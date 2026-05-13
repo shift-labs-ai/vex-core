@@ -298,26 +298,25 @@ export class Vex {
         args: {},
         async handler(ctx: QueryContext) {
           const since = Date.now() - 60 * 60 * 1000;
-          const all = await ctx.db
-            .table("_spans")
-            .where("startTime", ">=", since)
-            .all();
-          const roots = all.filter(
-            (s: Record<string, any>) =>
-              !s.parentSpanId && TRACE_TYPES.has(s.type),
-          );
-          const errors = roots.filter((s) => s.status === "error").length;
-          const totalDuration = roots.reduce(
-            (sum, s) => sum + ((s.duration as number) || 0),
-            0,
+          const [stats] = await ctx.db.sql<{
+            total: number;
+            errors: number | null;
+            avgMs: number | null;
+          }>(
+            `SELECT
+               COUNT(*) AS total,
+               SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
+               ROUND(AVG(duration) / 1000) AS avgMs
+             FROM _spans
+             WHERE startTime >= ?
+               AND parentSpanId IS NULL
+               AND type IN ('agent', 'channel', 'cron', 'webhook')`,
+            since,
           );
           return {
-            total: roots.length,
-            errors,
-            avgMs:
-              roots.length > 0
-                ? Math.round(totalDuration / roots.length / 1000)
-                : 0,
+            total: stats?.total ?? 0,
+            errors: stats?.errors ?? 0,
+            avgMs: stats?.avgMs ?? 0,
           };
         },
       },
