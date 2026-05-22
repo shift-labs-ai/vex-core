@@ -83,6 +83,17 @@ describe("engine", () => {
     expect(vex.listQueries()).toContain("kv.get");
     expect(vex.listMutations()).toContain("kv.set");
   });
+
+  test("does not register legacy _system RPCs by default", async () => {
+    const core = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      plugins: [kvPlugin],
+    });
+
+    expect(core.listQueries()).not.toContain("_system.rows");
+    expect(core.listMutations()).not.toContain("_system.sql");
+    await core.close();
+  });
 });
 
 describe("kv plugin", () => {
@@ -141,6 +152,51 @@ describe("subscriptions", () => {
 
     await vex.mutate("kv.set", { scope: "s1", key: "x", value: 0 });
     expect(results).toEqual([null, 42, 99]);
+  });
+
+  test("subscription invalidation preserves the subscriber user", async () => {
+    const secure = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("secure");
+          api.registerTable("events", {
+            columns: { value: { type: "string" } },
+          });
+          api.registerQuery("viewer", {
+            args: {},
+            async handler(ctx) {
+              if (!ctx.user) throw new Error("User required");
+              const count = await ctx.db.table("events").count();
+              return { userId: ctx.user.id, count };
+            },
+          });
+          api.registerMutation("touch", {
+            args: { value: "string" },
+            async handler(ctx, args) {
+              await ctx.db.table("events").insert({ value: args.value });
+            },
+          });
+        },
+      ],
+    });
+
+    const results: Array<{ userId: string; count: number }> = [];
+    const unsubscribe = await secure.subscribe(
+      "secure.viewer",
+      {},
+      (data) => results.push(data),
+      { user: { id: "u1", name: "User", isAdmin: false } },
+    );
+
+    await secure.mutate("secure.touch", { value: "changed" });
+
+    expect(results).toEqual([
+      { userId: "u1", count: 0 },
+      { userId: "u1", count: 1 },
+    ]);
+    unsubscribe();
+    await secure.close();
   });
 });
 
@@ -670,6 +726,15 @@ describe("plugin name collisions", () => {
 });
 
 describe("_system.sql", () => {
+  beforeEach(async () => {
+    await vex.close();
+    vex = await Vex.create({
+      plugins: [kvPlugin],
+      storage: sqliteAdapter(":memory:"),
+      systemRpc: true,
+    });
+  });
+
   test("requires admin", async () => {
     await expect(
       vex.mutate("_system.sql", { sql: "SELECT 1" }),
