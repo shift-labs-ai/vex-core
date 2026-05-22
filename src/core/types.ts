@@ -103,11 +103,33 @@ export interface CallContext {
   user?: VexUser | null;
 }
 
+export interface SubscriptionSummary {
+  total: number;
+  unique: number;
+  queries: {
+    name: string;
+    args: string;
+    count: number;
+    tables: string[];
+  }[];
+}
+
+export interface VexRuntime {
+  triggerJob(name: string): Promise<{
+    status: string | null | undefined;
+    error: string | null | undefined;
+    durationMs: number | null | undefined;
+  }>;
+  setJobEnabled(name: string, enabled: boolean): Promise<void>;
+  describeSubscriptions(): SubscriptionSummary;
+}
+
 export interface QueryContext {
   db: {
     table(name: string): QueryBuilder;
     sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
   };
+  runtime: VexRuntime;
   user?: VexUser | null;
 }
 
@@ -116,6 +138,7 @@ export interface MutationContext {
     table(name: string): MutationTable;
     sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
   };
+  runtime: VexRuntime;
   user?: VexUser | null;
 }
 

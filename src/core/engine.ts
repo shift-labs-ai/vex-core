@@ -16,6 +16,7 @@ import type {
   QueryBuilder,
   QueryContext,
   QueryDef,
+  VexRuntime,
   VexUser,
   WebhookRequest,
   WebhookResponse,
@@ -602,6 +603,14 @@ export class Vex {
     };
   }
 
+  private runtime(): VexRuntime {
+    return {
+      triggerJob: (name) => this.triggerJob(name),
+      setJobEnabled: (name, enabled) => this.setJobEnabled(name, enabled),
+      describeSubscriptions: () => this.describeSubscriptions(),
+    };
+  }
+
   private buildQueryContext(
     touchedTables?: Set<string>,
     user?: VexUser | null,
@@ -620,6 +629,7 @@ export class Vex {
           return self.storage.rawQuery<T>(sql, ...params);
         },
       },
+      runtime: this.runtime(),
       user: user ?? undefined,
     };
   }
@@ -663,6 +673,7 @@ export class Vex {
           return build(adapter.query(name));
         },
       },
+      runtime: this.runtime(),
       user: user ?? undefined,
     };
   }
