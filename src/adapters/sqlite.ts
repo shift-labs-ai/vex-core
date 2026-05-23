@@ -428,10 +428,15 @@ export function sqliteAdapter(
   async function withConnectionLock<T>(fn: () => Promise<T> | T): Promise<T> {
     if (closed) throw closedError();
     const owner = transactionContext.getStore();
-    if (owner) {
-      if (!owner.active) throw new Error("SQLite transaction owner is closed");
-      return fn();
-    }
+    // Genuine same-call nesting: an active transaction owner means
+    // we're still inside the BEGIN/COMMIT bracket on this async
+    // chain, so we run in-place and ride the existing lock.
+    if (owner?.active) return fn();
+    // No owner, or an owner whose transaction has already settled
+    // (commit or rollback) but whose AsyncLocalStorage context
+    // happens to still be visible via setImmediate/detached promise
+    // inheritance. Treat as a fresh top-level call: acquire the
+    // lock and start our own owner context.
     await acquireWriteLock();
     const context = { active: true };
     try {
@@ -667,11 +672,11 @@ export function sqliteAdapter(
     async transaction<T>(fn: () => Promise<T> | T): Promise<T> {
       if (closed) throw closedError();
       const owner = transactionContext.getStore();
-      if (owner) {
-        if (!owner.active)
-          throw new Error("SQLite transaction owner is closed");
-        return fn();
-      }
+      // Same rule as withConnectionLock: only join the outer BEGIN
+      // when the owner is still active. A stale owner (parent
+      // already committed/rolled back) falls through and opens its
+      // own top-level transaction.
+      if (owner?.active) return fn();
 
       await acquireWriteLock();
       const context = { active: true };

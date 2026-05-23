@@ -370,7 +370,12 @@ describe("SQLite transaction ownership", () => {
     );
   });
 
-  test("timed-out mutation handlers cannot keep writing through a closed owner", async () => {
+  test("timed-out handler's pre-timeout writes roll back with the parent transaction", async () => {
+    // The parent `vex.mutate(...)` call opens a transaction. When the
+    // handler exceeds the timeout, that transaction rolls back, so
+    // any write made *before* the timeout disappears. A late write
+    // arriving after the rollback is a fresh top-level write — see
+    // the next test.
     const started = Promise.withResolvers<void>();
     const vex = await Vex.create({
       storage: sqliteAdapter(dbPath),
@@ -383,11 +388,49 @@ describe("SQLite transaction ownership", () => {
         "Handler timed out after 10ms",
       );
       await started.promise;
+      // Give the late insert a chance to run after the rollback.
       await sleep(60);
 
-      expect(peerValues()).toEqual([]);
+      // The pre-timeout insert ("before-timeout") rolled back. The
+      // post-timeout insert ("after-timeout") arrived AFTER the
+      // owner was closed: it must acquire the lock fresh and commit
+      // on its own rather than throw "transaction owner is closed".
+      expect(peerValues()).toEqual(["after-timeout"]);
     } finally {
       await vex.close();
+    }
+  });
+
+  test("writes scheduled after a transaction settles acquire the lock fresh", async () => {
+    // The platform tracer scheduled span writes via setImmediate /
+    // detached promises that fire after the originating mutation
+    // commits. Those writes must succeed by acquiring a fresh lock,
+    // not throw because their AsyncLocalStorage owner already
+    // marked itself closed when the parent committed.
+    const storage = await buildStorage();
+    try {
+      let lateWrite: Promise<unknown> = Promise.resolve();
+
+      await storage.transaction(async () => {
+        await storage.insert("rows", { v: "committed" });
+        // Detach a write that resolves after the parent transaction
+        // has finished. setImmediate continuations inherit the ALS
+        // context but the outer transaction's owner record will be
+        // marked inactive by the time this fires.
+        lateWrite = new Promise<void>((resolve, reject) => {
+          setImmediate(() => {
+            storage
+              .insert("rows", { v: "late" })
+              .then(() => resolve())
+              .catch(reject);
+          });
+        });
+      });
+
+      await lateWrite;
+      expect(peerValues()).toEqual(["committed", "late"]);
+    } finally {
+      await storage.close();
     }
   });
 
