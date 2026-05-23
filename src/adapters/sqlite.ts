@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { id as generateId } from "../core/id.js";
 import type { StorageAdapter } from "../core/storage.js";
 import type { TableSchema } from "../core/types.js";
@@ -338,20 +339,28 @@ function rebuildTable(
   for (const sql of manualIndexSql) db.exec(sql);
 }
 
-function wrapSync(db: Database, changedTables: Set<string>): DbExec {
+function wrapSync(
+  db: Database,
+  changedTables: Set<string>,
+  withConnectionLock: <T>(fn: () => Promise<T> | T) => Promise<T>,
+): DbExec {
   return {
     schemas: new Map(),
     markChanged(table, changes) {
       if (changes > 0) changedTables.add(table);
     },
     async all(sql, params) {
-      return params.length > 0
-        ? db.prepare(sql).all(...params)
-        : db.prepare(sql).all();
+      return withConnectionLock(() =>
+        params.length > 0
+          ? db.prepare(sql).all(...params)
+          : db.prepare(sql).all(),
+      );
     },
     async run(sql, params) {
-      const result = params.length > 0 ? db.run(sql, ...params) : db.run(sql);
-      return { changes: result.changes };
+      return withConnectionLock(() => {
+        const result = params.length > 0 ? db.run(sql, ...params) : db.run(sql);
+        return { changes: result.changes };
+      });
     },
   };
 }
@@ -372,9 +381,78 @@ export function sqliteAdapter(
   if (opts?.cacheSize) db.exec(`PRAGMA cache_size = ${opts.cacheSize}`);
 
   const changedTables = new Set<string>();
-  const exec = wrapSync(db, changedTables);
-  let txDepth = 0;
+  // Bun's SQLite handle is a single connection. While it has an
+  // open BEGIN, every statement on that connection participates in
+  // that transaction. Track the async owner so same-call nesting can
+  // reuse the connection, while unrelated concurrent calls queue
+  // instead of accidentally sharing each other's COMMIT/ROLLBACK.
+  const transactionContext = new AsyncLocalStorage<{ active: boolean }>();
+  let writeLocked = false;
+  const writeWaiters: Array<{
+    resolve: () => void;
+    reject: (error: Error) => void;
+  }> = [];
   let closed = false;
+
+  function closedError(): Error {
+    return new Error("SQLite adapter is closed");
+  }
+
+  async function acquireWriteLock(): Promise<void> {
+    if (closed) throw closedError();
+    if (!writeLocked) {
+      writeLocked = true;
+      return;
+    }
+    await new Promise<void>((resolve, reject) =>
+      writeWaiters.push({ resolve, reject }),
+    );
+    if (closed) throw closedError();
+  }
+
+  function releaseWriteLock(): void {
+    if (closed) {
+      writeLocked = false;
+      return;
+    }
+    const next = writeWaiters.shift();
+    if (next) next.resolve();
+    else writeLocked = false;
+  }
+
+  function rejectQueuedWork(): void {
+    const error = closedError();
+    for (const waiter of writeWaiters.splice(0)) waiter.reject(error);
+  }
+
+  async function withConnectionLock<T>(fn: () => Promise<T> | T): Promise<T> {
+    if (closed) throw closedError();
+    const owner = transactionContext.getStore();
+    if (owner) {
+      if (!owner.active) throw new Error("SQLite transaction owner is closed");
+      return fn();
+    }
+    await acquireWriteLock();
+    const context = { active: true };
+    try {
+      return await transactionContext.run(context, () => fn());
+    } finally {
+      context.active = false;
+      releaseWriteLock();
+    }
+  }
+
+  function insertUnlocked(table: string, row: Record<string, any>): string {
+    const id = row._id ?? generateId(12);
+    const data: Record<string, any> = { ...row, _id: id };
+    const keys = Object.keys(data);
+    const values = keys.map((k) => serializeValue(data[k]));
+    db.prepare(buildInsertSql(table, keys)).run(...values);
+    changedTables.add(table);
+    return id;
+  }
+
+  const exec = wrapSync(db, changedTables, withConnectionLock);
 
   return {
     name: "sqlite",
@@ -535,13 +613,7 @@ export function sqliteAdapter(
     },
 
     async insert(table: string, row: Record<string, any>): Promise<string> {
-      const id = row._id ?? generateId(12);
-      const data: Record<string, any> = { ...row, _id: id };
-      const keys = Object.keys(data);
-      const values = keys.map((k) => serializeValue(data[k]));
-      db.prepare(buildInsertSql(table, keys)).run(...values);
-      changedTables.add(table);
-      return id;
+      return withConnectionLock(() => insertUnlocked(table, row));
     },
 
     async upsert(
@@ -549,18 +621,20 @@ export function sqliteAdapter(
       keys: Record<string, any>,
       data: Record<string, any>,
     ): Promise<void> {
-      const qb = createQueryBuilder(exec, table);
-      for (const [col, val] of Object.entries(keys)) qb.where(col, "=", val);
-      const row = await qb.first<{ _id: string }>();
+      await withConnectionLock(async () => {
+        const qb = createQueryBuilder(exec, table);
+        for (const [col, val] of Object.entries(keys)) qb.where(col, "=", val);
+        const row = await qb.first<{ _id: string }>();
 
-      if (row) {
-        if (Object.keys(data).length === 0) return;
-        const { sql, values } = buildUpdateSql(table, data);
-        const result = db.prepare(sql).run(...values, row._id);
-        if (result.changes > 0) changedTables.add(table);
-      } else {
-        await this.insert(table, { ...keys, ...data });
-      }
+        if (row) {
+          if (Object.keys(data).length === 0) return;
+          const { sql, values } = buildUpdateSql(table, data);
+          const result = db.prepare(sql).run(...values, row._id);
+          if (result.changes > 0) changedTables.add(table);
+        } else {
+          insertUnlocked(table, { ...keys, ...data });
+        }
+      });
     },
 
     async update(
@@ -568,18 +642,22 @@ export function sqliteAdapter(
       id: string,
       data: Record<string, any>,
     ): Promise<void> {
-      if (Object.keys(data).length === 0) return;
-      const { sql, values } = buildUpdateSql(table, data);
-      const result = db.prepare(sql).run(...values, id);
-      if (result.changes > 0) changedTables.add(table);
+      await withConnectionLock(() => {
+        if (Object.keys(data).length === 0) return;
+        const { sql, values } = buildUpdateSql(table, data);
+        const result = db.prepare(sql).run(...values, id);
+        if (result.changes > 0) changedTables.add(table);
+      });
     },
 
     async delete(table: string, id: string): Promise<boolean> {
-      const result = db
-        .prepare(`DELETE FROM ${quoteIdent(table)} WHERE _id = ?`)
-        .run(id);
-      if (result.changes > 0) changedTables.add(table);
-      return result.changes > 0;
+      return withConnectionLock(() => {
+        const result = db
+          .prepare(`DELETE FROM ${quoteIdent(table)} WHERE _id = ?`)
+          .run(id);
+        if (result.changes > 0) changedTables.add(table);
+        return result.changes > 0;
+      });
     },
 
     query(table: string) {
@@ -587,20 +665,21 @@ export function sqliteAdapter(
     },
 
     async transaction<T>(fn: () => Promise<T> | T): Promise<T> {
-      if (txDepth > 0) {
-        txDepth++;
-        try {
-          return await fn();
-        } finally {
-          txDepth--;
-        }
+      if (closed) throw closedError();
+      const owner = transactionContext.getStore();
+      if (owner) {
+        if (!owner.active)
+          throw new Error("SQLite transaction owner is closed");
+        return fn();
       }
-      txDepth++;
+
+      await acquireWriteLock();
+      const context = { active: true };
       const changedBefore = new Set(changedTables);
       const schemasBefore = new Map(exec.schemas);
       db.exec("BEGIN");
       try {
-        const result = await fn();
+        const result = await transactionContext.run(context, () => fn());
         db.exec("COMMIT");
         return result;
       } catch (e) {
@@ -613,7 +692,8 @@ export function sqliteAdapter(
         }
         throw e;
       } finally {
-        txDepth--;
+        context.active = false;
+        releaseWriteLock();
       }
     },
 
@@ -621,44 +701,48 @@ export function sqliteAdapter(
       sql: string,
       ...params: any[]
     ): Promise<T[]> {
-      return db.prepare(sql).all(...params) as T[];
+      return withConnectionLock(() => db.prepare(sql).all(...params) as T[]);
     },
 
     async rawExec(sql: string, ...params: any[]): Promise<void> {
-      if (params.length > 0) {
-        db.prepare(sql).run(...params);
-      } else {
-        db.exec(sql);
-      }
+      await withConnectionLock(() => {
+        if (params.length > 0) {
+          db.prepare(sql).run(...params);
+        } else {
+          db.exec(sql);
+        }
+      });
     },
 
     async bulkInsert(
       table: string,
       rows: Record<string, any>[],
     ): Promise<void> {
-      if (rows.length === 0) return;
-      const keys = [
-        "_id",
-        ...new Set(
-          rows
-            .flatMap((row) => Object.keys(row))
-            .filter((key) => key !== "_id"),
-        ),
-      ];
-      const stmt = db.prepare(buildInsertSql(table, keys));
+      await withConnectionLock(() => {
+        if (rows.length === 0) return;
+        const keys = [
+          "_id",
+          ...new Set(
+            rows
+              .flatMap((row) => Object.keys(row))
+              .filter((key) => key !== "_id"),
+          ),
+        ];
+        const stmt = db.prepare(buildInsertSql(table, keys));
 
-      const insertMany = db.transaction((items: Record<string, any>[]) => {
-        for (const row of items) {
-          const data: Record<string, any> = {
-            _id: row._id ?? generateId(12),
-            ...row,
-          };
-          stmt.run(...keys.map((k) => serializeValue(data[k])));
-        }
+        const insertMany = db.transaction((items: Record<string, any>[]) => {
+          for (const row of items) {
+            const data: Record<string, any> = {
+              _id: row._id ?? generateId(12),
+              ...row,
+            };
+            stmt.run(...keys.map((k) => serializeValue(data[k])));
+          }
+        });
+
+        insertMany(rows);
+        changedTables.add(table);
       });
-
-      insertMany(rows);
-      changedTables.add(table);
     },
 
     getChangedTables(): string[] {
@@ -674,6 +758,7 @@ export function sqliteAdapter(
     close() {
       if (closed) return;
       closed = true;
+      rejectQueuedWork();
       db.close();
     },
   };

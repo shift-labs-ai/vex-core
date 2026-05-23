@@ -16,14 +16,13 @@ import type {
   QueryBuilder,
   QueryContext,
   QueryDef,
+  VexRuntime,
   VexUser,
   WebhookRequest,
   WebhookResponse,
 } from "./types.js";
 
 type SubscriptionCallback = (data: any) => void;
-
-const TRACE_TYPES = new Set(["agent", "channel", "cron", "webhook"]);
 
 // Trace metadata is operational telemetry, not a request archive.
 // The engine records stable execution facts (plugin, touched tables,
@@ -40,6 +39,7 @@ interface Subscription {
   callback: SubscriptionCallback;
   lastHash: number;
   tables: Set<string>;
+  user?: VexUser | null;
 }
 
 interface RegisteredQuery {
@@ -143,223 +143,6 @@ export class Vex {
       vex.plugins.push(plugin);
       await vex.registerPlugin(plugin);
     }
-
-    // Sensitive columns get stripped from `_system.rows` so encrypted blobs
-    // never leak via the row browser. Add new tables here as needed.
-    const SENSITIVE_COLUMNS: Record<string, readonly string[]> = {
-      provider_credentials: ["credential"],
-      providers: ["credential"],
-      secrets: ["value"],
-      auth_users: ["token"],
-      browser_sessions: ["token"],
-    };
-
-    vex.queries.set("_system.rows", {
-      plugin: "_system",
-      def: {
-        args: { table: "string" },
-        async handler(ctx: QueryContext, args: Record<string, any>) {
-          const total = await ctx.db.table(args.table).count();
-          const rows = await ctx.db
-            .table(args.table)
-            .order("_id", "desc")
-            .limit(args.limit ?? 50)
-            .offset(args.offset ?? 0)
-            .all();
-          const sensitive = SENSITIVE_COLUMNS[args.table];
-          if (sensitive && sensitive.length > 0) {
-            for (const row of rows as Record<string, any>[]) {
-              for (const col of sensitive) {
-                if (col in row) row[col] = "\u2022\u2022\u2022";
-              }
-            }
-          }
-          return { rows, total };
-        },
-      },
-    });
-
-    vex.queries.set("_system.jobs", {
-      plugin: "_system",
-      def: {
-        args: {},
-        async handler(ctx: QueryContext) {
-          return ctx.db.table("_jobs").order("name", "asc").all();
-        },
-      },
-    });
-
-    vex.queries.set("_system.triggerJob", {
-      plugin: "_system",
-      def: {
-        args: { name: "string" },
-        async handler(_ctx: QueryContext, args: Record<string, any>) {
-          return vex.triggerJob(args.name);
-        },
-      },
-    });
-
-    vex.mutations.set("_system.setJobEnabled", {
-      plugin: "_system",
-      def: {
-        args: { name: "string", enabled: "number" },
-        async handler(_ctx: MutationContext, args: Record<string, any>) {
-          await vex.setJobEnabled(args.name, !!args.enabled);
-        },
-      },
-    });
-
-    // Admin-only raw SQL escape hatch. Needed for ad-hoc migrations
-    // (rename/drop tables after a plugin refactor) and one-off fixes.
-    // Bypasses schema validation entirely. Use sparingly.
-    //
-    // Already wrapped by vex.mutate() in a SQLite transaction, so DDL and
-    // DML roll back cleanly on error without any extra work here.
-    //
-    // Does NOT trigger subscription invalidation — callers subscribed to
-    // affected tables won't auto-refresh. Known limitation.
-    vex.mutations.set("_system.sql", {
-      plugin: "_system",
-      def: {
-        args: {
-          sql: "string",
-          params: "json",
-        },
-        async handler(ctx: MutationContext, args: Record<string, any>) {
-          if (!ctx.user?.isAdmin) {
-            throw new Error("_system.sql requires admin privileges");
-          }
-          const params = Array.isArray(args.params) ? args.params : [];
-          return vex.storage.rawQuery(args.sql, ...params);
-        },
-      },
-    });
-
-    // ─── Trace mutations ───
-
-    vex.mutations.set("_system.writeSpan", {
-      plugin: "_system",
-      def: {
-        args: {},
-        async handler(ctx: MutationContext, args: Record<string, any>) {
-          await ctx.db.table("_spans").insert(args);
-        },
-      },
-    });
-
-    // ─── Trace queries ───
-
-    vex.queries.set("_system.traces", {
-      plugin: "_system",
-      def: {
-        args: {},
-        async handler(ctx: QueryContext, args: Record<string, any>) {
-          const limit = args.limit ?? 100;
-          const showAll = args.all === true;
-          const all = await ctx.db
-            .table("_spans")
-            .order("startTime", "desc")
-            .limit(showAll ? limit : limit * 3)
-            .all();
-          let roots = all.filter((s: Record<string, any>) => !s.parentSpanId);
-          if (!showAll)
-            roots = roots.filter(
-              (s) => TRACE_TYPES.has(s.type) && s.name !== "metrics.sample",
-            );
-          return roots.slice(0, limit).map((r) => ({
-            ...r,
-            meta: r.meta ? parseJsonSafe(r.meta) : null,
-          }));
-        },
-      },
-    });
-
-    vex.queries.set("_system.traceDetail", {
-      plugin: "_system",
-      def: {
-        args: { traceId: "string" },
-        async handler(ctx: QueryContext, args: Record<string, any>) {
-          const rows = await ctx.db
-            .table("_spans")
-            .where("traceId", "=", args.traceId)
-            .order("startTime", "asc")
-            .all();
-          return rows.map((r) => ({
-            ...r,
-            meta: r.meta ? parseJsonSafe(r.meta) : null,
-          }));
-        },
-      },
-    });
-
-    vex.queries.set("_system.traceStats", {
-      plugin: "_system",
-      def: {
-        args: {},
-        async handler(ctx: QueryContext) {
-          const since = Date.now() - 60 * 60 * 1000;
-          const all = await ctx.db
-            .table("_spans")
-            .where("startTime", ">=", since)
-            .all();
-          const roots = all.filter(
-            (s: Record<string, any>) =>
-              !s.parentSpanId && TRACE_TYPES.has(s.type),
-          );
-          const errors = roots.filter((s) => s.status === "error").length;
-          const totalDuration = roots.reduce(
-            (sum, s) => sum + ((s.duration as number) || 0),
-            0,
-          );
-          return {
-            total: roots.length,
-            errors,
-            avgMs:
-              roots.length > 0
-                ? Math.round(totalDuration / roots.length / 1000)
-                : 0,
-          };
-        },
-      },
-    });
-
-    vex.queries.set("_system.subscriptions", {
-      plugin: "_system",
-      def: {
-        args: {},
-        async handler() {
-          const byQuery = new Map<
-            string,
-            { args: string; count: number; tables: string[] }
-          >();
-          for (const sub of vex.subscriptions.values()) {
-            const key = `${sub.queryName}\0${sub.argsKey}`;
-            const existing = byQuery.get(key);
-            if (existing) {
-              existing.count++;
-            } else {
-              byQuery.set(key, {
-                args: sub.argsKey,
-                count: 1,
-                tables: [...sub.tables],
-              });
-            }
-          }
-          return {
-            total: vex.subscriptions.size,
-            unique: byQuery.size,
-            queries: [...byQuery.entries()]
-              .map(([key, v]) => ({
-                name: key.split("\0")[0],
-                args: v.args,
-                count: v.count,
-                tables: v.tables,
-              }))
-              .sort((a, b) => b.count - a.count),
-          };
-        },
-      },
-    });
 
     return vex;
   }
@@ -530,7 +313,7 @@ export class Vex {
             meta.schedule = job.schedule;
             meta.attempt = attempt;
             const ctx = this.buildMutationContext();
-            await this.storage.transaction(() => job.handler(ctx));
+            await job.handler(ctx);
             await this.invalidateSubscriptions(ectx);
           },
         );
@@ -598,6 +381,14 @@ export class Vex {
     };
   }
 
+  private runtime(): VexRuntime {
+    return {
+      triggerJob: (name) => this.triggerJob(name),
+      setJobEnabled: (name, enabled) => this.setJobEnabled(name, enabled),
+      describeSubscriptions: () => this.describeSubscriptions(),
+    };
+  }
+
   private buildQueryContext(
     touchedTables?: Set<string>,
     user?: VexUser | null,
@@ -616,6 +407,7 @@ export class Vex {
           return self.storage.rawQuery<T>(sql, ...params);
         },
       },
+      runtime: this.runtime(),
       user: user ?? undefined,
     };
   }
@@ -659,6 +451,7 @@ export class Vex {
           return build(adapter.query(name));
         },
       },
+      runtime: this.runtime(),
       user: user ?? undefined,
     };
   }
@@ -744,7 +537,7 @@ export class Vex {
             const tables = new Set<string>();
             const reg = this.queries.get(first.queryName);
             if (!reg) continue;
-            const ctx = this.buildQueryContext(tables);
+            const ctx = this.buildQueryContext(tables, first.user);
             const result = await reg.def.handler(ctx, first.args);
             const hash = Number(Bun.hash(JSON.stringify(result)));
             for (const sub of subs) {
@@ -840,6 +633,7 @@ export class Vex {
         callback,
         lastHash: Number(Bun.hash(JSON.stringify(result))),
         tables,
+        user,
       };
       this.subscriptions.set(subId, sub);
       callback(result);
@@ -955,6 +749,38 @@ export class Vex {
     return this.subscriptions.size;
   }
 
+  describeSubscriptions() {
+    const byQuery = new Map<
+      string,
+      { args: string; count: number; tables: string[] }
+    >();
+    for (const sub of this.subscriptions.values()) {
+      const key = `${sub.queryName}\0${sub.argsKey}`;
+      const existing = byQuery.get(key);
+      if (existing) {
+        existing.count++;
+      } else {
+        byQuery.set(key, {
+          args: sub.argsKey,
+          count: 1,
+          tables: [...sub.tables],
+        });
+      }
+    }
+    return {
+      total: this.subscriptions.size,
+      unique: byQuery.size,
+      queries: [...byQuery.entries()]
+        .map(([key, v]) => ({
+          name: key.split("\0")[0],
+          args: v.args,
+          count: v.count,
+          tables: v.tables,
+        }))
+        .sort((a, b) => b.count - a.count),
+    };
+  }
+
   async describeTable(table: string) {
     const rowCount = await this.storage.query(table).count();
     const schema = this.storage.getSchema(table);
@@ -1034,17 +860,6 @@ function normalizeCallContext(callCtx?: ExecContext | CallContext): {
   }
   const cc = callCtx as CallContext;
   return { parent: cc.parent, user: cc.user };
-}
-
-function parseJsonSafe(val: any): any {
-  if (typeof val === "string") {
-    try {
-      return JSON.parse(val);
-    } catch {
-      return val;
-    }
-  }
-  return val;
 }
 
 function parseSchedule(schedule: string): number {
