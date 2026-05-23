@@ -313,7 +313,7 @@ export class Vex {
             meta.schedule = job.schedule;
             meta.attempt = attempt;
             const ctx = this.buildMutationContext();
-            await this.storage.transaction(() => job.handler(ctx));
+            await job.handler(ctx);
             await this.invalidateSubscriptions(ectx);
           },
         );
