@@ -142,8 +142,14 @@ export interface MutationContext {
   user?: VexUser | null;
 }
 
+export interface ReactiveBudget {
+  maxRows?: number;
+  maxBytes?: number;
+}
+
 export interface QueryDef {
   args: Record<string, string>;
+  reactive?: false | ReactiveBudget;
   handler: (ctx: QueryContext, args: Record<string, any>) => Promise<any> | any;
 }
 

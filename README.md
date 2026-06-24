@@ -49,6 +49,32 @@ const unsub = await vex.subscribe("counter.list", {}, (rows) => {
 });
 ```
 
+## Reactive safety
+
+Explicit `query()` calls may return large results. `subscribe()` calls may not: reactive queries are re-run after writes, hashed, and delivered to callbacks, so Vex enforces row and byte budgets before accepting or continuing a subscription.
+
+```ts
+const vex = await Vex.create({
+  storage,
+  plugins,
+  reactive: { maxRows: 500, maxBytes: 512 * 1024 },
+});
+
+api.registerQuery("list", {
+  args: {},
+  reactive: { maxRows: 100, maxBytes: 64 * 1024 },
+  handler: (ctx) => ctx.db.table("items").limit(100).all(),
+});
+
+api.registerQuery("export", {
+  args: {},
+  reactive: false,
+  handler: (ctx) => ctx.db.table("items").all(), // query() only, not subscribe()
+});
+```
+
+Reactive metadata is recorded on spans: `resultRows`, `resultBytes`, `reactive`, `budget`, and `budgetExceeded`. Query-builder reads record dependency descriptors for table, filters, selected columns, ordering, and limits. Raw SQL is tracked conservatively by parsed `FROM`/`JOIN` tables; external API work and unbounded exports should stay outside reactive queries or be marked `reactive: false`.
+
 ## Query builder
 
 Reads, filters, aggregations — pushed down to SQL.

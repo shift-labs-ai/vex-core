@@ -39,6 +39,7 @@ export type {
   QueryBuilder,
   QueryContext,
   QueryDef,
+  ReactiveBudget,
   TableSchema,
   VexUser,
   WebhookDef,
