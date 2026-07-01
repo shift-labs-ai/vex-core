@@ -90,6 +90,13 @@ export interface VexWebSocketOptions {
   getUser?: (
     req: Request,
   ) => VexUser | null | undefined | Promise<VexUser | null | undefined>;
+  /**
+   * Reject upgrades when `getUser` resolves to null. Hosts with an auth
+   * boundary should enable this so WebSocket RPC follows the same
+   * authenticated-user contract as HTTP RPC. Anonymous/local-dev servers can
+   * leave it false or return a synthetic user from `getUser`.
+   */
+  requireUser?: boolean;
 }
 
 export interface VexWebSocketHandlers {
@@ -110,6 +117,7 @@ export function vexWebSocket(
   opts: VexWebSocketOptions = {},
 ): VexWebSocketHandlers {
   const getUser = opts.getUser ?? (() => null);
+  const requireUser = opts.requireUser ?? false;
 
   return {
     async upgrade(req, server) {
@@ -117,6 +125,12 @@ export function vexWebSocket(
       // the request, the body is no longer available and we can't
       // return a clean 401.
       const user = (await getUser(req)) ?? null;
+      if (requireUser && !user) {
+        return new Response("Unauthorized", {
+          status: 401,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      }
 
       const data: ConnectionState = {
         user,

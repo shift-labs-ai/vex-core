@@ -30,6 +30,10 @@ beforeAll(async () => {
             handler: async (ctx, args) =>
               ctx.db.table("items").where("name", "=", args.name).all(),
           },
+          viewer: {
+            args: {},
+            handler: async (ctx) => ctx.user?.id ?? null,
+          },
         },
         mutations: {
           create: {
@@ -279,6 +283,87 @@ function collectData(
 }
 
 describe("WebSocket live channel", () => {
+  test("requireUser rejects unauthenticated upgrades", async () => {
+    const secureWs = vexWebSocket(vex, { requireUser: true });
+    const secureServer = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        return secureWs.upgrade(req, srv);
+      },
+      websocket: {
+        open: secureWs.open as any,
+        message: secureWs.message as any,
+        close: secureWs.close as any,
+      },
+    });
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${secureServer.port}`);
+      const event = await new Promise<"open" | "error" | "close">(
+        (resolve) => {
+          ws.addEventListener("open", () => resolve("open"), { once: true });
+          ws.addEventListener("error", () => resolve("error"), { once: true });
+          ws.addEventListener("close", () => resolve("close"), { once: true });
+        },
+      );
+      expect(event).not.toBe("open");
+    } finally {
+      secureServer.stop(true);
+    }
+  });
+
+  test("requireUser allows authenticated upgrades and pins the user", async () => {
+    const secureWs = vexWebSocket(vex, {
+      requireUser: true,
+      getUser: (req) =>
+        new URL(req.url).searchParams.get("token") === "ok"
+          ? { id: "user-1" }
+          : null,
+    });
+    const secureServer = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        return secureWs.upgrade(req, srv);
+      },
+      websocket: {
+        open: secureWs.open as any,
+        message: secureWs.message as any,
+        close: secureWs.close as any,
+      },
+    });
+
+    try {
+      const ws = new WebSocket(
+        `ws://localhost:${secureServer.port}?token=ok`,
+      );
+      await new Promise<void>((resolve, reject) => {
+        ws.addEventListener("open", () => resolve(), { once: true });
+        ws.addEventListener("error", () => reject(new Error("ws rejected")), {
+          once: true,
+        });
+      });
+
+      const got = new Promise<any>((resolve) => {
+        ws.addEventListener(
+          "message",
+          (ev) => resolve(JSON.parse(ev.data as string)),
+          { once: true },
+        );
+      });
+      ws.send(
+        JSON.stringify({ type: "query", id: "who", name: "items.viewer" }),
+      );
+      expect(await got).toEqual({
+        type: "result",
+        id: "who",
+        data: "user-1",
+      });
+      ws.close();
+    } finally {
+      secureServer.stop(true);
+    }
+  });
+
   test("subscribe pushes initial data on connect", async () => {
     const client = await openClient();
     try {
