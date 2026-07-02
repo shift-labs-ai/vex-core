@@ -70,6 +70,12 @@ interface RegisteredMutation {
   def: MutationDef;
 }
 
+interface JobRunResult {
+  status: "ok" | "error";
+  error: string | null;
+  durationMs: number;
+}
+
 export interface VexOptions {
   plugins: Array<PluginFunction | PluginDef>;
   storage: StorageAdapter;
@@ -95,6 +101,7 @@ export class Vex {
   private cronTimers: Map<string, ReturnType<typeof setInterval>> = new Map();
   private jobHandlers: Map<string, JobDef> = new Map();
   private jobIntervalMs: Map<string, number> = new Map();
+  private runningJobs: Map<string, Promise<JobRunResult>> = new Map();
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
   private appId: string = "unknown";
@@ -313,7 +320,32 @@ export class Vex {
     }
   }
 
-  private async executeJob(cronName: string, job: JobDef) {
+  // Jobs are single-flight per name: while a run (including retries and
+  // still-settling timed-out handlers) is active, scheduled ticks and
+  // manual triggers join the in-flight promise instead of starting a
+  // second concurrent execution. Missed ticks are coalesced, not queued.
+  private async executeJob(
+    cronName: string,
+    job: JobDef,
+  ): Promise<JobRunResult> {
+    const existing = this.runningJobs.get(cronName);
+    if (existing) return existing;
+
+    const running = this.executeJobLocked(cronName, job);
+    this.runningJobs.set(cronName, running);
+    try {
+      return await running;
+    } finally {
+      if (this.runningJobs.get(cronName) === running) {
+        this.runningJobs.delete(cronName);
+      }
+    }
+  }
+
+  private async executeJobLocked(
+    cronName: string,
+    job: JobDef,
+  ): Promise<JobRunResult> {
     const startTime = Date.now();
     const timeoutMs = job.timeoutMs ?? 0;
     const maxRetries = job.retries ?? 0;
@@ -333,9 +365,16 @@ export class Vex {
       });
     }
 
+    let lastResult: JobRunResult = {
+      status: "error",
+      error: "Job did not run",
+      durationMs: 0,
+    };
+
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      let handlerPromise: Promise<void> | null = null;
       try {
-        const handlerPromise = this.trace(
+        handlerPromise = this.trace(
           "cron",
           cronName,
           null,
@@ -349,29 +388,38 @@ export class Vex {
         );
 
         if (timeoutMs > 0) {
-          const timeout = new Promise<never>((_, reject) =>
-            setTimeout(
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(
               () =>
                 reject(
                   new Error(`Job ${cronName} timed out after ${timeoutMs}ms`),
                 ),
               timeoutMs,
-            ),
-          );
-          await Promise.race([handlerPromise, timeout]);
+            );
+          });
+          try {
+            await Promise.race([handlerPromise, timeout]);
+          } finally {
+            clearTimeout(timer);
+          }
         } else {
           await handlerPromise;
         }
 
-        // Update status in table
+        const result: JobRunResult = {
+          status: "ok",
+          error: null,
+          durationMs: Date.now() - startTime,
+        };
         if (row) {
           await this.storage.update("_jobs", row._id, {
-            lastStatus: "ok",
-            lastError: null,
-            lastDurationMs: Date.now() - startTime,
+            lastStatus: result.status,
+            lastError: result.error,
+            lastDurationMs: result.durationMs,
           });
         }
-        return;
+        return result;
       } catch (err: any) {
         const errMsg = err?.message ?? String(err);
         console.error(
@@ -379,36 +427,36 @@ export class Vex {
           errMsg,
         );
 
+        lastResult = {
+          status: "error",
+          error: errMsg,
+          durationMs: Date.now() - startTime,
+        };
         if (row) {
           await this.storage.update("_jobs", row._id, {
-            lastStatus: "error",
-            lastError: errMsg,
-            lastDurationMs: Date.now() - startTime,
+            lastStatus: lastResult.status,
+            lastError: lastResult.error,
+            lastDurationMs: lastResult.durationMs,
           });
         }
+
+        // A timed-out handler cannot be cancelled — wait for it to settle
+        // so retries and future ticks never overlap a live handler.
+        if (handlerPromise) await handlerPromise.catch(() => {});
 
         if (attempt < maxRetries) {
           await new Promise((r) => setTimeout(r, retryDelay));
         }
       }
     }
+
+    return lastResult;
   }
 
   async triggerJob(name: string) {
     const handler = this.jobHandlers.get(name);
     if (!handler) throw new Error(`Job not found: ${name}`);
-    await this.executeJob(name, handler);
-    const row = await this.storage
-      .rawQuery<any>(
-        "SELECT lastStatus, lastError, lastDurationMs FROM _jobs WHERE name = ?",
-        name,
-      )
-      .then((r) => r[0]);
-    return {
-      status: row?.lastStatus,
-      error: row?.lastError,
-      durationMs: row?.lastDurationMs,
-    };
+    return this.executeJob(name, handler);
   }
 
   private runtime(): VexRuntime {
@@ -1169,6 +1217,7 @@ export class Vex {
   async close() {
     for (const timer of this.cronTimers.values()) clearInterval(timer);
     this.cronTimers.clear();
+    await Promise.allSettled([...this.runningJobs.values()]);
     this.subscriptions.clear();
     await this.storage.close();
   }

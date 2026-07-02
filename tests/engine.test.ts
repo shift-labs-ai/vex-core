@@ -725,6 +725,272 @@ describe("plugin name collisions", () => {
   });
 });
 
+describe("jobs", () => {
+  test("different scheduled jobs may run concurrently", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const started: string[] = [];
+
+    const jvex = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("parallel");
+          for (const name of ["one", "two"] as const) {
+            api.registerJob(name, {
+              schedule: "every 1s",
+              async handler() {
+                started.push(name);
+                active += 1;
+                maxActive = Math.max(maxActive, active);
+                await new Promise((resolve) => setTimeout(resolve, 300));
+                active -= 1;
+              },
+            });
+          }
+        },
+      ],
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 1_150));
+
+    expect(started.sort()).toEqual(["one", "two"]);
+    expect(maxActive).toBe(2);
+
+    await jvex.close();
+  });
+
+  test("scheduled jobs do not overlap when a previous run is still active", async () => {
+    let active = 0;
+    let maxActive = 0;
+    let runs = 0;
+
+    const jvex = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("slow");
+          api.registerJob("tick", {
+            schedule: "every 1s",
+            async handler() {
+              runs += 1;
+              active += 1;
+              maxActive = Math.max(maxActive, active);
+              await new Promise((resolve) => setTimeout(resolve, 1_500));
+              active -= 1;
+            },
+          });
+        },
+      ],
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 2_700));
+
+    expect(runs).toBeGreaterThanOrEqual(1);
+    expect(active).toBe(0);
+    expect(maxActive).toBe(1);
+
+    await jvex.close();
+  });
+
+  test("timed-out scheduled jobs do not overlap while their handler is still active", async () => {
+    let active = 0;
+    let maxActive = 0;
+    let runs = 0;
+
+    const jvex = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("timeout");
+          api.registerJob("tick", {
+            schedule: "every 1s",
+            timeoutMs: 200,
+            async handler() {
+              runs += 1;
+              active += 1;
+              maxActive = Math.max(maxActive, active);
+              await new Promise((resolve) => setTimeout(resolve, 1_500));
+              active -= 1;
+            },
+          });
+        },
+      ],
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    expect(active).toBe(1);
+    expect(maxActive).toBe(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(runs).toBeGreaterThanOrEqual(1);
+    expect(active).toBe(0);
+    expect(maxActive).toBe(1);
+
+    const [job] = await jvex.unsafeSql<any>(
+      "SELECT runs, lastStatus, lastError FROM _jobs WHERE name = ?",
+      "timeout.tick",
+    );
+    expect(job.runs).toBe(1);
+    expect(job.lastStatus).toBe("error");
+    expect(job.lastError).toBe("Job timeout.tick timed out after 200ms");
+
+    await jvex.close();
+  });
+
+  test("timed-out jobs can run again after the timed-out handler settles", async () => {
+    let active = 0;
+    let maxActive = 0;
+    let runs = 0;
+
+    const jvex = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("recover");
+          api.registerJob("tick", {
+            schedule: "every 1h",
+            timeoutMs: 50,
+            async handler() {
+              runs += 1;
+              active += 1;
+              maxActive = Math.max(maxActive, active);
+              await new Promise((resolve) => setTimeout(resolve, 100));
+              active -= 1;
+            },
+          });
+        },
+      ],
+    });
+
+    await jvex.triggerJob("recover.tick");
+    expect(runs).toBe(1);
+    expect(active).toBe(0);
+
+    await jvex.triggerJob("recover.tick");
+    expect(runs).toBe(2);
+    expect(active).toBe(0);
+    expect(maxActive).toBe(1);
+
+    await jvex.close();
+  });
+
+  test("job retries do not overlap with the failed attempt or scheduled ticks", async () => {
+    let active = 0;
+    let maxActive = 0;
+    let runs = 0;
+
+    const jvex = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("retrying");
+          api.registerJob("tick", {
+            schedule: "every 1s",
+            retries: 1,
+            retryDelayMs: 300,
+            async handler() {
+              runs += 1;
+              active += 1;
+              maxActive = Math.max(maxActive, active);
+              await new Promise((resolve) => setTimeout(resolve, 800));
+              active -= 1;
+              throw new Error("boom");
+            },
+          });
+        },
+      ],
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+
+    expect(runs).toBe(2);
+    expect(active).toBe(0);
+    expect(maxActive).toBe(1);
+
+    const [job] = await jvex.unsafeSql<any>(
+      "SELECT runs, lastStatus, lastError FROM _jobs WHERE name = ?",
+      "retrying.tick",
+    );
+    expect(job.runs).toBe(1);
+    expect(job.lastStatus).toBe("error");
+    expect(job.lastError).toBe("boom");
+
+    await jvex.close();
+  });
+
+  test("concurrent manual triggers for the same job do not overlap", async () => {
+    let active = 0;
+    let maxActive = 0;
+    let runs = 0;
+
+    const jvex = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("manual");
+          api.registerJob("tick", {
+            schedule: "every 1h",
+            async handler() {
+              runs += 1;
+              active += 1;
+              maxActive = Math.max(maxActive, active);
+              await new Promise((resolve) => setTimeout(resolve, 300));
+              active -= 1;
+            },
+          });
+        },
+      ],
+    });
+
+    await Promise.all([
+      jvex.triggerJob("manual.tick"),
+      jvex.triggerJob("manual.tick"),
+      jvex.triggerJob("manual.tick"),
+    ]);
+
+    expect(runs).toBe(1);
+    expect(active).toBe(0);
+    expect(maxActive).toBe(1);
+
+    await jvex.close();
+  });
+
+  test("close waits for running jobs before closing storage", async () => {
+    let active = 0;
+    let completed = false;
+
+    const jvex = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("shutdown");
+          api.registerJob("tick", {
+            schedule: "every 1h",
+            async handler(ctx) {
+              active += 1;
+              await new Promise((resolve) => setTimeout(resolve, 100));
+              await ctx.db.table("_jobs").count();
+              active -= 1;
+              completed = true;
+            },
+          });
+        },
+      ],
+    });
+
+    const trigger = jvex.triggerJob("shutdown.tick");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(active).toBe(1);
+
+    await jvex.close();
+    await trigger;
+
+    expect(active).toBe(0);
+    expect(completed).toBe(true);
+  });
+});
+
 describe("trace metadata", () => {
   test("does not auto-capture query, mutation, subscription, or webhook args", async () => {
     const spans: any[] = [];
