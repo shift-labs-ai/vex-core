@@ -343,12 +343,17 @@ export class VexClient {
     } else if (frame.type === "error") {
       // A rejected auth frame is terminal: the server closes the
       // socket right after, and reconnecting with the same dead
-      // credential would just loop. Tear down instead of retrying;
-      // the app's auth layer owns recovery (re-login, re-pair).
+      // credential would just loop. Notify every active subscription
+      // (close() drops them silently), then tear down; the app's
+      // auth layer owns recovery (re-login, re-pair).
       if (frame.id === this.authId) {
-        console.error(
-          `[vex-client] authentication rejected: ${frame.message ?? "Unauthorized"}`,
+        const err = new Error(
+          `authentication rejected: ${frame.message ?? "Unauthorized"}`,
         );
+        console.error(`[vex-client] ${err.message}`);
+        for (const sub of this.subscriptions.values()) {
+          sub.onError?.(err);
+        }
         this.close();
         return;
       }

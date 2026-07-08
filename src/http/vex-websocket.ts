@@ -200,10 +200,18 @@ export function vexWebSocket(
     frame: ClientFrame,
   ): Promise<void> {
     if (frame.type === "auth") {
-      const pending = handleAuth(ws, frame);
-      ws.data.pendingAuth = pending.then(() => {
-        ws.data.pendingAuth = null;
+      const pending = handleAuth(ws, frame).catch((err) => {
+        // handleAuth handles its own failures; this guard only
+        // exists so a bug in it can never leave a rejected promise
+        // for guarded frames to trip over.
+        console.error("[vex-ws] auth handling failed:", err);
       });
+      // Clear the marker only if it is still ours - a newer auth
+      // frame may have replaced it while this one resolved.
+      const marker: Promise<void> = pending.then(() => {
+        if (ws.data.pendingAuth === marker) ws.data.pendingAuth = null;
+      });
+      ws.data.pendingAuth = marker;
       return pending;
     }
     // Clients send auth first but don't wait for its result before

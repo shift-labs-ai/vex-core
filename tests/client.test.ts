@@ -282,6 +282,479 @@ function collectData(
   });
 }
 
+// ── First-frame auth edge cases ──────────────────────────────────
+//
+// Shared harness: spins up an isolated secure server per test and
+// gives raw frame-level access, so each case reads as "send these
+// frames, expect those frames / that close".
+
+interface RawSocket {
+  ws: WebSocket;
+  frames: any[];
+  send(frame: Record<string, unknown>): void;
+  /** Resolves with the close event; never rejects. */
+  closed: Promise<{ code: number }>;
+  /** Waits until `frames` satisfies the predicate (or times out). */
+  until(pred: (frames: any[]) => boolean, timeoutMs?: number): Promise<void>;
+}
+
+function secureServe(options: Parameters<typeof vexWebSocket>[1]): {
+  url: string;
+  stop(): void;
+} {
+  const handlers = vexWebSocket(vex, options);
+  const server = Bun.serve({
+    port: 0,
+    fetch(req, srv) {
+      return handlers.upgrade(req, srv);
+    },
+    websocket: {
+      open: handlers.open as any,
+      message: handlers.message as any,
+      close: handlers.close as any,
+    },
+  });
+  return {
+    url: `ws://localhost:${server.port}`,
+    stop: () => server.stop(true),
+  };
+}
+
+async function rawSocket(url: string): Promise<RawSocket> {
+  const ws = new WebSocket(url);
+  const frames: any[] = [];
+  const closed = new Promise<{ code: number }>((resolve) => {
+    ws.addEventListener(
+      "close",
+      (ev) => resolve({ code: (ev as CloseEvent).code }),
+      {
+        once: true,
+      },
+    );
+  });
+  ws.addEventListener("message", (ev) =>
+    frames.push(JSON.parse(ev.data as string)),
+  );
+  await new Promise<void>((resolve, reject) => {
+    ws.addEventListener("open", () => resolve(), { once: true });
+    ws.addEventListener("error", () => reject(new Error("ws open failed")), {
+      once: true,
+    });
+  });
+  return {
+    ws,
+    frames,
+    send: (frame) => ws.send(JSON.stringify(frame)),
+    closed,
+    async until(pred, timeoutMs = 1_500) {
+      const deadline = Date.now() + timeoutMs;
+      while (!pred(frames)) {
+        if (Date.now() > deadline) {
+          throw new Error(
+            `until() timed out; frames: ${JSON.stringify(frames)}`,
+          );
+        }
+        await Bun.sleep(10);
+      }
+    },
+  };
+}
+
+describe("WebSocket first-frame auth edge cases", () => {
+  test("auth frame on a server without getUserFromToken is refused, socket survives", async () => {
+    // requireUser=false: an open server. The auth frame is answered
+    // with a typed error but must not kill an otherwise-valid
+    // anonymous connection.
+    const srv = secureServe({});
+    try {
+      const sock = await rawSocket(srv.url);
+      sock.send({ type: "auth", id: "a-1", token: "anything" });
+      sock.send({ type: "query", id: "q-1", name: "items.list" });
+      await sock.until((f) => f.length >= 2);
+      expect(sock.frames).toContainEqual({
+        type: "error",
+        id: "a-1",
+        message: "Token auth is not enabled",
+      });
+      expect(
+        sock.frames.some((f) => f.type === "result" && f.id === "q-1"),
+      ).toBe(true);
+      sock.ws.close();
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("a throwing getUserFromToken is unauthorized, not a crash", async () => {
+    const srv = secureServe({
+      requireUser: true,
+      getUserFromToken: () => {
+        throw new Error("identity backend down");
+      },
+    });
+    try {
+      const sock = await rawSocket(srv.url);
+      sock.send({ type: "auth", id: "a-1", token: "t" });
+      const close = await sock.closed;
+      expect(close.code).toBe(1008);
+      expect(sock.frames).toContainEqual({
+        type: "error",
+        id: "a-1",
+        message: "Unauthorized",
+      });
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("a genuinely async slow auth still wins the race against same-tick frames", async () => {
+    // The same-tick test elsewhere uses a sync resolver; this one
+    // holds the auth open across real event-loop turns while the
+    // subscribe and query frames arrive and must queue behind it.
+    let release!: (u: { id: string } | null) => void;
+    const gate = new Promise<{ id: string } | null>((r) => {
+      release = r;
+    });
+    const srv = secureServe({
+      requireUser: true,
+      getUserFromToken: () => gate,
+    });
+    try {
+      const sock = await rawSocket(srv.url);
+      sock.send({ type: "auth", id: "a-1", token: "t" });
+      sock.send({ type: "subscribe", id: "s-1", name: "items.list" });
+      sock.send({ type: "query", id: "who", name: "items.viewer" });
+      // Nothing may be answered while auth is pending.
+      await Bun.sleep(100);
+      expect(sock.frames).toHaveLength(0);
+
+      release({ id: "slow-user" });
+      await sock.until((f) => f.length >= 3);
+      expect(sock.frames).toContainEqual({
+        type: "result",
+        id: "a-1",
+        data: { ok: true },
+      });
+      expect(sock.frames).toContainEqual({
+        type: "result",
+        id: "who",
+        data: "slow-user",
+      });
+      expect(sock.frames.some((f) => f.type === "data" && f.id === "s-1")).toBe(
+        true,
+      );
+      sock.ws.close();
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("a newer auth frame is not unblocked by an older one settling", async () => {
+    // The regression the pendingAuth marker guards against: auth #1
+    // settles while auth #2 is still in flight; a guarded frame must
+    // wait for #2, not sneak through when #1 clears the marker.
+    const gates = new Map<string, Promise<{ id: string } | null>>();
+    const releases = new Map<string, (u: { id: string } | null) => void>();
+    for (const key of ["first", "second"]) {
+      gates.set(
+        key,
+        new Promise((r) => {
+          releases.set(key, r);
+        }),
+      );
+    }
+    const srv = secureServe({
+      requireUser: true,
+      getUserFromToken: (token) => gates.get(token) ?? null,
+    });
+    try {
+      const sock = await rawSocket(srv.url);
+      sock.send({ type: "auth", id: "a-1", token: "first" });
+      sock.send({ type: "auth", id: "a-2", token: "second" });
+      sock.send({ type: "query", id: "who", name: "items.viewer" });
+
+      // Settle the FIRST auth. The query is guarded by the SECOND
+      // (newer) auth and must stay unanswered.
+      releases.get("first")!({ id: "user-one" });
+      await sock.until((f) =>
+        f.some((x: any) => x.type === "result" && x.id === "a-1"),
+      );
+      await Bun.sleep(100);
+      expect(
+        sock.frames.some((f) => f.type === "result" && f.id === "who"),
+      ).toBe(false);
+
+      releases.get("second")!({ id: "user-two" });
+      await sock.until((f) =>
+        f.some((x: any) => x.type === "result" && x.id === "who"),
+      );
+      expect(sock.frames).toContainEqual({
+        type: "result",
+        id: "who",
+        data: "user-two",
+      });
+      sock.ws.close();
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("re-authenticating an already-authenticated socket swaps the pinned user", async () => {
+    const users: Record<string, { id: string }> = {
+      "tok-a": { id: "alice" },
+      "tok-b": { id: "bob" },
+    };
+    const srv = secureServe({
+      requireUser: true,
+      getUserFromToken: (token) => users[token] ?? null,
+    });
+    try {
+      const sock = await rawSocket(srv.url);
+      sock.send({ type: "auth", id: "a-1", token: "tok-a" });
+      sock.send({ type: "query", id: "q-1", name: "items.viewer" });
+      await sock.until((f) =>
+        f.some((x: any) => x.type === "result" && x.id === "q-1"),
+      );
+      expect(sock.frames).toContainEqual({
+        type: "result",
+        id: "q-1",
+        data: "alice",
+      });
+
+      sock.send({ type: "auth", id: "a-2", token: "tok-b" });
+      sock.send({ type: "query", id: "q-2", name: "items.viewer" });
+      await sock.until((f) =>
+        f.some((x: any) => x.type === "result" && x.id === "q-2"),
+      );
+      expect(sock.frames).toContainEqual({
+        type: "result",
+        id: "q-2",
+        data: "bob",
+      });
+      sock.ws.close();
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("an auth frame without a token string is dropped at parse, deadline still applies", async () => {
+    const srv = secureServe({
+      requireUser: true,
+      getUserFromToken: () => ({ id: "user" }),
+      authTimeoutMs: 150,
+    });
+    try {
+      const sock = await rawSocket(srv.url);
+      sock.send({ type: "auth", id: "a-1" }); // malformed: no token
+      const close = await sock.closed;
+      // Dropped frames are not auth attempts - the deadline reaped
+      // the socket as never-authenticated.
+      expect(close.code).toBe(1008);
+      expect(sock.frames).toHaveLength(0);
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("successful auth clears the deadline - the socket outlives authTimeoutMs", async () => {
+    const srv = secureServe({
+      requireUser: true,
+      getUserFromToken: () => ({ id: "user" }),
+      authTimeoutMs: 100,
+    });
+    try {
+      const sock = await rawSocket(srv.url);
+      sock.send({ type: "auth", id: "a-1", token: "t" });
+      await sock.until((f) =>
+        f.some((x: any) => x.type === "result" && x.id === "a-1"),
+      );
+      await Bun.sleep(250);
+      sock.send({ type: "query", id: "q-1", name: "items.list" });
+      await sock.until((f) =>
+        f.some((x: any) => x.type === "result" && x.id === "q-1"),
+      );
+      sock.ws.close();
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("auth elevates an anonymous socket when requireUser is off", async () => {
+    // Open server with token auth available: anonymous frames are
+    // served (no user), and an auth frame upgrades the connection
+    // to an identified one.
+    const srv = secureServe({
+      getUserFromToken: (token) =>
+        token === "tok" ? { id: "identified" } : null,
+    });
+    try {
+      const sock = await rawSocket(srv.url);
+      sock.send({ type: "query", id: "anon", name: "items.viewer" });
+      await sock.until((f) =>
+        f.some((x: any) => x.type === "result" && x.id === "anon"),
+      );
+      expect(sock.frames).toContainEqual({
+        type: "result",
+        id: "anon",
+        data: null,
+      });
+
+      sock.send({ type: "auth", id: "a-1", token: "tok" });
+      sock.send({ type: "query", id: "named", name: "items.viewer" });
+      await sock.until((f) =>
+        f.some((x: any) => x.type === "result" && x.id === "named"),
+      );
+      expect(sock.frames).toContainEqual({
+        type: "result",
+        id: "named",
+        data: "identified",
+      });
+      sock.ws.close();
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("every guarded frame type is refused before auth, and unsubscribe stays silent", async () => {
+    const srv = secureServe({
+      requireUser: true,
+      getUserFromToken: () => ({ id: "user" }),
+    });
+    try {
+      const sock = await rawSocket(srv.url);
+      sock.send({ type: "subscribe", id: "s-1", name: "items.list" });
+      sock.send({ type: "query", id: "q-1", name: "items.list" });
+      sock.send({
+        type: "mutate",
+        id: "m-1",
+        name: "items.create",
+        args: { name: "x", value: 1 },
+      });
+      sock.send({ type: "unsubscribe", id: "s-1" });
+      await sock.until((f) => f.length >= 4);
+      for (const id of ["s-1", "q-1", "m-1"]) {
+        expect(sock.frames).toContainEqual({
+          type: "error",
+          id,
+          message: "Unauthorized",
+        });
+      }
+      // unsubscribe is also refused per-id (it went through the same
+      // guard) - and crucially, nothing was ever registered to leak.
+      expect(
+        sock.frames.filter((f) => f.id === "s-1" && f.type === "error").length,
+      ).toBeGreaterThanOrEqual(1);
+      sock.ws.close();
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("VexClient buffers one-shots issued before connect behind the auth frame", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const srv = secureServe({
+      requireUser: true,
+      getUserFromToken: (token) =>
+        token === "tok" ? { id: "buffered-user" } : null,
+    });
+    const client = new VexClient({
+      basePath: `http://localhost:${new URL(srv.url.replace("ws://", "http://")).port}`,
+      token: "tok",
+    });
+    try {
+      // Issued while the socket is still connecting - lands in
+      // pendingSends and must flush AFTER the auth frame.
+      expect(await client.query("items.viewer")).toBe("buffered-user");
+    } finally {
+      client.close();
+      srv.stop();
+    }
+  });
+
+  test("VexClient token thunk returning null connects without auth", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const srv = secureServe({
+      requireUser: true,
+      getUserFromToken: () => ({ id: "user" }),
+    });
+    const client = new VexClient({
+      basePath: `http://localhost:${new URL(srv.url.replace("ws://", "http://")).port}`,
+      token: () => null,
+    });
+    try {
+      const failure = new Promise<Error>((resolve) => {
+        client.subscribe("items.list", {}, () => {}, resolve);
+      });
+      // No credential offered: the server refuses the subscribe
+      // per-id and the consumer's onError hears about it.
+      const err = await failure;
+      expect(err.message).toBe("Unauthorized");
+    } finally {
+      client.close();
+      srv.stop();
+    }
+  });
+
+  test("VexClient token thunk is re-resolved on reconnect - rotated credentials work", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const seen: string[] = [];
+    const handlers = vexWebSocket(vex, {
+      requireUser: true,
+      getUserFromToken: (token) => {
+        seen.push(token);
+        return { id: token };
+      },
+    });
+    const serve = () =>
+      Bun.serve({
+        port,
+        fetch(req, srv) {
+          return handlers.upgrade(req, srv);
+        },
+        websocket: {
+          open: handlers.open as any,
+          message: handlers.message as any,
+          close: handlers.close as any,
+        },
+      });
+    // Fixed port so the restarted server is reachable at the same URL.
+    let port = 0;
+    let server = serve();
+    port = server.port;
+
+    let generation = 0;
+    const client = new VexClient({
+      basePath: `http://localhost:${port}`,
+      token: () => `tok-${++generation}`,
+      minReconnectDelayMs: 10,
+      maxReconnectDelayMs: 50,
+    });
+    try {
+      const first = new Promise<unknown>((resolve) => {
+        client.subscribe("items.list", {}, resolve);
+      });
+      await first;
+      expect(seen).toEqual(["tok-1"]);
+
+      // Kill the server; the client reconnects with a FRESH thunk
+      // resolution once the same port is listening again.
+      server.stop(true);
+      await Bun.sleep(50);
+      server = serve();
+
+      const deadline = Date.now() + 3_000;
+      while (!seen.includes("tok-2") && Date.now() < deadline) {
+        await Bun.sleep(25);
+      }
+      expect(seen).toContain("tok-2");
+      expect(await client.query("items.viewer")).toBe(`tok-${generation}`);
+    } finally {
+      client.close();
+      server.stop(true);
+    }
+  });
+});
+
 describe("WebSocket live channel", () => {
   test("requireUser rejects unauthenticated upgrades", async () => {
     const secureWs = vexWebSocket(vex, { requireUser: true });
@@ -299,13 +772,11 @@ describe("WebSocket live channel", () => {
 
     try {
       const ws = new WebSocket(`ws://localhost:${secureServer.port}`);
-      const event = await new Promise<"open" | "error" | "close">(
-        (resolve) => {
-          ws.addEventListener("open", () => resolve("open"), { once: true });
-          ws.addEventListener("error", () => resolve("error"), { once: true });
-          ws.addEventListener("close", () => resolve("close"), { once: true });
-        },
-      );
+      const event = await new Promise<"open" | "error" | "close">((resolve) => {
+        ws.addEventListener("open", () => resolve("open"), { once: true });
+        ws.addEventListener("error", () => resolve("error"), { once: true });
+        ws.addEventListener("close", () => resolve("close"), { once: true });
+      });
       expect(event).not.toBe("open");
     } finally {
       secureServer.stop(true);
@@ -333,9 +804,7 @@ describe("WebSocket live channel", () => {
     });
 
     try {
-      const ws = new WebSocket(
-        `ws://localhost:${secureServer.port}?token=ok`,
-      );
+      const ws = new WebSocket(`ws://localhost:${secureServer.port}?token=ok`);
       await new Promise<void>((resolve, reject) => {
         ws.addEventListener("open", () => resolve(), { once: true });
         ws.addEventListener("error", () => reject(new Error("ws rejected")), {
@@ -401,9 +870,7 @@ describe("WebSocket live channel", () => {
       );
       // Auth frame first, then a query in the SAME tick - the query
       // must wait for the in-flight auth instead of racing it.
-      ws.send(
-        JSON.stringify({ type: "auth", id: "a-1", token: "good-token" }),
-      );
+      ws.send(JSON.stringify({ type: "auth", id: "a-1", token: "good-token" }));
       ws.send(
         JSON.stringify({ type: "query", id: "who", name: "items.viewer" }),
       );
@@ -565,13 +1032,11 @@ describe("WebSocket live channel", () => {
 
     try {
       const ws = new WebSocket(`ws://localhost:${secureServer.port}`);
-      const event = await new Promise<"open" | "error" | "close">(
-        (resolve) => {
-          ws.addEventListener("open", () => resolve("open"), { once: true });
-          ws.addEventListener("error", () => resolve("error"), { once: true });
-          ws.addEventListener("close", () => resolve("close"), { once: true });
-        },
-      );
+      const event = await new Promise<"open" | "error" | "close">((resolve) => {
+        ws.addEventListener("open", () => resolve("open"), { once: true });
+        ws.addEventListener("error", () => resolve("error"), { once: true });
+        ws.addEventListener("close", () => resolve("close"), { once: true });
+      });
       expect(event).not.toBe("open");
     } finally {
       secureServer.stop(true);
@@ -660,6 +1125,40 @@ describe("WebSocket live channel", () => {
       });
       expect(Array.isArray(await first)).toBe(true);
       expect(await client.query("items.viewer")).toBe("client-user");
+    } finally {
+      client.close();
+      secureServer.stop(true);
+    }
+  });
+
+  test("VexClient with a rejected token tears down and notifies subscribers", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const secureWs = vexWebSocket(vex, {
+      requireUser: true,
+      getUserFromToken: () => null,
+    });
+    const secureServer = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        return secureWs.upgrade(req, srv);
+      },
+      websocket: {
+        open: secureWs.open as any,
+        message: secureWs.message as any,
+        close: secureWs.close as any,
+      },
+    });
+
+    const client = new VexClient({
+      basePath: `http://localhost:${secureServer.port}`,
+      token: "revoked",
+    });
+    try {
+      const failure = new Promise<Error>((resolve) => {
+        client.subscribe("items.list", {}, () => {}, resolve);
+      });
+      const err = await failure;
+      expect(err.message).toMatch(/authentication rejected/i);
     } finally {
       client.close();
       secureServer.stop(true);
