@@ -1,4 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import {
+  createServer as createNetServer,
+  connect as netConnect,
+} from "node:net";
 import type { Server } from "bun";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import { Vex } from "../src/core/engine.js";
@@ -748,6 +752,193 @@ describe("WebSocket first-frame auth edge cases", () => {
       }
       expect(seen).toContain("tok-2");
       expect(await client.query("items.viewer")).toBe(`tok-${generation}`);
+    } finally {
+      client.close();
+      server.stop(true);
+    }
+  });
+});
+
+// ── Heartbeat ──────────────────────────────────────────────────────────
+//
+// The protocol only speaks when there's something to say, so an idle
+// chat surface sends zero bytes for minutes. Every real deployment
+// sits behind an ingress with an idle timeout (~30-60s) that kills
+// silent TCP connections - producing a reconnect-churn loop: connect,
+// auth, idle, killed at the timeout, reconnect. The heartbeat keeps
+// idle sockets warm through any proxy.
+
+/**
+ * TCP proxy emulating an ingress idle timeout: forwards to `target`
+ * and destroys any connection with no traffic in either direction
+ * for `idleMs`.
+ */
+function idleKillingProxy(
+  target: number,
+  idleMs: number,
+): { port: number; kills(): number; stop(): void } {
+  let kills = 0;
+  const sockets = new Set<import("node:net").Socket>();
+  const server = createNetServer((client) => {
+    const upstream = netConnect(target, "127.0.0.1");
+    sockets.add(client);
+    sockets.add(upstream);
+    let timer: ReturnType<typeof setTimeout>;
+    const arm = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        kills++;
+        client.destroy();
+        upstream.destroy();
+      }, idleMs);
+    };
+    arm();
+    client.on("data", (d) => {
+      arm();
+      upstream.write(d);
+    });
+    upstream.on("data", (d) => {
+      arm();
+      client.write(d);
+    });
+    const cleanup = () => {
+      clearTimeout(timer);
+      client.destroy();
+      upstream.destroy();
+    };
+    client.on("close", cleanup);
+    client.on("error", cleanup);
+    upstream.on("close", cleanup);
+    upstream.on("error", cleanup);
+  });
+  server.listen(0);
+  const port = (server.address() as { port: number }).port;
+  return {
+    port,
+    kills: () => kills,
+    stop: () => {
+      for (const s of sockets) s.destroy();
+      server.close();
+    },
+  };
+}
+
+describe("WebSocket heartbeat", () => {
+  test("an idle client survives an ingress idle timeout", async () => {
+    // THE deployment bug: without a heartbeat the socket dies at the
+    // proxy's idle deadline and the client reconnect-churns forever.
+    // With the heartbeat pinging inside the idle window, one socket
+    // lives through several would-be timeouts.
+    const { VexClient } = await import("../src/client/client.js");
+    const handlers = vexWebSocket(vex, {});
+    const server = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        return handlers.upgrade(req, srv);
+      },
+      websocket: {
+        open: handlers.open as any,
+        message: handlers.message as any,
+        close: handlers.close as any,
+      },
+    });
+    const proxy = idleKillingProxy(server.port, 300);
+
+    const client = new VexClient({
+      basePath: `http://localhost:${proxy.port}`,
+      heartbeatIntervalMs: 100,
+    });
+    try {
+      const first = new Promise<unknown>((resolve) => {
+        client.subscribe("items.list", {}, resolve);
+      });
+      await first;
+
+      // Idle across 4x the proxy's timeout window.
+      await Bun.sleep(1_200);
+      expect(proxy.kills()).toBe(0);
+
+      // Still the same live connection: a query answers instantly.
+      expect(Array.isArray(await client.query("items.list"))).toBe(true);
+    } finally {
+      client.close();
+      proxy.stop();
+      server.stop(true);
+    }
+  });
+
+  test("server answers ping with pong, even before authentication", async () => {
+    // Keepalive is transport-level: it must not be gated behind the
+    // auth guard, or an unauthenticated-but-connecting socket behind
+    // a fast proxy could die mid-handshake. The auth deadline still
+    // reaps sockets that never authenticate - pinging is not a way
+    // to squat unauthenticated.
+    const srv = secureServe({
+      requireUser: true,
+      getUserFromToken: () => ({ id: "user" }),
+      authTimeoutMs: 300,
+    });
+    try {
+      const sock = await rawSocket(srv.url);
+      sock.send({ type: "ping", id: "hb-1" });
+      await sock.until((f) =>
+        f.some((x: any) => x.type === "pong" && x.id === "hb-1"),
+      );
+      // Pings don't extend the auth deadline.
+      const close = await sock.closed;
+      expect(close.code).toBe(1008);
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test("a dead upstream is detected by a missed pong and the client reconnects", async () => {
+    // Half-open connections: the TCP path is up but the server stops
+    // answering (crashed process behind a proxy, dropped VM). Without
+    // pong tracking the client would trust the silent socket forever.
+    const { VexClient } = await import("../src/client/client.js");
+    let connections = 0;
+    let mute = false;
+    const handlers = vexWebSocket(vex, {});
+    const server = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        connections++;
+        return handlers.upgrade(req, srv);
+      },
+      websocket: {
+        open: handlers.open as any,
+        message: ((ws: any, raw: any) => {
+          if (mute) return; // swallow everything - a silent upstream
+          handlers.message(ws, raw);
+        }) as any,
+        close: handlers.close as any,
+      },
+    });
+
+    const client = new VexClient({
+      basePath: `http://localhost:${server.port}`,
+      heartbeatIntervalMs: 80,
+      heartbeatTimeoutMs: 120,
+      minReconnectDelayMs: 10,
+      maxReconnectDelayMs: 40,
+    });
+    try {
+      const first = new Promise<unknown>((resolve) => {
+        client.subscribe("items.list", {}, resolve);
+      });
+      await first;
+      expect(connections).toBe(1);
+
+      mute = true;
+      // Wait for: ping sent -> pong deadline missed -> reconnect.
+      const deadline = Date.now() + 3_000;
+      while (connections < 2 && Date.now() < deadline) {
+        if (connections >= 1 && Date.now() > deadline - 2_000) mute = false;
+        await Bun.sleep(25);
+      }
+      mute = false;
+      expect(connections).toBeGreaterThanOrEqual(2);
     } finally {
       client.close();
       server.stop(true);
