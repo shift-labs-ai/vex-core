@@ -60,6 +60,17 @@ export interface VexClientOptions {
    */
   token?: string | (() => string | null);
   /**
+   * Keepalive interval. The wire protocol is silent between changes,
+   * and ingress proxies kill idle TCP connections (~30-60s); pinging
+   * inside that window keeps the socket warm. Default 20s.
+   */
+  heartbeatIntervalMs?: number;
+  /**
+   * How long to wait for a pong before declaring the connection
+   * half-open (TCP up, upstream gone) and reconnecting. Default 10s.
+   */
+  heartbeatTimeoutMs?: number;
+  /**
    * Lower bound on reconnect backoff. Default 100ms.
    */
   minReconnectDelayMs?: number;
@@ -77,7 +88,11 @@ export class VexClient {
   private readonly token: string | (() => string | null) | null;
   private readonly minDelay: number;
   private readonly maxDelay: number;
+  private readonly heartbeatIntervalMs: number;
+  private readonly heartbeatTimeoutMs: number;
   private authId: string | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private pongTimer: ReturnType<typeof setTimeout> | null = null;
 
   private socket: WebSocket | null = null;
   private state: "idle" | "connecting" | "open" | "closed" = "idle";
@@ -94,6 +109,8 @@ export class VexClient {
     this.token = opts.token ?? null;
     this.minDelay = opts.minReconnectDelayMs ?? 100;
     this.maxDelay = opts.maxReconnectDelayMs ?? 5_000;
+    this.heartbeatIntervalMs = opts.heartbeatIntervalMs ?? 20_000;
+    this.heartbeatTimeoutMs = opts.heartbeatTimeoutMs ?? 10_000;
   }
 
   /**
@@ -155,6 +172,7 @@ export class VexClient {
    */
   close(): void {
     this.state = "closed";
+    this.stopHeartbeat();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -245,6 +263,8 @@ export class VexClient {
         this.rawSend({ type: "auth", id: this.authId, token });
       }
 
+      this.startHeartbeat(socket);
+
       // Re-send subscribe frames for every active subscription. The
       // server allocates fresh engine-side state; the client side
       // carries the same id so the existing callback wiring continues
@@ -269,6 +289,7 @@ export class VexClient {
     });
 
     socket.addEventListener("close", (ev) => {
+      this.stopHeartbeat();
       this.socket = null;
       // Any caller still waiting on a one-shot loses its transport.
       // We don't auto-retry — mutations aren't always idempotent
@@ -292,6 +313,48 @@ export class VexClient {
       // the close event that follows is what actually matters. Don't
       // act here — let `close` drive the reconnect.
     });
+  }
+
+  // ── Heartbeat ────────────────────────────────────────────────────────
+
+  /**
+   * Ping on an interval so ingress proxies never see an idle
+   * connection; treat a missed pong as a half-open socket (TCP up,
+   * upstream gone) and force a reconnect. One pong deadline at a
+   * time: a new ping doesn't re-arm the deadline while one is
+   * already pending, so a dead upstream is detected after exactly
+   * `heartbeatTimeoutMs` regardless of the ping cadence.
+   */
+  private startHeartbeat(socket: WebSocket): void {
+    this.stopHeartbeat();
+    if (this.heartbeatIntervalMs <= 0) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (this.state !== "open" || this.socket !== socket) return;
+      this.rawSend({ type: "ping", id: this.allocId("hb") });
+      if (this.pongTimer) return;
+      this.pongTimer = setTimeout(() => {
+        this.pongTimer = null;
+        console.warn("[vex-client] heartbeat pong missed; reconnecting");
+        // 4000 (app-defined, not 1000): the close handler treats it
+        // as an unexpected close and schedules the reconnect.
+        try {
+          socket.close(4000, "heartbeat timeout");
+        } catch {
+          /* already gone */
+        }
+      }, this.heartbeatTimeoutMs);
+    }, this.heartbeatIntervalMs);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.pongTimer) {
+      clearTimeout(this.pongTimer);
+      this.pongTimer = null;
+    }
   }
 
   private scheduleReconnect(): void {
@@ -331,6 +394,13 @@ export class VexClient {
     }
     if (typeof frame.id !== "string") return;
 
+    if (frame.type === "pong") {
+      if (this.pongTimer) {
+        clearTimeout(this.pongTimer);
+        this.pongTimer = null;
+      }
+      return;
+    }
     if (frame.type === "data") {
       const sub = this.subscriptions.get(frame.id);
       if (!sub) return;
@@ -343,12 +413,17 @@ export class VexClient {
     } else if (frame.type === "error") {
       // A rejected auth frame is terminal: the server closes the
       // socket right after, and reconnecting with the same dead
-      // credential would just loop. Tear down instead of retrying;
-      // the app's auth layer owns recovery (re-login, re-pair).
+      // credential would just loop. Notify every active subscription
+      // (close() drops them silently), then tear down; the app's
+      // auth layer owns recovery (re-login, re-pair).
       if (frame.id === this.authId) {
-        console.error(
-          `[vex-client] authentication rejected: ${frame.message ?? "Unauthorized"}`,
+        const err = new Error(
+          `authentication rejected: ${frame.message ?? "Unauthorized"}`,
         );
+        console.error(`[vex-client] ${err.message}`);
+        for (const sub of this.subscriptions.values()) {
+          sub.onError?.(err);
+        }
         this.close();
         return;
       }

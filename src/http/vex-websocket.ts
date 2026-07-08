@@ -21,15 +21,26 @@
  *
  *   Client → Server
  *     { type: "auth",        id, token }         first-frame bearer auth
+ *     { type: "ping",        id }                keepalive probe
  *     { type: "subscribe",   id, name, args? }   start a live query
  *     { type: "unsubscribe", id }                stop one
  *     { type: "query",       id, name, args? }   one-shot read
  *     { type: "mutate",      id, name, args? }   one-shot write
  *
  *   Server → Client
+ *     { type: "pong",   id }           keepalive answer
  *     { type: "data",   id, data }     subscribe initial + each update
  *     { type: "result", id, data }     query/mutate + auth completion
  *     { type: "error",  id, message }  per-id failure
+ *
+ * Keepalive
+ *   The protocol is otherwise silent between changes, and real
+ *   deployments sit behind ingress proxies that kill idle TCP
+ *   connections (~30-60s). The client pings on an interval; the
+ *   server answers. Ping/pong is transport-level: it is served
+ *   before the auth guard (a connecting socket must not die to a
+ *   fast proxy mid-handshake) but does NOT extend the auth deadline
+ *   - pinging is not a way to squat unauthenticated.
  *
  * `id` is client-assigned and opaque to the server; the server only
  * uses it to route responses back to the right caller. Subscription
@@ -199,11 +210,23 @@ export function vexWebSocket(
     ws: VexWebSocket,
     frame: ClientFrame,
   ): Promise<void> {
+    if (frame.type === "ping") {
+      send(ws, { type: "pong", id: frame.id });
+      return;
+    }
     if (frame.type === "auth") {
-      const pending = handleAuth(ws, frame);
-      ws.data.pendingAuth = pending.then(() => {
-        ws.data.pendingAuth = null;
+      const pending = handleAuth(ws, frame).catch((err) => {
+        // handleAuth handles its own failures; this guard only
+        // exists so a bug in it can never leave a rejected promise
+        // for guarded frames to trip over.
+        console.error("[vex-ws] auth handling failed:", err);
       });
+      // Clear the marker only if it is still ours - a newer auth
+      // frame may have replaced it while this one resolved.
+      const marker: Promise<void> = pending.then(() => {
+        if (ws.data.pendingAuth === marker) ws.data.pendingAuth = null;
+      });
+      ws.data.pendingAuth = marker;
       return pending;
     }
     // Clients send auth first but don't wait for its result before
@@ -310,6 +333,7 @@ export function vexWebSocket(
 
 type ClientFrame =
   | { type: "auth"; id: string; token: string }
+  | { type: "ping"; id: string }
   | {
       type: "subscribe";
       id: string;
@@ -359,6 +383,8 @@ function parseFrame(value: unknown): ClientFrame | null {
       return { type: f.type, id, name: f.name, args };
     case "unsubscribe":
       return { type: "unsubscribe", id };
+    case "ping":
+      return { type: "ping", id };
     case "auth":
       if (typeof f.token !== "string") {
         console.warn("[vex-ws] auth frame missing string `token`; ignored");
@@ -382,9 +408,11 @@ async function dispatch(
   // message boundary, so the union is guaranteed closed here.
   // TS will surface a never-narrowing error if a new variant is
   // ever added to `ClientFrame` and forgotten in this switch.
-  // (`auth` never reaches dispatch - `guardedDispatch` owns it.)
+  // (`auth` and `ping` never reach dispatch - `guardedDispatch`
+  // owns them.)
   switch (frame.type) {
     case "auth":
+    case "ping":
       return;
     case "subscribe":
       return handleSubscribe(vex, ws, frame);
