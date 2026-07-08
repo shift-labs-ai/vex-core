@@ -364,6 +364,308 @@ describe("WebSocket live channel", () => {
     }
   });
 
+  test("requireUser + getUserFromToken admits the socket and authenticates on the first frame", async () => {
+    // Browsers cannot attach an Authorization header to a WebSocket
+    // upgrade, and cross-origin surfaces (browser extensions) don't
+    // get their cookie attached either. `getUserFromToken` lets such
+    // clients authenticate with their first frame instead.
+    const secureWs = vexWebSocket(vex, {
+      requireUser: true,
+      getUserFromToken: (token) =>
+        token === "good-token" ? { id: "token-user" } : null,
+    });
+    const secureServer = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        return secureWs.upgrade(req, srv);
+      },
+      websocket: {
+        open: secureWs.open as any,
+        message: secureWs.message as any,
+        close: secureWs.close as any,
+      },
+    });
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${secureServer.port}`);
+      await new Promise<void>((resolve, reject) => {
+        ws.addEventListener("open", () => resolve(), { once: true });
+        ws.addEventListener("error", () => reject(new Error("ws rejected")), {
+          once: true,
+        });
+      });
+
+      const frames: any[] = [];
+      ws.addEventListener("message", (ev) =>
+        frames.push(JSON.parse(ev.data as string)),
+      );
+      // Auth frame first, then a query in the SAME tick - the query
+      // must wait for the in-flight auth instead of racing it.
+      ws.send(
+        JSON.stringify({ type: "auth", id: "a-1", token: "good-token" }),
+      );
+      ws.send(
+        JSON.stringify({ type: "query", id: "who", name: "items.viewer" }),
+      );
+      await Bun.sleep(100);
+
+      expect(frames).toContainEqual({
+        type: "result",
+        id: "a-1",
+        data: { ok: true },
+      });
+      expect(frames).toContainEqual({
+        type: "result",
+        id: "who",
+        data: "token-user",
+      });
+      ws.close();
+    } finally {
+      secureServer.stop(true);
+    }
+  });
+
+  test("a bad token gets an error frame and the server closes the socket", async () => {
+    const secureWs = vexWebSocket(vex, {
+      requireUser: true,
+      getUserFromToken: (token) =>
+        token === "good-token" ? { id: "token-user" } : null,
+    });
+    const secureServer = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        return secureWs.upgrade(req, srv);
+      },
+      websocket: {
+        open: secureWs.open as any,
+        message: secureWs.message as any,
+        close: secureWs.close as any,
+      },
+    });
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${secureServer.port}`);
+      await new Promise<void>((resolve) =>
+        ws.addEventListener("open", () => resolve(), { once: true }),
+      );
+      const frames: any[] = [];
+      ws.addEventListener("message", (ev) =>
+        frames.push(JSON.parse(ev.data as string)),
+      );
+      const closed = new Promise<CloseEvent>((resolve) =>
+        ws.addEventListener("close", (ev) => resolve(ev as CloseEvent), {
+          once: true,
+        }),
+      );
+      ws.send(JSON.stringify({ type: "auth", id: "a-1", token: "nope" }));
+
+      const closeEvent = await closed;
+      expect(closeEvent.code).toBe(1008);
+      expect(frames).toContainEqual({
+        type: "error",
+        id: "a-1",
+        message: "Unauthorized",
+      });
+    } finally {
+      secureServer.stop(true);
+    }
+  });
+
+  test("frames before authentication are refused per-id", async () => {
+    const secureWs = vexWebSocket(vex, {
+      requireUser: true,
+      getUserFromToken: () => ({ id: "token-user" }),
+    });
+    const secureServer = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        return secureWs.upgrade(req, srv);
+      },
+      websocket: {
+        open: secureWs.open as any,
+        message: secureWs.message as any,
+        close: secureWs.close as any,
+      },
+    });
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${secureServer.port}`);
+      await new Promise<void>((resolve) =>
+        ws.addEventListener("open", () => resolve(), { once: true }),
+      );
+      const got = new Promise<any>((resolve) =>
+        ws.addEventListener(
+          "message",
+          (ev) => resolve(JSON.parse(ev.data as string)),
+          { once: true },
+        ),
+      );
+      ws.send(JSON.stringify({ type: "query", id: "q-1", name: "items.list" }));
+      expect(await got).toEqual({
+        type: "error",
+        id: "q-1",
+        message: "Unauthorized",
+      });
+      ws.close();
+    } finally {
+      secureServer.stop(true);
+    }
+  });
+
+  test("sockets that never authenticate are closed at the deadline", async () => {
+    const secureWs = vexWebSocket(vex, {
+      requireUser: true,
+      getUserFromToken: () => ({ id: "token-user" }),
+      authTimeoutMs: 100,
+    });
+    const secureServer = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        return secureWs.upgrade(req, srv);
+      },
+      websocket: {
+        open: secureWs.open as any,
+        message: secureWs.message as any,
+        close: secureWs.close as any,
+      },
+    });
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${secureServer.port}`);
+      await new Promise<void>((resolve) =>
+        ws.addEventListener("open", () => resolve(), { once: true }),
+      );
+      const closed = new Promise<CloseEvent>((resolve) =>
+        ws.addEventListener("close", (ev) => resolve(ev as CloseEvent), {
+          once: true,
+        }),
+      );
+      const closeEvent = await closed;
+      expect(closeEvent.code).toBe(1008);
+    } finally {
+      secureServer.stop(true);
+    }
+  });
+
+  test("requireUser without getUserFromToken still rejects at upgrade", async () => {
+    // The pre-existing contract: hosts that don't opt into first-frame
+    // auth keep the hard upgrade-time boundary.
+    const secureWs = vexWebSocket(vex, { requireUser: true });
+    const secureServer = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        return secureWs.upgrade(req, srv);
+      },
+      websocket: {
+        open: secureWs.open as any,
+        message: secureWs.message as any,
+        close: secureWs.close as any,
+      },
+    });
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${secureServer.port}`);
+      const event = await new Promise<"open" | "error" | "close">(
+        (resolve) => {
+          ws.addEventListener("open", () => resolve("open"), { once: true });
+          ws.addEventListener("error", () => resolve("error"), { once: true });
+          ws.addEventListener("close", () => resolve("close"), { once: true });
+        },
+      );
+      expect(event).not.toBe("open");
+    } finally {
+      secureServer.stop(true);
+    }
+  });
+
+  test("a cookie-authenticated upgrade needs no auth frame even when token auth is enabled", async () => {
+    const secureWs = vexWebSocket(vex, {
+      requireUser: true,
+      getUser: (req) =>
+        new URL(req.url).searchParams.get("token") === "ok"
+          ? { id: "upgrade-user" }
+          : null,
+      getUserFromToken: () => null,
+      authTimeoutMs: 100,
+    });
+    const secureServer = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        return secureWs.upgrade(req, srv);
+      },
+      websocket: {
+        open: secureWs.open as any,
+        message: secureWs.message as any,
+        close: secureWs.close as any,
+      },
+    });
+
+    try {
+      const ws = new WebSocket(`ws://localhost:${secureServer.port}?token=ok`);
+      await new Promise<void>((resolve) =>
+        ws.addEventListener("open", () => resolve(), { once: true }),
+      );
+      // Outlive the deadline: an upgrade-authenticated socket must not
+      // be reaped for never sending an auth frame.
+      await Bun.sleep(200);
+      const got = new Promise<any>((resolve) =>
+        ws.addEventListener(
+          "message",
+          (ev) => resolve(JSON.parse(ev.data as string)),
+          { once: true },
+        ),
+      );
+      ws.send(
+        JSON.stringify({ type: "query", id: "who", name: "items.viewer" }),
+      );
+      expect(await got).toEqual({
+        type: "result",
+        id: "who",
+        data: "upgrade-user",
+      });
+      ws.close();
+    } finally {
+      secureServer.stop(true);
+    }
+  });
+
+  test("VexClient with a token authenticates before replaying subscriptions", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const secureWs = vexWebSocket(vex, {
+      requireUser: true,
+      getUserFromToken: (token) =>
+        token === "client-token" ? { id: "client-user" } : null,
+    });
+    const secureServer = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        const url = new URL(req.url);
+        if (url.pathname === "/subscribe") return secureWs.upgrade(req, srv);
+        return new Response("nope", { status: 404 });
+      },
+      websocket: {
+        open: secureWs.open as any,
+        message: secureWs.message as any,
+        close: secureWs.close as any,
+      },
+    });
+
+    const client = new VexClient({
+      basePath: `http://localhost:${secureServer.port}`,
+      token: "client-token",
+    });
+    try {
+      const first = new Promise<unknown>((resolve) => {
+        client.subscribe("items.list", {}, resolve);
+      });
+      expect(Array.isArray(await first)).toBe(true);
+      expect(await client.query("items.viewer")).toBe("client-user");
+    } finally {
+      client.close();
+      secureServer.stop(true);
+    }
+  });
+
   test("subscribe pushes initial data on connect", async () => {
     const client = await openClient();
     try {
