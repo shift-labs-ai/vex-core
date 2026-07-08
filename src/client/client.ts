@@ -50,6 +50,16 @@ export interface VexClientOptions {
    */
   basePath?: string;
   /**
+   * Bearer credential for first-frame auth. Browsers cannot attach
+   * an Authorization header to a WebSocket upgrade, so cross-origin
+   * clients authenticate with an `auth` frame instead - sent first
+   * on every (re)connect, before active subscriptions replay. A
+   * function is resolved fresh per connect, so rotated credentials
+   * are picked up on reconnect. Same-origin apps riding a session
+   * cookie don't need this.
+   */
+  token?: string | (() => string | null);
+  /**
    * Lower bound on reconnect backoff. Default 100ms.
    */
   minReconnectDelayMs?: number;
@@ -64,8 +74,10 @@ const SCHEME_HTTPS = "https://";
 
 export class VexClient {
   private readonly basePath: string;
+  private readonly token: string | (() => string | null) | null;
   private readonly minDelay: number;
   private readonly maxDelay: number;
+  private authId: string | null = null;
 
   private socket: WebSocket | null = null;
   private state: "idle" | "connecting" | "open" | "closed" = "idle";
@@ -79,6 +91,7 @@ export class VexClient {
 
   constructor(opts: VexClientOptions = {}) {
     this.basePath = opts.basePath ?? "/vex";
+    this.token = opts.token ?? null;
     this.minDelay = opts.minReconnectDelayMs ?? 100;
     this.maxDelay = opts.maxReconnectDelayMs ?? 5_000;
   }
@@ -220,6 +233,18 @@ export class VexClient {
       this.state = "open";
       this.reconnectAttempt = 0;
 
+      // Auth rides the first frame - before subscription replay and
+      // the buffered-send flush, so the server never sees a guarded
+      // frame from an unauthenticated socket. The server serializes
+      // the in-flight auth against subsequent frames; we don't wait
+      // for the result here.
+      const token =
+        typeof this.token === "function" ? this.token() : this.token;
+      if (token) {
+        this.authId = this.allocId("auth");
+        this.rawSend({ type: "auth", id: this.authId, token });
+      }
+
       // Re-send subscribe frames for every active subscription. The
       // server allocates fresh engine-side state; the client side
       // carries the same id so the existing callback wiring continues
@@ -316,6 +341,17 @@ export class VexClient {
       this.pendingResults.delete(frame.id);
       pending.resolve(frame.data);
     } else if (frame.type === "error") {
+      // A rejected auth frame is terminal: the server closes the
+      // socket right after, and reconnecting with the same dead
+      // credential would just loop. Tear down instead of retrying;
+      // the app's auth layer owns recovery (re-login, re-pair).
+      if (frame.id === this.authId) {
+        console.error(
+          `[vex-client] authentication rejected: ${frame.message ?? "Unauthorized"}`,
+        );
+        this.close();
+        return;
+      }
       // Errors target either a one-shot or a subscription. The id
       // disambiguates which side gets notified.
       const pending = this.pendingResults.get(frame.id);

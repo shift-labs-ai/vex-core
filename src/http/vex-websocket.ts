@@ -20,6 +20,7 @@
  * Wire protocol — all messages are JSON objects, one per ws.send().
  *
  *   Client → Server
+ *     { type: "auth",        id, token }         first-frame bearer auth
  *     { type: "subscribe",   id, name, args? }   start a live query
  *     { type: "unsubscribe", id }                stop one
  *     { type: "query",       id, name, args? }   one-shot read
@@ -27,7 +28,7 @@
  *
  *   Server → Client
  *     { type: "data",   id, data }     subscribe initial + each update
- *     { type: "result", id, data }     query/mutate completion
+ *     { type: "result", id, data }     query/mutate + auth completion
  *     { type: "error",  id, message }  per-id failure
  *
  * `id` is client-assigned and opaque to the server; the server only
@@ -36,10 +37,23 @@
  * ids are one-shot.
  *
  * Auth
- *   The user is resolved at upgrade time (cookies, bearer header,
- *   whatever the host's auth middleware does) and pinned to the
- *   connection. Every dispatched call inherits it. No per-message
- *   re-auth; if you want that, use HTTP RPC.
+ *   Two ways in, one resolution contract:
+ *
+ *   - Upgrade-time: the user is resolved from the upgrade request
+ *     (cookies, bearer header - whatever `getUser` does) and pinned
+ *     to the connection. This is the whole story for same-origin
+ *     clients, whose browser attaches the session cookie.
+ *   - First-frame bearer: browsers cannot attach an Authorization
+ *     header to a WebSocket upgrade, and cross-origin surfaces
+ *     (browser extensions, remote SPAs) don't get their cookie
+ *     attached either. When the host provides `getUserFromToken`,
+ *     an unauthenticated socket is admitted but refused service
+ *     until its first `auth` frame resolves to a user; sockets
+ *     that never authenticate are closed at `authTimeoutMs`.
+ *
+ *   Either way the user is pinned to the connection and every
+ *   dispatched call inherits it. No per-message re-auth; if you
+ *   want that, use HTTP RPC.
  *
  * Bun integration
  *   `vexWebSocket()` returns the four hooks Bun.serve needs:
@@ -69,6 +83,14 @@ export interface VexWebSocketConnectionState {
   user: VexUser | null;
   /** id → unsubscribe(). Drained on close. */
   subs: Map<string, () => void>;
+  /**
+   * In-flight `auth` frame resolution. Clients send auth as their
+   * first frame but don't wait for the result before subscribing,
+   * so guarded frames await this instead of racing it.
+   */
+  pendingAuth: Promise<void> | null;
+  /** Deadline for sockets admitted unauthenticated. */
+  authTimer: ReturnType<typeof setTimeout> | null;
 }
 
 /** Convenience alias for the typed `ServerWebSocket` Bun hands us. */
@@ -97,6 +119,24 @@ export interface VexWebSocketOptions {
    * leave it false or return a synthetic user from `getUser`.
    */
   requireUser?: boolean;
+  /**
+   * Resolve a bearer credential from an `auth` frame. Providing this
+   * enables first-frame auth: with `requireUser`, sockets that fail
+   * upgrade-time resolution are admitted unauthenticated instead of
+   * rejected, and must authenticate before anything else is served.
+   * Feed it the same resolution HTTP uses (e.g. wrap the token in a
+   * synthetic `Authorization: Bearer` request) so every transport
+   * accepts the same credentials.
+   */
+  getUserFromToken?: (
+    token: string,
+  ) => VexUser | null | undefined | Promise<VexUser | null | undefined>;
+  /**
+   * How long an unauthenticated socket may live before it is closed
+   * (code 1008). Only applies when `requireUser` and `getUserFromToken`
+   * are set and the upgrade did not authenticate. Default 10s.
+   */
+  authTimeoutMs?: number;
 }
 
 export interface VexWebSocketHandlers {
@@ -112,12 +152,70 @@ export interface VexWebSocketHandlers {
   close(ws: VexWebSocket): void;
 }
 
+const AUTH_TIMEOUT_DEFAULT_MS = 10_000;
+const POLICY_VIOLATION_CLOSE_CODE = 1008;
+
 export function vexWebSocket(
   vex: Vex,
   opts: VexWebSocketOptions = {},
 ): VexWebSocketHandlers {
   const getUser = opts.getUser ?? (() => null);
   const requireUser = opts.requireUser ?? false;
+  const getUserFromToken = opts.getUserFromToken ?? null;
+  const authTimeoutMs = opts.authTimeoutMs ?? AUTH_TIMEOUT_DEFAULT_MS;
+
+  async function handleAuth(
+    ws: VexWebSocket,
+    frame: { id: string; token: string },
+  ): Promise<void> {
+    if (!getUserFromToken) {
+      sendError(ws, frame.id, "Token auth is not enabled");
+      return;
+    }
+    let user: VexUser | null = null;
+    try {
+      user = (await getUserFromToken(frame.token)) ?? null;
+    } catch (err) {
+      console.error("[vex-ws] getUserFromToken failed:", err);
+    }
+    if (!user) {
+      // A bad credential is terminal for the connection: answering
+      // the frame lets the client distinguish "rejected" from a
+      // network drop, and the close stops it from streaming further
+      // frames into an unauthenticated socket.
+      sendError(ws, frame.id, "Unauthorized");
+      ws.close(POLICY_VIOLATION_CLOSE_CODE, "authentication failed");
+      return;
+    }
+    ws.data.user = user;
+    if (ws.data.authTimer) {
+      clearTimeout(ws.data.authTimer);
+      ws.data.authTimer = null;
+    }
+    sendResult(ws, frame.id, { ok: true });
+  }
+
+  async function guardedDispatch(
+    ws: VexWebSocket,
+    frame: ClientFrame,
+  ): Promise<void> {
+    if (frame.type === "auth") {
+      const pending = handleAuth(ws, frame);
+      ws.data.pendingAuth = pending.then(() => {
+        ws.data.pendingAuth = null;
+      });
+      return pending;
+    }
+    // Clients send auth first but don't wait for its result before
+    // flushing subscribes - let an in-flight auth settle before
+    // deciding this frame is unauthorized.
+    if (ws.data.pendingAuth) await ws.data.pendingAuth;
+    if (requireUser && !ws.data.user) {
+      sendError(ws, frame.id, "Unauthorized");
+      return;
+    }
+    return dispatch(vex, ws, frame);
+  }
 
   return {
     async upgrade(req, server) {
@@ -125,7 +223,7 @@ export function vexWebSocket(
       // the request, the body is no longer available and we can't
       // return a clean 401.
       const user = (await getUser(req)) ?? null;
-      if (requireUser && !user) {
+      if (requireUser && !user && !getUserFromToken) {
         return new Response("Unauthorized", {
           status: 401,
           headers: { "content-type": "text/plain; charset=utf-8" },
@@ -135,6 +233,8 @@ export function vexWebSocket(
       const data: ConnectionState = {
         user,
         subs: new Map(),
+        pendingAuth: null,
+        authTimer: null,
       };
 
       const ok = server.upgrade(req, { data });
@@ -154,9 +254,18 @@ export function vexWebSocket(
       });
     },
 
-    open(_ws) {
-      // No-op. `data` was pinned at upgrade time; this hook exists
-      // so the host can wire it through symmetrically with `close`.
+    open(ws) {
+      // Sockets admitted without upgrade-time auth get a deadline:
+      // authenticate via an `auth` frame or be closed. Without this,
+      // idle unauthenticated connections would pile up for free.
+      if (requireUser && !ws.data.user) {
+        ws.data.authTimer = setTimeout(() => {
+          ws.data.authTimer = null;
+          if (!ws.data.user) {
+            ws.close(POLICY_VIOLATION_CLOSE_CODE, "authentication timeout");
+          }
+        }, authTimeoutMs);
+      }
     },
 
     message(ws, raw) {
@@ -173,10 +282,14 @@ export function vexWebSocket(
       }
       const frame = parseFrame(parsed);
       if (!frame) return;
-      void dispatch(vex, ws, frame);
+      void guardedDispatch(ws, frame);
     },
 
     close(ws) {
+      if (ws.data.authTimer) {
+        clearTimeout(ws.data.authTimer);
+        ws.data.authTimer = null;
+      }
       // Drain all subscriptions for this connection. Each entry
       // is a `vex.subscribe()` unsubscribe function; calling it
       // removes the engine-side subscription and stops further
@@ -196,6 +309,7 @@ export function vexWebSocket(
 // ─── Frame types ────────────────────────────────────────────────────
 
 type ClientFrame =
+  | { type: "auth"; id: string; token: string }
   | {
       type: "subscribe";
       id: string;
@@ -245,6 +359,12 @@ function parseFrame(value: unknown): ClientFrame | null {
       return { type: f.type, id, name: f.name, args };
     case "unsubscribe":
       return { type: "unsubscribe", id };
+    case "auth":
+      if (typeof f.token !== "string") {
+        console.warn("[vex-ws] auth frame missing string `token`; ignored");
+        return null;
+      }
+      return { type: "auth", id, token: f.token };
     default:
       console.warn(`[vex-ws] unknown frame type: ${String(f.type)}; ignored`);
       return null;
@@ -262,7 +382,10 @@ async function dispatch(
   // message boundary, so the union is guaranteed closed here.
   // TS will surface a never-narrowing error if a new variant is
   // ever added to `ClientFrame` and forgotten in this switch.
+  // (`auth` never reaches dispatch - `guardedDispatch` owns it.)
   switch (frame.type) {
+    case "auth":
+      return;
     case "subscribe":
       return handleSubscribe(vex, ws, frame);
     case "unsubscribe":
