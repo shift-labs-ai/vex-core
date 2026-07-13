@@ -6,9 +6,9 @@ Local-first reactive backend engine. Plugin architecture, SQLite storage, real-t
 npm install vex-core
 ```
 
-**Runtime requirements**
+**Runtime requirement:** Bun 1.3+
 
-- Bun 1.3+ *or* Node 24+ — `vex-core/http` uses the Web platform's `URLPattern` global for route matching. Older runtimes need a polyfill (`urlpattern-polyfill` works).
+`vex-core` intentionally targets Bun. Its SQLite adapter, reactive hashing, and WebSocket server use Bun runtime APIs.
 
 Peer: `react` ^19 (only if you use `vex-core/client`).
 
@@ -129,7 +129,7 @@ Also supported in files: `webhook(path, handler)`, `job(schedule, handler)`, `mi
 
 ## HTTP
 
-`vex-core/http` is a small, composable HTTP toolkit built around the Fetch API. A `Router` matches methods and paths (via `URLPattern`), middleware wraps the chain in classic onion order, handlers return `Response` (or `undefined` to fall through). Inspired by Vert.x Web and Koa; no dependencies beyond Bun/Node built-ins.
+`vex-core/http` is a small, composable HTTP toolkit built around the Fetch API. A `Router` matches methods and paths (via `URLPattern`), middleware wraps the chain in classic onion order, handlers return `Response` (or `undefined` to fall through). Inspired by Vert.x Web and Koa; no dependencies beyond Bun's built-ins.
 
 ```ts
 import {
