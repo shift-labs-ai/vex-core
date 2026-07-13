@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
+import type { Span, Tracer } from "../src/core/tracer.js";
 import type { MiddlewareInfo, MutationContext } from "../src/core/types.js";
 
 // Inline KV plugin for testing (replaces app-specific plugin imports)
@@ -992,8 +993,152 @@ describe("jobs", () => {
 });
 
 describe("trace metadata", () => {
+  test("does not serialize query results when no trace is recording", async () => {
+    let serializations = 0;
+    const tracers: Array<Tracer | undefined> = [
+      undefined,
+      { shouldRecord: () => false, onSpan: () => {} },
+    ];
+
+    for (const tracer of tracers) {
+      const tvex = await Vex.create({
+        storage: sqliteAdapter(":memory:"),
+        ...(tracer ? { tracer } : {}),
+        plugins: [
+          (api: VexPluginAPI) => {
+            api.setName("sampled");
+            api.registerQuery("result", {
+              args: {},
+              handler: () => ({
+                toJSON() {
+                  serializations++;
+                  return { ok: true };
+                },
+              }),
+            });
+          },
+        ],
+      });
+
+      await tvex.query("sampled.result");
+      await tvex.close();
+    }
+
+    expect(serializations).toBe(0);
+  });
+
+  test("emits safe metadata for every query and write shape", async () => {
+    const spans: Span[] = [];
+    const tvex = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      tracer: { onSpan: (span) => spans.push(span) },
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("safe");
+          api.registerTable("documents", {
+            columns: {
+              workspaceId: { type: "string" },
+              content: { type: "string" },
+            },
+          });
+          api.registerQuery("read", {
+            args: { workspaceId: "string" },
+            handler: (ctx, args) =>
+              ctx.db
+                .table("documents")
+                .where("workspaceId", "=", args.workspaceId)
+                .all(),
+          });
+          api.registerMutation("insert", {
+            args: { workspaceId: "string", content: "string" },
+            handler: (ctx, args) => ctx.db.table("documents").insert(args),
+          });
+          api.registerMutation("upsert", {
+            args: { workspaceId: "string", content: "string" },
+            handler: (ctx, args) =>
+              ctx.db
+                .table("documents")
+                .upsert(
+                  { workspaceId: args.workspaceId },
+                  { content: args.content },
+                ),
+          });
+          api.registerMutation("update", {
+            args: { id: "string", content: "string" },
+            handler: (ctx, args) =>
+              ctx.db
+                .table("documents")
+                .update(args.id, { content: args.content }),
+          });
+          api.registerMutation("delete", {
+            args: { id: "string" },
+            handler: (ctx, args) => ctx.db.table("documents").delete(args.id),
+          });
+          api.registerMutation("rawDelete", {
+            args: { workspaceId: "string" },
+            handler: (ctx, args) =>
+              ctx.db.sql(
+                "DELETE FROM documents WHERE workspaceId = ?",
+                args.workspaceId,
+              ),
+          });
+        },
+      ],
+    });
+    const secretWorkspace = "workspace-secret-value";
+    const secretContent = "knowledge-content-must-not-enter-a-span";
+
+    await tvex.query("safe.read", { workspaceId: secretWorkspace });
+    const id = await tvex.mutate<string>("safe.insert", {
+      workspaceId: secretWorkspace,
+      content: secretContent,
+    });
+    await tvex.mutate("safe.upsert", {
+      workspaceId: secretWorkspace,
+      content: secretContent,
+    });
+    await tvex.mutate("safe.update", { id, content: secretContent });
+    await tvex.mutate("safe.delete", { id });
+    await tvex.mutate("safe.rawDelete", { workspaceId: secretWorkspace });
+
+    function metadata(type: string, name: string) {
+      const span = spans.find(
+        (candidate) => candidate.type === type && candidate.name === name,
+      );
+      if (!span?.meta) throw new Error(`Missing ${type} span: ${name}`);
+      return JSON.parse(span.meta);
+    }
+
+    expect(metadata("query", "safe.read").dependencies).toEqual([
+      {
+        table: "documents",
+        filters: [{ column: "workspaceId", operator: "=" }],
+      },
+    ]);
+    expect(metadata("mutation", "safe.insert").writes).toEqual([
+      { table: "documents", columns: ["content", "workspaceId"] },
+    ]);
+    expect(metadata("mutation", "safe.upsert").writes).toEqual([
+      { table: "documents", columns: ["content", "workspaceId"] },
+    ]);
+    expect(metadata("mutation", "safe.update").writes).toEqual([
+      { table: "documents", columns: ["content"] },
+    ]);
+    expect(metadata("mutation", "safe.delete").writes).toEqual([
+      { table: "documents" },
+    ]);
+    expect(metadata("mutation", "safe.rawDelete").writes).toEqual([
+      { table: "documents", raw: true },
+    ]);
+    const serializedMetadata = spans.map((span) => span.meta).join("\n");
+    expect(serializedMetadata).not.toContain(secretWorkspace);
+    expect(serializedMetadata).not.toContain(secretContent);
+
+    await tvex.close();
+  });
+
   test("does not auto-capture query, mutation, subscription, or webhook args", async () => {
-    const spans: any[] = [];
+    const spans: Span[] = [];
     const tvex = await Vex.create({
       storage: sqliteAdapter(":memory:"),
       tracer: { onSpan: (span) => spans.push(span) },

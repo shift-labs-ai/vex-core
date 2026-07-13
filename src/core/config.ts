@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 
-// Load .env file into process.env (Bun loads .env automatically, but
-// this handles explicit paths and non-Bun runtimes)
+// Load .env file into process.env. Bun handles the default .env file;
+// this helper also supports explicit paths.
 function loadEnvFile(path?: string) {
   const file = path ?? ".env";
   if (!existsSync(file)) return;

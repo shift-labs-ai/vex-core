@@ -6,9 +6,9 @@ Local-first reactive backend engine. Plugin architecture, SQLite storage, real-t
 npm install vex-core
 ```
 
-**Runtime requirements**
+**Runtime requirement:** Bun 1.3+
 
-- Bun 1.3+ *or* Node 24+ — `vex-core/http` uses the Web platform's `URLPattern` global for route matching. Older runtimes need a polyfill (`urlpattern-polyfill` works).
+`vex-core` intentionally targets Bun. Its SQLite adapter, reactive hashing, and WebSocket server use Bun runtime APIs.
 
 Peer: `react` ^19 (only if you use `vex-core/client`).
 
@@ -129,7 +129,7 @@ Also supported in files: `webhook(path, handler)`, `job(schedule, handler)`, `mi
 
 ## HTTP
 
-`vex-core/http` is a small, composable HTTP toolkit built around the Fetch API. A `Router` matches methods and paths (via `URLPattern`), middleware wraps the chain in classic onion order, handlers return `Response` (or `undefined` to fall through). Inspired by Vert.x Web and Koa; no dependencies beyond Bun/Node built-ins.
+`vex-core/http` is a small, composable HTTP toolkit built around the Fetch API. A `Router` matches methods and paths (via `URLPattern`), middleware wraps the chain in classic onion order, handlers return `Response` (or `undefined` to fall through). Inspired by Vert.x Web and Koa; no dependencies beyond Bun's built-ins.
 
 ```ts
 import {
@@ -278,19 +278,33 @@ SSE-backed — data updates automatically on mutations that touch the underlying
 
 Every engine operation is a span. Pass a `tracer` to `Vex.create` to capture queries, mutations, handler timings, tables touched, invalidated subscriptions, and errors. See `src/core/tracer.ts` for the `Tracer` and `Span` interfaces.
 
-Spans are written to the internal `_spans` table. Core does **not** prune it — retention policy is app-specific. For a long-running server, register a cron that deletes old rows:
+A tracer can make one head-sampling decision for each root. Returning `false` prevents the entire trace from recording and skips result-size instrumentation for one-shot queries:
+
+```ts
+const tracer: Tracer = {
+  shouldRecord: ({ traceId }) => sample(traceId),
+  onSpan: (span) => persist(span),
+};
+```
+
+Core metadata describes query and write structure without recording filter values, row values, handler arguments, or results. Core emits spans to the tracer but does not persist them automatically; it reserves the internal `_spans` table for apps that choose SQLite persistence. Retention remains app-specific. For a long-running server that writes `_spans`, register bounded cleanup:
 
 ```ts
 api.registerJob("spanRetention", {
   schedule: "every 1h",
   async handler(ctx) {
     const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 days
-    await ctx.db.table("_spans").where("startTime", "<", cutoff).delete();
+    await ctx.db.sql(
+      `DELETE FROM _spans WHERE _id IN (
+         SELECT _id FROM _spans WHERE startTime < ? LIMIT 1000
+       )`,
+      cutoff,
+    );
   },
 });
 ```
 
-Without this, `_spans` grows unbounded.
+Age retention alone is not a hard volume bound. Production sinks should also cap queued spans, individual span size, and total retained rows or bytes.
 
 ## Exports
 

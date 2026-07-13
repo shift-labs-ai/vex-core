@@ -8,8 +8,8 @@
  *   - Content-Type inferred by extension, falls back to
  *     application/octet-stream.
  *
- * Uses Bun.file for zero-copy streaming when available; falls back
- * to readFile on other runtimes so this is portable.
+ * Uses Bun.file for zero-copy streaming when available, with a buffered
+ * readFile fallback when the file API is unavailable.
  */
 
 import { existsSync } from "node:fs";

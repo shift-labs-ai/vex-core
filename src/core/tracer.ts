@@ -14,7 +14,16 @@ export interface Span {
   meta: string | null;
 }
 
+export interface TraceStart {
+  readonly traceId: string;
+  readonly app: string;
+  readonly type: string;
+  readonly name: string;
+}
+
 export interface Tracer {
+  /** Decide once, at the root, whether the entire trace records spans. */
+  shouldRecord?(trace: TraceStart): boolean;
   onSpan(span: Span): void;
 }
 
@@ -42,6 +51,11 @@ const noopSpan: SpanHandle = {
 
 export const noopExecCtx: ExecContext = { traceId: "", span: noopSpan };
 
+/** Internal recording check without expanding the public SpanHandle contract. */
+export function isTraceRecording(context: ExecContext): boolean {
+  return context.span !== noopSpan;
+}
+
 export function createRootSpan(
   tracer: Tracer | null,
   app: string,
@@ -51,6 +65,9 @@ export function createRootSpan(
 ): ExecContext {
   if (!tracer) return noopExecCtx;
   const tid = traceId ?? id(8);
+  if (tracer.shouldRecord?.({ traceId: tid, app, type, name }) === false) {
+    return { traceId: tid, span: noopSpan };
+  }
   const span = makeSpan(tracer, tid, null, app, type, name);
   return { traceId: tid, span };
 }

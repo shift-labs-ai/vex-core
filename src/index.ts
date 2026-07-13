@@ -20,7 +20,13 @@ export type { VexOptions } from "./core/engine.js";
 export { Vex } from "./core/engine.js";
 export { id } from "./core/id.js";
 export type { StorageAdapter } from "./core/storage.js";
-export type { ExecContext, Span, SpanHandle, Tracer } from "./core/tracer.js";
+export type {
+  ExecContext,
+  Span,
+  SpanHandle,
+  Tracer,
+  TraceStart,
+} from "./core/tracer.js";
 export { createRootSpan, noopExecCtx } from "./core/tracer.js";
 export type {
   AggDef,
