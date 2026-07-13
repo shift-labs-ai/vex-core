@@ -2,11 +2,16 @@ import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
 import { INTERNAL_TABLES } from "./internal.js";
 import type { StorageAdapter } from "./storage.js";
+import {
+  describeQueryDependencies,
+  describeWrites,
+  type QueryDependency,
+  type WriteDependency,
+} from "./trace-metadata.js";
 import type { ExecContext, Tracer } from "./tracer.js";
-import { createRootSpan } from "./tracer.js";
+import { createRootSpan, isTraceRecording } from "./tracer.js";
 import type {
   CallContext,
-  Filter,
   JobDef,
   MiddlewareFn,
   MiddlewareInfo,
@@ -32,22 +37,6 @@ type SubscriptionCallback = (data: any) => void;
 // summaries to explicit call-site metadata. Handler args/results can
 // contain arbitrarily large files, imports, prompts, messages, or
 // credentials, so they are never captured here by default.
-
-interface QueryDependency {
-  table: string;
-  filters?: Filter[];
-  select?: string[] | null;
-  order?: { column: string; dir: "asc" | "desc" } | null;
-  limit?: number | null;
-  offset?: number | null;
-  raw?: boolean;
-}
-
-interface WriteDependency {
-  table: string;
-  values?: Record<string, any>;
-  raw?: boolean;
-}
 
 interface Subscription {
   id: string;
@@ -148,7 +137,7 @@ export class Vex {
       ectx.span.end("ok", { meta });
       return result;
     } catch (e: any) {
-      meta.stack = e.stack ?? null;
+      if (isTraceRecording(ectx)) meta.stack = e.stack ?? null;
       ectx.span.end("error", { error: e.message, meta });
       throw e;
     }
@@ -476,24 +465,24 @@ export class Vex {
     return {
       db: {
         table(name: string) {
-          if (touchedTables) touchedTables.add(name);
-          return self.trackQueryBuilder(
-            self.storage.query(name),
-            name,
-            dependencies,
-          );
+          const query = self.storage.query(name);
+          if (!touchedTables && !dependencies) return query;
+          touchedTables?.add(name);
+          return self.trackQueryBuilder(query, name, dependencies);
         },
         sql<T = Record<string, any>>(
           sql: string,
           ...params: any[]
         ): Promise<T[]> {
-          const tables = self.extractTables(sql);
-          for (const table of tables) {
-            touchedTables?.add(table);
-            dependencies?.push({ table, raw: true });
+          if (touchedTables || dependencies) {
+            const tables = self.extractTables(sql);
+            for (const table of tables) {
+              touchedTables?.add(table);
+              dependencies?.push({ table, raw: true });
+            }
+            if (tables.length === 0)
+              dependencies?.push({ table: "*", raw: true });
           }
-          if (tables.length === 0)
-            dependencies?.push({ table: "*", raw: true });
           return self.storage.rawQuery<T>(sql, ...params);
         },
       },
@@ -905,9 +894,9 @@ export class Vex {
     return this.trace("query", name, parent, async (ectx, meta) => {
       const reg = this.queries.get(name);
       if (!reg) throw new Error(`Query not found: ${name}`);
-      meta.plugin = reg.plugin;
-      const tables = new Set<string>();
-      const dependencies: QueryDependency[] = [];
+      const recording = isTraceRecording(ectx);
+      const tables = recording ? new Set<string>() : undefined;
+      const dependencies = recording ? ([] as QueryDependency[]) : undefined;
       const ctx = this.buildQueryContext(tables, user, dependencies);
       const result = await this.runMiddleware(
         ctx,
@@ -915,16 +904,19 @@ export class Vex {
         () => reg.def.handler(ctx, args),
         ectx,
       );
-      meta.tables = [...tables];
-      meta.dependencies = dependencies;
-      if (Array.isArray(result)) meta.resultRows = result.length;
-      else if (result && typeof result === "object" && "rows" in result)
-        meta.resultRows = (result as any).rows?.length;
-      try {
-        meta.resultBytes = new TextEncoder().encode(
-          JSON.stringify(result),
-        ).byteLength;
-      } catch {}
+      if (tables && dependencies) {
+        meta.plugin = reg.plugin;
+        meta.tables = [...tables];
+        meta.dependencies = describeQueryDependencies(dependencies);
+        if (Array.isArray(result)) meta.resultRows = result.length;
+        else if (result && typeof result === "object" && "rows" in result)
+          meta.resultRows = (result as any).rows?.length;
+        try {
+          meta.resultBytes = new TextEncoder().encode(
+            JSON.stringify(result),
+          ).byteLength;
+        } catch {}
+      }
       return result as T;
     });
   }
@@ -938,7 +930,6 @@ export class Vex {
     return this.trace("mutation", name, parent, async (ectx, meta) => {
       const reg = this.mutations.get(name);
       if (!reg) throw new Error(`Mutation not found: ${name}`);
-      meta.plugin = reg.plugin;
       const writes: WriteDependency[] = [];
       const ctx = this.buildMutationContext(user, writes);
       const result = await this.storage.transaction(() =>
@@ -949,7 +940,10 @@ export class Vex {
           ectx,
         ),
       );
-      meta.writes = writes;
+      if (isTraceRecording(ectx)) {
+        meta.plugin = reg.plugin;
+        meta.writes = describeWrites(writes);
+      }
       await this.invalidateSubscriptions(ectx, writes);
       return result as T;
     });
@@ -966,10 +960,11 @@ export class Vex {
     return this.trace("subscribe", name, null, async (_ectx, meta) => {
       const reg = this.queries.get(name);
       if (!reg) throw new Error(`Query not found: ${name}`);
+      const recording = isTraceRecording(_ectx);
       const budget = this.resolveReactive(reg.def);
-      meta.reactive = budget !== false;
+      if (recording) meta.reactive = budget !== false;
       if (budget === false) throw new Error(`Query ${name} is not reactive`);
-      meta.budget = budget;
+      if (recording) meta.budget = budget;
       const tables = new Set<string>();
       const dependencies: QueryDependency[] = [];
       const ctx = this.buildQueryContext(tables, user, dependencies);
@@ -980,12 +975,14 @@ export class Vex {
         _ectx,
       );
       const measurement = this.measureReactiveResult(result);
-      meta.resultRows = measurement.resultRows;
-      meta.resultBytes = measurement.resultBytes;
+      if (recording) {
+        meta.resultRows = measurement.resultRows;
+        meta.resultBytes = measurement.resultBytes;
+      }
       try {
         this.assertReactiveBudget(measurement, budget);
       } catch (err) {
-        meta.budgetExceeded = true;
+        if (recording) meta.budgetExceeded = true;
         throw err;
       }
       const sub: Subscription = {
@@ -1006,10 +1003,12 @@ export class Vex {
         this.subscriptions.delete(subId);
         throw err;
       }
-      meta.subId = subId;
-      meta.tables = [...tables];
-      meta.dependencies = dependencies;
-      meta.totalSubs = this.subscriptions.size;
+      if (recording) {
+        meta.subId = subId;
+        meta.tables = [...tables];
+        meta.dependencies = describeQueryDependencies(dependencies);
+        meta.totalSubs = this.subscriptions.size;
+      }
 
       return () => {
         this.subscriptions.delete(subId);
