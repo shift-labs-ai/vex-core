@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { RateLimiter } from "../../src/core/rate-limit.js";
+import type { SpanHandle } from "../../src/core/tracer.js";
 import {
   accessLog,
   bearerAuth,
@@ -172,6 +174,34 @@ describe("bearerAuth", () => {
     );
     expect(res.status).toBe(401);
   });
+
+  test("only failed logins consume the failure budget", async () => {
+    const app = createRouter()
+      .use(bearerAuth({ token, maxFailures: 2, failureWindowSeconds: 60 }))
+      .get("/private", () => new Response("private"));
+
+    const login = (submitted: string) =>
+      app.handle(
+        new Request("http://x/login", {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            "x-forwarded-for": "3.3.3.3",
+          },
+          body: `token=${submitted}`,
+        }),
+      );
+
+    // Successful logins never count against the failure budget.
+    for (let i = 0; i < 5; i++) expect((await login(token)).status).toBe(303);
+
+    // The budget still has its full two failures available…
+    expect((await login("wrong")).status).toBe(401);
+    expect((await login("wrong")).status).toBe(401);
+    // …then the IP is blocked — even with the correct token.
+    expect((await login("wrong")).status).toBe(429);
+    expect((await login(token)).status).toBe(429);
+  });
 });
 
 describe("requestId", () => {
@@ -235,6 +265,119 @@ describe("rateLimit", () => {
       new Request("http://x/", { headers: { "x-forwarded-for": "1" } }),
     );
     expect(a2.status).toBe(429);
+  });
+
+  test("every response carries the full X-RateLimit header set", async () => {
+    const app = createRouter()
+      .use(errorBoundary())
+      .use(rateLimit({ requests: 2, window: 60 }))
+      .get("/", () => new Response("ok"));
+
+    const make = () =>
+      app.handle(
+        new Request("http://x/", { headers: { "x-forwarded-for": "9" } }),
+      );
+
+    const ok = await make();
+    expect(ok.headers.get("x-ratelimit-limit")).toBe("2");
+    expect(ok.headers.get("x-ratelimit-remaining")).toBe("1");
+    expect(Number(ok.headers.get("x-ratelimit-reset"))).toBeGreaterThan(0);
+
+    await make();
+    const blocked = await make();
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers.get("retry-after")).toBeDefined();
+    expect(blocked.headers.get("x-ratelimit-limit")).toBe("2");
+    expect(blocked.headers.get("x-ratelimit-remaining")).toBe("0");
+    const body = (await blocked.json()) as { error: string; resource: string };
+    expect(body.error).toBe("too_many_requests");
+  });
+
+  test("a shared limiter pools the budget across routes", async () => {
+    const limiter = new RateLimiter({
+      limit: { requests: 2, window: 60 },
+      scope: "api",
+    });
+    const app = createRouter()
+      .use(errorBoundary())
+      .get("/a", rateLimit({ limiter }), () => new Response("a"))
+      .get("/b", rateLimit({ limiter }), () => new Response("b"));
+
+    const get = (path: string) =>
+      app.handle(
+        new Request(`http://x${path}`, {
+          headers: { "x-forwarded-for": "7" },
+        }),
+      );
+
+    expect((await get("/a")).status).toBe(200);
+    expect((await get("/b")).status).toBe(200);
+    const blocked = await get("/a");
+    expect(blocked.status).toBe(429);
+    expect(((await blocked.json()) as { resource: string }).resource).toBe(
+      "api",
+    );
+  });
+
+  test("cost weighs expensive routes against the same budget", async () => {
+    const app = createRouter()
+      .use(errorBoundary())
+      .use(rateLimit({ requests: 10, window: 60, cost: () => 6 }))
+      .get("/", () => new Response("ok"));
+
+    const make = () =>
+      app.handle(
+        new Request("http://x/", { headers: { "x-forwarded-for": "8" } }),
+      );
+    expect((await make()).status).toBe(200);
+    expect((await make()).status).toBe(429);
+  });
+
+  test("rejections record an errored rateLimit child span", async () => {
+    const ended: Array<{ status?: string; meta?: Record<string, unknown> }> =
+      [];
+    const fakeSpan: SpanHandle = {
+      spanId: "root",
+      end() {},
+      child(type, name) {
+        const record: { status?: string; meta?: Record<string, unknown> } = {};
+        ended.push(record);
+        return {
+          spanId: `${type}:${name}`,
+          end(status, opts) {
+            record.status = status;
+            record.meta = opts?.meta;
+          },
+          child() {
+            throw new Error("unused");
+          },
+        };
+      },
+    };
+    const app = createRouter()
+      .use(errorBoundary())
+      .use(async (ctx, next) => {
+        ctx.span = fakeSpan;
+        return next();
+      })
+      .use(rateLimit({ requests: 1, window: 60, resource: "login" }))
+      .get("/", () => new Response("ok"));
+
+    const make = () =>
+      app.handle(
+        new Request("http://x/", { headers: { "x-forwarded-for": "5" } }),
+      );
+    await make();
+    expect(ended).toHaveLength(0); // allowed requests add no spans
+    await make();
+    expect(ended).toHaveLength(1);
+    expect(ended[0].status).toBe("error");
+    expect(ended[0].meta).toMatchObject({ scope: "login", key: "5" });
+  });
+
+  test("requires either a limiter or requests+window", () => {
+    expect(() => rateLimit({ requests: 5 })).toThrow(/requests/);
+    expect(() => rateLimit({})).toThrow(/requests/);
   });
 });
 

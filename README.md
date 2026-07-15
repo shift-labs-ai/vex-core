@@ -225,7 +225,7 @@ ALL  /webhook/*          user-defined webhooks
 | `cors({ origin, credentials, allowedHeaders, maxAge })` | Fetch-standard CORS. Downgrades `*` to request origin when `credentials: true`. |
 | `bearerAuth({ token, publicPaths, loginPage })` | Single-token HTTP gate: `Authorization: Bearer` OR session cookie. Built-in `/login` + `/logout`; per-IP rate limit on failures. |
 | `bodyParser({ limit, json, urlencoded, text })` | Parse request body into `ctx.state.body`. |
-| `rateLimit({ requests, window, key })`      | 429 + `Retry-After` + `X-RateLimit-*`. |
+| `rateLimit({ requests, window, key, cost, limiter })` | Token-bucket limiting: 429 + `Retry-After`, full `X-RateLimit-*` on every response. Works as `use()` middleware or as a route-chain gate. |
 | `staticFiles({ dir, index, spaFallback, immutablePrefix })` | Serve built assets. Fallback-on-404 semantics: explicit routes win, static serves what's left. SPA-friendly. |
 | `sessions({ storage, cookieName, maxAge, rolling })` | Server-side session store on any `StorageAdapter` (SQLite/custom). `ctx.session.get/set/delete/destroy`. |
 
@@ -251,6 +251,41 @@ app.use(sessions({ storage: store, maxAge: 86400 * 7 }))
      return new Response("ok");
    });
 ```
+
+## Rate limiting
+
+`RateLimiter` is the core primitive — a token bucket (capacity `requests`, refilling at `requests / window` per second), keyed by caller identity, with cost-weighted consumption for expensive operations. One instance = one scope + one budget; share the instance to share the budget.
+
+```ts
+import { RateLimiter, RateLimitExceededError } from "vex-core";
+
+const runs = new RateLimiter({
+  limit: { requests: 30, window: 60 },
+  scope: "agent-runs",
+  onDecision: (d) => { if (!d.allowed) log.warn("rate limited", d); },
+});
+
+runs.tryConsume(userId);        // → { allowed, retryAfter, remaining, … }
+runs.consume(userId, 5);        // throws RateLimitExceededError on reject
+runs.peek(userId);              // report without spending budget
+runs.stats();                   // { allowed, rejected, keys }
+```
+
+State is in-memory and bounded (`prune()` + a `maxKeys` cap with LRU-ish eviction). Per-key limits bound per-key abuse, not aggregate volume — cap aggregate volume with a second limiter on a constant key.
+
+Over HTTP, the `rateLimit` middleware wraps the same primitive:
+
+```ts
+import { rateLimit } from "vex-core/http";
+
+app.use(rateLimit({ requests: 100, window: 60 }));            // per-IP, all routes
+
+const shared = new RateLimiter({ limit: { requests: 10, window: 60 }, scope: "expensive" });
+app.get("/report", rateLimit({ limiter: shared, cost: () => 5 }), reportHandler)
+   .get("/export", rateLimit({ limiter: shared, cost: () => 10 }), exportHandler);
+```
+
+Every response carries `X-RateLimit-Limit` / `-Remaining` / `-Reset`; rejections return the 429 body `{ error: "too_many_requests", retryAfter, resource }` and record an errored `rateLimit` child span when tracing is composed upstream.
 
 ## React client
 
@@ -310,7 +345,7 @@ Age retention alone is not a hard volume bound. Production sinks should also cap
 
 | Entry | Contents |
 |-------|----------|
-| `vex-core` | `Vex`, `sqliteAdapter`, `id`, core types, tracer, auth helpers |
+| `vex-core` | `Vex`, `sqliteAdapter`, `id`, core types, tracer, `RateLimiter` |
 | `vex-core/framework` | `table`, `query`, `mutation`, `webhook`, `job`, `middleware`, `scanDirectory` |
 | `vex-core/http` | `Router`, `createRouter`, `HttpError`, `compose`, `vexHandler`, plus middleware (`cors`, `bearerAuth`, `bodyParser`, `accessLog`, `requestId`, `rateLimit`, `staticFiles`, `errorBoundary`, `sessions`) |
 | `vex-core/client` | `VexProvider`, `useQuery`, `useMutation` |
