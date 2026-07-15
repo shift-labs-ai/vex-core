@@ -14,7 +14,7 @@
  */
 
 import { timingSafeEqual } from "node:crypto";
-import { RateLimiter } from "../../core/auth.js";
+import { RateLimiter } from "../../core/rate-limit.js";
 import type { Middleware } from "../types.js";
 
 export interface BearerAuthOptions {
@@ -59,11 +59,13 @@ export function bearerAuth(options: BearerAuthOptions): Middleware {
   const token = options.token;
   if (!token) throw new Error("bearerAuth: token is required");
 
-  const limiter = new RateLimiter();
-  const limit = {
-    requests: options.maxFailures ?? 5,
-    window: options.failureWindowSeconds ?? 60,
-  };
+  const limiter = new RateLimiter({
+    limit: {
+      requests: options.maxFailures ?? 5,
+      window: options.failureWindowSeconds ?? 60,
+    },
+    scope: "login",
+  });
 
   return async (ctx, next): Promise<Response> => {
     const path = ctx.url.pathname;
@@ -71,7 +73,7 @@ export function bearerAuth(options: BearerAuthOptions): Middleware {
     // Internal endpoints.
     if (path === "/login") {
       if (ctx.req.method === "POST") {
-        return handleLogin(ctx, token, cookieName, maxAge, limiter, limit);
+        return handleLogin(ctx, token, cookieName, maxAge, limiter);
       }
       return handleLoginPage(ctx, brand);
     }
@@ -202,22 +204,26 @@ async function handleLogin(
   cookieName: string,
   maxAge: number,
   limiter: RateLimiter,
-  limit: { requests: number; window: number },
 ): Promise<Response> {
+  // Peek first: an IP that already burned its failure budget is
+  // blocked before we even read the body. Successful logins never
+  // consume budget — only failures do, below — so legitimate users
+  // logging in repeatedly can't lock themselves out.
   const ip = clientIp(ctx.req);
-  const { allowed, retryAfter } = limiter.check(`login:${ip}`, limit);
-  if (!allowed) {
+  const blocked = limiter.peek(ip);
+  if (!blocked.allowed) {
     return new Response(renderLoginPage("Too many attempts. Try again soon."), {
       status: 429,
       headers: {
         "content-type": "text/html; charset=utf-8",
-        "retry-after": String(retryAfter),
+        "retry-after": String(blocked.retryAfter),
       },
     });
   }
 
   const submitted = await readSubmittedToken(ctx.req);
   if (!submitted || !constantTimeEq(submitted, token)) {
+    limiter.tryConsume(ip);
     return new Response(renderLoginPage("Invalid token."), {
       status: 401,
       headers: { "content-type": "text/html; charset=utf-8" },
