@@ -21,10 +21,14 @@ export type { RequestIdOptions } from "./middleware/request-id.js";
 export { requestId } from "./middleware/request-id.js";
 export type { SessionOptions } from "./middleware/sessions.js";
 export { sessions } from "./middleware/sessions.js";
-export type { StaticFilesOptions } from "./middleware/static-files.js";
-export { staticFiles } from "./middleware/static-files.js";
 export type { RouterOptions } from "./router.js";
 export { createRouter, Router } from "./router.js";
+export type {
+  ServeDirOptions,
+  ServeFileOptions,
+} from "./serve-static.js";
+// Explicit static-serving route handlers (namespace owners, not fallbacks)
+export { serveDir, serveFile } from "./serve-static.js";
 export type {
   ErrorHandler,
   Handler,
