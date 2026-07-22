@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -69,18 +69,43 @@ describe("serveDir — the asset namespace owner", () => {
     // The document route `/*` is registered after the asset route. If
     // serveDir fell through instead of owning its namespace, this would
     // deliver HTML into a <script> tag.
-    const res = await buildApp().handle(
-      new Request("http://x/assets/gone.js"),
-    );
+    const res = await buildApp().handle(new Request("http://x/assets/gone.js"));
     expect(res.status).toBe(404);
     expect(await res.text()).not.toContain("<html>");
   });
 
-  test("path traversal cannot escape the directory", async () => {
+  test("encoded traversal never leaks file contents through the app", async () => {
+    // The WHATWG URL parser collapses %2e%2e into a dot-segment before
+    // routing, so this lands on the document route — which serves the
+    // shell, not the file. Assert the invariant that matters: the
+    // secret is unreachable through any route.
     const res = await buildApp().handle(
       new Request("http://x/assets/%2e%2e/secret.txt"),
     );
-    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain("top secret");
+  });
+
+  test("serveDir's own guard rejects a pathname that retains ..", async () => {
+    // Defense in depth: if a runtime ever hands the handler an
+    // un-collapsed path (proxy rewrite, exotic client), the resolve
+    // guard must still hold. Drive the handler directly.
+    const handler = serveDir({
+      dir: join(root, "assets"),
+      stripPrefix: "/assets",
+    });
+    const url = new URL("http://x/assets/placeholder");
+    Object.defineProperty(url, "pathname", {
+      value: "/assets/../secret.txt",
+    });
+    const req = new Request("http://x/assets/placeholder");
+    const res = await handler({
+      req,
+      url,
+      params: {},
+      state: {},
+      signal: req.signal,
+    });
+    expect(res?.status).toBe(404);
   });
 
   test("HEAD answers with headers and length but no body", async () => {
@@ -101,9 +126,7 @@ describe("serveDir — the asset namespace owner", () => {
       "/assets/*",
       serveDir({ dir: join(root, "assets"), stripPrefix: "/assets" }),
     );
-    const res = await app.handle(
-      new Request("http://x/assets/app-abc123.js"),
-    );
+    const res = await app.handle(new Request("http://x/assets/app-abc123.js"));
     expect(res.headers.get("cache-control")).toBe("no-cache");
   });
 });

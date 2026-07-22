@@ -26,6 +26,12 @@ export { staticFiles } from "./middleware/static-files.js";
 export type { RouterOptions } from "./router.js";
 export { createRouter, Router } from "./router.js";
 export type {
+  ServeDirOptions,
+  ServeFileOptions,
+} from "./serve-static.js";
+// Explicit static-serving route handlers (namespace owners, not fallbacks)
+export { serveDir, serveFile } from "./serve-static.js";
+export type {
   ErrorHandler,
   Handler,
   Middleware,
