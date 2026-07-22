@@ -226,8 +226,35 @@ ALL  /webhook/*          user-defined webhooks
 | `bearerAuth({ token, publicPaths, loginPage })` | Single-token HTTP gate: `Authorization: Bearer` OR session cookie. Built-in `/login` + `/logout`; per-IP rate limit on failures. |
 | `bodyParser({ limit, json, urlencoded, text })` | Parse request body into `ctx.state.body`. |
 | `rateLimit({ requests, window, key, cost, limiter })` | Token-bucket limiting: 429 + `Retry-After`, full `X-RateLimit-*` on every response. Works as `use()` middleware or as a route-chain gate. |
-| `staticFiles({ dir, index, spaFallback, immutablePrefix })` | Serve built assets. Fallback-on-404 semantics: explicit routes win, static serves what's left. SPA-friendly. |
+| `staticFiles({ dir, index, spaFallback, immutablePrefix })` | Serve built assets. Fallback-on-404 semantics: explicit routes win, static serves what's left. For explicit per-namespace routing, see `serveDir`/`serveFile` below. |
 | `sessions({ storage, cookieName, maxAge, rolling })` | Server-side session store on any `StorageAdapter` (SQLite/custom). `ctx.session.get/set/delete/destroy`. |
+
+### Static serving — namespace owners, not fallbacks
+
+`serveDir` and `serveFile` are plain route handlers. Give each URL
+namespace exactly one owner and every request has one deterministic
+path through the router — no Accept sniffing, no extension heuristics,
+no 404-then-retry:
+
+```ts
+import { serveDir, serveFile } from "vex-core/http";
+
+app
+  // Asset namespace: bytes or 404 — a missing script can never
+  // receive the HTML shell.
+  .get("/assets/*", serveDir({
+    dir: "./dist/ui/assets",
+    stripPrefix: "/assets",
+    cacheControl: "public, max-age=31536000, immutable",
+  }))
+  .get("/favicon.ico", serveFile("./dist/ui/favicon.ico"))
+  // Document namespace: the terminal GET route owns every
+  // client-routed URL — dotted or not — and serves the app shell.
+  .get("/*", serveFile("./dist/ui/index.html"));
+```
+
+Both resolve paths inside their directory (traversal-guarded), infer
+content type by extension, support HEAD, and default to `no-cache`.
 
 ### Sessions
 
