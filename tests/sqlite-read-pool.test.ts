@@ -60,7 +60,7 @@ function peerRows(): Array<{ id: string; value: number }> {
   }
 }
 
-describe("SQLite read-only connection pool", () => {
+describe("SQLite read pool and statement cache", () => {
   test("a brand-new file is readable before any table is created", async () => {
     storage = sqliteAdapter(dbPath);
 
@@ -474,6 +474,26 @@ describe("SQLite read-only connection pool", () => {
       ),
     );
     expect(reads.every((rows) => rows[0].added === "default")).toBe(true);
+  });
+
+  test("raw schema changes invalidate cached statement shapes", async () => {
+    const adapter = await createRowsStorage();
+    await adapter.insert("rows", { _id: "existing", value: 1 });
+    const sql = "SELECT * FROM rows WHERE _id = ?";
+    await Promise.all(
+      Array.from({ length: 4 }, () => adapter.rawQuery(sql, "existing")),
+    );
+
+    await adapter.rawExec(
+      "ALTER TABLE rows ADD COLUMN raw_added TEXT DEFAULT 'visible'",
+    );
+
+    const reads = await Promise.all(
+      Array.from({ length: 4 }, () =>
+        adapter.rawQuery<{ raw_added: string }>(sql, "existing"),
+      ),
+    );
+    expect(reads.every((rows) => rows[0].raw_added === "visible")).toBe(true);
   });
 
   test("pooled readers ignore an uncommitted peer WAL write", async () => {

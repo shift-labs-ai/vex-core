@@ -34,21 +34,22 @@ class StatementCache {
     private readonly capacity: number,
   ) {}
 
-  get(sql: string): PreparedStatement {
-    const existing = this.statements.get(sql);
-    if (existing) {
+  prepare(sql: string): PreparedStatement {
+    const cached = this.statements.get(sql);
+    if (cached) {
+      // Map insertion order is the LRU order. Reinsert a hit at the tail.
       this.statements.delete(sql);
-      this.statements.set(sql, existing);
-      return existing;
+      this.statements.set(sql, cached);
+      return cached;
     }
 
     const statement = this.db.prepare(sql);
     this.statements.set(sql, statement);
     if (this.statements.size > this.capacity) {
-      const oldest = this.statements.keys().next().value;
-      if (oldest !== undefined) {
-        this.statements.get(oldest)?.finalize();
-        this.statements.delete(oldest);
+      const oldestSql = this.statements.keys().next().value;
+      if (oldestSql !== undefined) {
+        this.statements.get(oldestSql)?.finalize();
+        this.statements.delete(oldestSql);
       }
     }
     return statement;
@@ -58,18 +59,14 @@ class StatementCache {
     for (const statement of this.statements.values()) statement.finalize();
     this.statements.clear();
   }
-
-  close(): void {
-    this.clear();
-  }
 }
 
 interface SqliteConnection {
-  db: Database;
   statements: StatementCache;
 }
 
 interface ReadConnection extends SqliteConnection {
+  db: Database;
   busy: boolean;
 }
 
@@ -411,13 +408,13 @@ function wrapSync(
     async all(sql, params) {
       return withReadConnection((connection) =>
         params.length > 0
-          ? connection.statements.get(sql).all(...params)
-          : connection.statements.get(sql).all(),
+          ? connection.statements.prepare(sql).all(...params)
+          : connection.statements.prepare(sql).all(),
       );
     },
     async run(sql, params) {
       return withConnectionLock(() => {
-        const statement = writer.statements.get(sql);
+        const statement = writer.statements.prepare(sql);
         const result =
           params.length > 0 ? statement.run(...params) : statement.run();
         return { changes: result.changes };
@@ -521,6 +518,12 @@ function changesConnectionLocalState(sql: string): boolean {
   );
 }
 
+function mayChangeSchema(sql: string): boolean {
+  return /(?:^|;)\s*(?:CREATE|ALTER|DROP|REINDEX|VACUUM|ATTACH|DETACH)\b/i.test(
+    sqlAfterLeadingComments(sql),
+  );
+}
+
 export function sqliteAdapter(
   path: string = ":memory:",
   opts?: SqliteOptions,
@@ -543,7 +546,6 @@ export function sqliteAdapter(
   }
 
   const writer: SqliteConnection = {
-    db,
     statements: new StatementCache(db, SQLITE_STATEMENT_CACHE_SIZE),
   };
   const changedTables = new Set<string>();
@@ -671,7 +673,7 @@ export function sqliteAdapter(
     const data: Record<string, any> = { ...row, _id: id };
     const keys = Object.keys(data);
     const values = keys.map((k) => serializeValue(data[k]));
-    writer.statements.get(buildInsertSql(table, keys)).run(...values);
+    writer.statements.prepare(buildInsertSql(table, keys)).run(...values);
     changedTables.add(table);
     return id;
   }
@@ -859,7 +861,7 @@ export function sqliteAdapter(
         if (row) {
           if (Object.keys(data).length === 0) return;
           const { sql, values } = buildUpdateSql(table, data);
-          const result = writer.statements.get(sql).run(...values, row._id);
+          const result = writer.statements.prepare(sql).run(...values, row._id);
           if (result.changes > 0) changedTables.add(table);
         } else {
           insertUnlocked(table, { ...keys, ...data });
@@ -875,7 +877,7 @@ export function sqliteAdapter(
       await withConnectionLock(() => {
         if (Object.keys(data).length === 0) return;
         const { sql, values } = buildUpdateSql(table, data);
-        const result = writer.statements.get(sql).run(...values, id);
+        const result = writer.statements.prepare(sql).run(...values, id);
         if (result.changes > 0) changedTables.add(table);
       });
     },
@@ -883,7 +885,7 @@ export function sqliteAdapter(
     async delete(table: string, id: string): Promise<boolean> {
       return withConnectionLock(() => {
         const result = writer.statements
-          .get(`DELETE FROM ${quoteIdent(table)} WHERE _id = ?`)
+          .prepare(`DELETE FROM ${quoteIdent(table)} WHERE _id = ?`)
           .run(id);
         if (result.changes > 0) changedTables.add(table);
         return result.changes > 0;
@@ -935,7 +937,7 @@ export function sqliteAdapter(
         try {
           return await withReadConnection(
             (connection) =>
-              connection.statements.get(sql).all(...params) as T[],
+              connection.statements.prepare(sql).all(...params) as T[],
           );
         } catch (error: unknown) {
           // A WITH statement can terminate in SELECT or in DML. Bun does not
@@ -947,8 +949,9 @@ export function sqliteAdapter(
         }
       }
       return withConnectionLock(() => {
-        const rows = writer.statements.get(sql).all(...params) as T[];
+        const rows = writer.statements.prepare(sql).all(...params) as T[];
         if (changesConnectionLocalState(sql)) writerReadsRequired = true;
+        if (mayChangeSchema(sql)) clearStatementCaches();
         return rows;
       });
     },
@@ -956,7 +959,7 @@ export function sqliteAdapter(
     async rawExec(sql: string, ...params: any[]): Promise<void> {
       await withConnectionLock(() => {
         if (params.length > 0) {
-          writer.statements.get(sql).run(...params);
+          writer.statements.prepare(sql).run(...params);
         } else {
           db.exec(sql);
         }
@@ -966,6 +969,7 @@ export function sqliteAdapter(
         ) {
           writerReadsRequired = true;
         }
+        if (mayChangeSchema(sql)) clearStatementCaches();
       });
     },
 
@@ -983,7 +987,7 @@ export function sqliteAdapter(
               .filter((key) => key !== "_id"),
           ),
         ];
-        const stmt = writer.statements.get(buildInsertSql(table, keys));
+        const stmt = writer.statements.prepare(buildInsertSql(table, keys));
 
         const insertMany = db.transaction((items: Record<string, any>[]) => {
           for (const row of items) {
@@ -1014,9 +1018,9 @@ export function sqliteAdapter(
       if (closed) return;
       closed = true;
       rejectQueuedWork();
-      writer.statements.close();
+      writer.statements.clear();
       for (const connection of readConnections) {
-        connection.statements.close();
+        connection.statements.clear();
         connection.db.close();
       }
       db.close();

@@ -69,16 +69,19 @@ class StatementLru {
     ReturnType<Database["prepare"]>
   >();
 
-  constructor(private readonly capacity: number) {}
+  constructor(
+    private readonly db: Database,
+    private readonly capacity: number,
+  ) {}
 
-  get(db: Database, sql: string): ReturnType<Database["prepare"]> {
+  get(sql: string): ReturnType<Database["prepare"]> {
     const existing = this.statements.get(sql);
     if (existing) {
       this.statements.delete(sql);
       this.statements.set(sql, existing);
       return existing;
     }
-    const statement = db.prepare(sql);
+    const statement = this.db.prepare(sql);
     this.statements.set(sql, statement);
     if (this.statements.size > this.capacity) {
       const oldest = this.statements.keys().next().value;
@@ -104,19 +107,20 @@ function printResult(result: Result): void {
 
 const root = mkdtempSync(join(tmpdir(), "vex-statement-cache-"));
 const path = join(root, "bench.db");
-const writer = new Database(path);
+const setupDb = new Database(path);
+let setupDbOpen = true;
 let adapter: ReturnType<typeof sqliteAdapter> | undefined;
 
 const results: Result[] = [];
 try {
-  writer.exec("PRAGMA journal_mode = WAL");
-  writer.exec(
+  setupDb.exec("PRAGMA journal_mode = WAL");
+  setupDb.exec(
     "CREATE TABLE records (_id TEXT PRIMARY KEY, bucket INTEGER, score INTEGER, payload TEXT)",
   );
-  const insert = writer.prepare(
+  const insert = setupDb.prepare(
     "INSERT INTO records (_id, bucket, score, payload) VALUES (?, ?, ?, ?)",
   );
-  const insertMany = writer.transaction(() => {
+  const insertMany = setupDb.transaction(() => {
     for (let index = 0; index < rows; index++) {
       insert.run(
         `row-${index}`,
@@ -130,7 +134,7 @@ try {
   insert.finalize();
 
   const direct = new Database(path, { readonly: true });
-  const lru = new StatementLru(cacheSize);
+  const lru = new StatementLru(direct, cacheSize);
   try {
     const pointSql = "SELECT score, payload FROM records WHERE _id = ?";
     const scanSql = "SELECT SUM(score) AS total FROM records WHERE score >= ?";
@@ -152,7 +156,7 @@ try {
     results.push(
       await measure("direct bounded LRU: point", iterations, () => {
         for (let index = 0; index < iterations; index++) {
-          lru.get(direct, pointSql).get(`row-${index % rows}`);
+          lru.get(pointSql).get(`row-${index % rows}`);
         }
       }),
     );
@@ -174,7 +178,7 @@ try {
     results.push(
       await measure("direct bounded LRU: aggregate", scanIterations, () => {
         for (let index = 0; index < scanIterations; index++) {
-          lru.get(direct, scanSql).get(index % rows);
+          lru.get(scanSql).get(index % rows);
         }
       }),
     );
@@ -193,7 +197,7 @@ try {
       await measure("direct bounded LRU: unique raw", dynamicIterations, () => {
         for (let index = 0; index < dynamicIterations; index++) {
           lru
-            .get(direct, `${pointSql} /* unique-${index} */`)
+            .get(`${pointSql} /* unique-${index} */`)
             .get(`row-${index % rows}`);
         }
       }),
@@ -203,7 +207,8 @@ try {
     direct.close();
   }
 
-  writer.close();
+  setupDb.close();
+  setupDbOpen = false;
   adapter = sqliteAdapter(path);
   await adapter.ensureTable("records", {
     columns: {
@@ -303,8 +308,6 @@ try {
   console.log(JSON.stringify(results, null, 2));
 } finally {
   await adapter?.close();
-  try {
-    writer.close();
-  } catch {}
+  if (setupDbOpen) setupDb.close();
   rmSync(root, { recursive: true, force: true });
 }
