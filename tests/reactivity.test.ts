@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
-import { Vex } from "../src/core/engine.js";
+import { SERIALIZED_SUBSCRIPTION_RESULT, Vex } from "../src/core/engine.js";
 
 const user = { id: "u1", name: "User", isAdmin: false };
 let open: Vex[] = [];
@@ -799,13 +799,21 @@ describe("reactive subscription bedrock", () => {
       storage: sqliteAdapter(":memory:"),
     });
     const frames: string[] = [];
-    const deliver = (result: unknown, serialized?: string) => {
-      frames.push(serialized ?? JSON.stringify(result));
-    };
+    const deliver = Object.assign(
+      (result: unknown, serialized?: string) => {
+        frames.push(serialized ?? JSON.stringify(result));
+      },
+      { [SERIALIZED_SUBSCRIPTION_RESULT]: true as const },
+    );
     await vex.subscribe("rx.serializable", {}, deliver);
     await vex.subscribe("rx.serializable", {}, deliver);
+    let ordinaryCallbackArgs = 0;
+    await vex.subscribe("rx.serializable", {}, (...args) => {
+      ordinaryCallbackArgs = args.length;
+    });
     frames.length = 0;
     serializationCalls = 0;
+    ordinaryCallbackArgs = 0;
 
     await vex.mutate("rx.add", {
       scope: "a",
@@ -815,6 +823,7 @@ describe("reactive subscription bedrock", () => {
     });
 
     expect(serializationCalls).toBe(1);
+    expect(ordinaryCallbackArgs).toBe(1);
     expect(frames).toHaveLength(2);
     expect(frames[0]).toBe(frames[1]);
     expect(JSON.parse(frames[0])).toEqual({

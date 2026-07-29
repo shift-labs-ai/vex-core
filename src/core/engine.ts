@@ -29,7 +29,23 @@ import type {
   WebhookResponse,
 } from "./types.js";
 
-type SubscriptionCallback = (data: any) => void;
+/** @internal Opt-in used by the WebSocket adapter; ordinary callbacks stay unary. */
+export const SERIALIZED_SUBSCRIPTION_RESULT = Symbol(
+  "vex.serializedSubscriptionResult",
+);
+
+type SubscriptionCallback = ((data: any, serialized?: string) => void) & {
+  [SERIALIZED_SUBSCRIPTION_RESULT]?: true;
+};
+
+function deliverSubscriptionResult(
+  callback: SubscriptionCallback,
+  result: any,
+  serialized: string | undefined,
+): void {
+  if (callback[SERIALIZED_SUBSCRIPTION_RESULT]) callback(result, serialized);
+  else callback(result);
+}
 
 // Trace metadata is operational telemetry, not a request archive.
 // The engine records stable execution facts (plugin, touched tables,
@@ -713,17 +729,19 @@ export class Vex {
     hash: number;
     resultRows: number | undefined;
     resultBytes: number;
+    serialized: string | undefined;
   } {
-    const json = JSON.stringify(result);
+    const serialized = JSON.stringify(result);
     const resultRows = Array.isArray(result)
       ? result.length
       : result && typeof result === "object" && Array.isArray(result.rows)
         ? result.rows.length
         : undefined;
     return {
-      hash: Number(Bun.hash(json)),
+      hash: Number(Bun.hash(serialized)),
       resultRows,
-      resultBytes: new TextEncoder().encode(json).byteLength,
+      resultBytes: new TextEncoder().encode(serialized).byteLength,
+      serialized,
     };
   }
 
@@ -862,7 +880,11 @@ export class Vex {
               if (measurement.hash !== sub.lastHash) {
                 sub.lastHash = measurement.hash;
                 try {
-                  sub.callback(result);
+                  deliverSubscriptionResult(
+                    sub.callback,
+                    result,
+                    measurement.serialized,
+                  );
                 } catch (err) {
                   console.error(
                     `[vex] subscription ${sub.queryName} callback failed:`,
@@ -998,7 +1020,7 @@ export class Vex {
       };
       this.subscriptions.set(subId, sub);
       try {
-        callback(result);
+        deliverSubscriptionResult(callback, result, measurement.serialized);
       } catch (err) {
         this.subscriptions.delete(subId);
         throw err;

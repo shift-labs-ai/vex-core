@@ -75,7 +75,7 @@
  */
 
 import type { Server as BunServer, ServerWebSocket } from "bun";
-import type { Vex } from "../core/engine.js";
+import { SERIALIZED_SUBSCRIPTION_RESULT, type Vex } from "../core/engine.js";
 import type { VexUser } from "../core/types.js";
 
 // Bun's `Server` is generic over the websocket payload shape; we
@@ -450,12 +450,16 @@ async function handleSubscribe(
 
   let unsubscribe: (() => void) | null = null;
   try {
+    const sendSubscriptionData = Object.assign(
+      (data: unknown, serialized?: string) => {
+        sendData(ws, frame.id, data, serialized);
+      },
+      { [SERIALIZED_SUBSCRIPTION_RESULT]: true as const },
+    );
     unsubscribe = await vex.subscribe(
       frame.name,
       frame.args ?? {},
-      (data) => {
-        sendData(ws, frame.id, data);
-      },
+      sendSubscriptionData,
       ws.data.user ? { user: ws.data.user } : undefined,
     );
   } catch (err) {
@@ -521,7 +525,7 @@ async function handleMutate(
 
 // ─── Wire helpers ───────────────────────────────────────────────────
 
-function send(ws: VexWebSocket, frame: Record<string, unknown>): void {
+function sendText(ws: VexWebSocket, text: string): void {
   // ws.send returns the number of bytes written or -1 if backpressured.
   // We don't queue or retry on backpressure — slow clients will lose
   // messages. The engine's per-query result hash means a missed
@@ -529,14 +533,30 @@ function send(ws: VexWebSocket, frame: Record<string, unknown>): void {
   // eventually consistent), and queries/mutations have at-most-once
   // semantics anyway.
   try {
-    ws.send(JSON.stringify(frame));
+    ws.send(text);
   } catch (err) {
     console.error("[vex-ws] send failed:", err);
   }
 }
 
-function sendData(ws: VexWebSocket, id: string, data: unknown): void {
-  send(ws, { type: "data", id, data });
+function send(ws: VexWebSocket, frame: Record<string, unknown>): void {
+  sendText(ws, JSON.stringify(frame));
+}
+
+function sendData(
+  ws: VexWebSocket,
+  id: string,
+  data: unknown,
+  serialized?: string,
+): void {
+  if (serialized === undefined) {
+    send(ws, { type: "data", id, data });
+    return;
+  }
+  sendText(
+    ws,
+    `{"type":"data","id":${JSON.stringify(id)},"data":${serialized}}`,
+  );
 }
 
 function sendResult(ws: VexWebSocket, id: string, data: unknown): void {
