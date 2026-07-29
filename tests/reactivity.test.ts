@@ -8,6 +8,7 @@ let open: Vex[] = [];
 let listRuns = 0;
 let rawRuns = 0;
 let flakyThrows = false;
+let serializationCalls = 0;
 async function create(options: Parameters<typeof Vex.create>[0]) {
   const vex = await Vex.create(options);
   open.push(vex);
@@ -19,6 +20,7 @@ afterEach(async () => {
   listRuns = 0;
   rawRuns = 0;
   flakyThrows = false;
+  serializationCalls = 0;
 });
 
 function reactivityPlugin(api: VexPluginAPI) {
@@ -151,6 +153,19 @@ function reactivityPlugin(api: VexPluginAPI) {
     async handler(ctx) {
       if (!ctx.user) throw new Error("User required");
       return { userId: ctx.user.id, rows: await ctx.db.table("items").count() };
+    },
+  });
+  api.registerQuery("serializable", {
+    args: {},
+    async handler(ctx) {
+      const rows = await ctx.db.table("items").order("name", "asc").all();
+      return {
+        rows,
+        toJSON() {
+          serializationCalls++;
+          return { rows };
+        },
+      };
     },
   });
   api.registerQuery("cyclic", {
@@ -776,6 +791,35 @@ describe("reactive subscription bedrock", () => {
     await expect(vex.subscribe("rx.disabled", {}, () => {})).rejects.toThrow(
       /not reactive/,
     );
+  });
+
+  test("grouped invalidation reuses one serialized result for every callback", async () => {
+    const vex = await create({
+      plugins: [reactivityPlugin],
+      storage: sqliteAdapter(":memory:"),
+    });
+    const frames: string[] = [];
+    const deliver = (result: unknown, serialized?: string) => {
+      frames.push(serialized ?? JSON.stringify(result));
+    };
+    await vex.subscribe("rx.serializable", {}, deliver);
+    await vex.subscribe("rx.serializable", {}, deliver);
+    frames.length = 0;
+    serializationCalls = 0;
+
+    await vex.mutate("rx.add", {
+      scope: "a",
+      kind: "one",
+      name: "added",
+      body: null,
+    });
+
+    expect(serializationCalls).toBe(1);
+    expect(frames).toHaveLength(2);
+    expect(frames[0]).toBe(frames[1]);
+    expect(JSON.parse(frames[0])).toEqual({
+      rows: [expect.objectContaining({ name: "added" })],
+    });
   });
 
   test("non-array results are byte-budgeted and cyclic results fail deterministically", async () => {
