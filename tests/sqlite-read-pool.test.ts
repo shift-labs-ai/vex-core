@@ -144,6 +144,7 @@ describe("SQLite read-only connection pool", () => {
   test("statement caches are bounded and evict least-recently-used SQL", async () => {
     storage = sqliteAdapter(":memory:");
     const prepare = spyOn(BunDatabase.prototype, "prepare");
+    const finalize = spyOn(BunStatement.prototype, "finalize");
 
     try {
       for (let index = 0; index < 64; index++) {
@@ -163,6 +164,24 @@ describe("SQLite read-only connection pool", () => {
       expect(
         shapePrepares.filter(([sql]) => String(sql).includes("shape-1 */")),
       ).toHaveLength(2);
+      expect(finalize).toHaveBeenCalledTimes(2);
+    } finally {
+      prepare.mockRestore();
+      finalize.mockRestore();
+    }
+  });
+
+  test("statements that fail to prepare are not cached", async () => {
+    storage = sqliteAdapter(":memory:");
+    const sql = "SELECT * FROM missing_table";
+    const prepare = spyOn(BunDatabase.prototype, "prepare");
+
+    try {
+      await expect(storage.rawQuery(sql)).rejects.toThrow("missing_table");
+      await expect(storage.rawQuery(sql)).rejects.toThrow("missing_table");
+      expect(
+        prepare.mock.calls.filter(([preparedSql]) => preparedSql === sql),
+      ).toHaveLength(2);
     } finally {
       prepare.mockRestore();
     }
@@ -177,6 +196,7 @@ describe("SQLite read-only connection pool", () => {
       for (let index = 0; index < 4; index++) {
         await adapter.rawQuery(sql);
       }
+      await adapter.close();
       await adapter.close();
       storage = undefined;
       expect(finalize).toHaveBeenCalledTimes(4);
@@ -433,12 +453,12 @@ describe("SQLite read-only connection pool", () => {
     await transaction;
   });
 
-  test("all readers observe schema changes made after pool creation", async () => {
+  test("cached statements survive schema changes made after pool creation", async () => {
     const adapter = await createRowsStorage();
+    await adapter.insert("rows", { _id: "existing", value: 1 });
+    const sql = "SELECT * FROM rows WHERE _id = ?";
     await Promise.all(
-      Array.from({ length: 8 }, () =>
-        adapter.rawQuery("SELECT value FROM rows"),
-      ),
+      Array.from({ length: 8 }, () => adapter.rawQuery(sql, "existing")),
     );
 
     await adapter.ensureTable("rows", {
@@ -448,16 +468,12 @@ describe("SQLite read-only connection pool", () => {
         added: { type: "string", default: "default" },
       },
     });
-    await adapter.insert("rows", { _id: "new", value: 1, added: "visible" });
-
     const reads = await Promise.all(
       Array.from({ length: 8 }, () =>
-        adapter.rawQuery<{ added: string }>(
-          "SELECT added FROM rows WHERE _id = 'new'",
-        ),
+        adapter.rawQuery<{ added: string }>(sql, "existing"),
       ),
     );
-    expect(reads.every((rows) => rows[0].added === "visible")).toBe(true);
+    expect(reads.every((rows) => rows[0].added === "default")).toBe(true);
   });
 
   test("pooled readers ignore an uncommitted peer WAL write", async () => {

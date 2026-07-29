@@ -24,8 +24,52 @@ interface ExistingColumn {
   dflt_value: string | null;
 }
 
-interface ReadConnection {
+type PreparedStatement = ReturnType<Database["prepare"]>;
+
+class StatementCache {
+  private readonly statements = new Map<string, PreparedStatement>();
+
+  constructor(
+    private readonly db: Database,
+    private readonly capacity: number,
+  ) {}
+
+  get(sql: string): PreparedStatement {
+    const existing = this.statements.get(sql);
+    if (existing) {
+      this.statements.delete(sql);
+      this.statements.set(sql, existing);
+      return existing;
+    }
+
+    const statement = this.db.prepare(sql);
+    this.statements.set(sql, statement);
+    if (this.statements.size > this.capacity) {
+      const oldest = this.statements.keys().next().value;
+      if (oldest !== undefined) {
+        this.statements.get(oldest)?.finalize();
+        this.statements.delete(oldest);
+      }
+    }
+    return statement;
+  }
+
+  clear(): void {
+    for (const statement of this.statements.values()) statement.finalize();
+    this.statements.clear();
+  }
+
+  close(): void {
+    this.clear();
+  }
+}
+
+interface SqliteConnection {
   db: Database;
+  statements: StatementCache;
+}
+
+interface ReadConnection extends SqliteConnection {
   busy: boolean;
 }
 
@@ -36,6 +80,7 @@ interface Waiter<T> {
 
 const SQLITE_INDEX_METADATA_TABLE = "__vex_sqlite_indexes";
 const SQLITE_READ_POOL_SIZE = 4;
+const SQLITE_STATEMENT_CACHE_SIZE = 64;
 
 function toSqlType(type: TableSchema["columns"][string]["type"]): string {
   switch (type) {
@@ -351,10 +396,12 @@ function rebuildTable(
 }
 
 function wrapSync(
-  db: Database,
+  writer: SqliteConnection,
   changedTables: Set<string>,
   withConnectionLock: <T>(fn: () => Promise<T> | T) => Promise<T>,
-  withReadConnection: <T>(fn: (readDb: Database) => T) => Promise<T>,
+  withReadConnection: <T>(
+    fn: (connection: SqliteConnection) => T,
+  ) => Promise<T>,
 ): DbExec {
   return {
     schemas: new Map(),
@@ -362,15 +409,17 @@ function wrapSync(
       if (changes > 0) changedTables.add(table);
     },
     async all(sql, params) {
-      return withReadConnection((readDb) =>
+      return withReadConnection((connection) =>
         params.length > 0
-          ? readDb.prepare(sql).all(...params)
-          : readDb.prepare(sql).all(),
+          ? connection.statements.get(sql).all(...params)
+          : connection.statements.get(sql).all(),
       );
     },
     async run(sql, params) {
       return withConnectionLock(() => {
-        const result = params.length > 0 ? db.run(sql, ...params) : db.run(sql);
+        const statement = writer.statements.get(sql);
+        const result =
+          params.length > 0 ? statement.run(...params) : statement.run();
         return { changes: result.changes };
       });
     },
@@ -405,7 +454,11 @@ function openReadConnections(
         readDb.close();
         throw error;
       }
-      connections.push({ db: readDb, busy: false });
+      connections.push({
+        db: readDb,
+        statements: new StatementCache(readDb, SQLITE_STATEMENT_CACHE_SIZE),
+        busy: false,
+      });
     }
     return connections;
   } catch (error) {
@@ -489,6 +542,10 @@ export function sqliteAdapter(
     throw error;
   }
 
+  const writer: SqliteConnection = {
+    db,
+    statements: new StatementCache(db, SQLITE_STATEMENT_CACHE_SIZE),
+  };
   const changedTables = new Set<string>();
   // The write handle is a single connection. While it has an open
   // BEGIN, every statement on that connection participates in
@@ -505,6 +562,11 @@ export function sqliteAdapter(
 
   function closedError(): Error {
     return new Error("SQLite adapter is closed");
+  }
+
+  function clearStatementCaches(): void {
+    writer.statements.clear();
+    for (const connection of readConnections) connection.statements.clear();
   }
 
   async function acquireWriteLock(): Promise<void> {
@@ -584,7 +646,7 @@ export function sqliteAdapter(
   }
 
   async function withReadConnection<T>(
-    fn: (readDb: Database) => T,
+    fn: (connection: SqliteConnection) => T,
   ): Promise<T> {
     if (closed) throw closedError();
     const owner = transactionContext.getStore();
@@ -592,13 +654,13 @@ export function sqliteAdapter(
     // changes. Connection-local state (TEMP tables, ATTACH, PRAGMAs) also pins
     // reads to that handle. In-memory databases have no shareable backing file.
     if (owner?.active || writerReadsRequired || readConnections.length === 0) {
-      return withConnectionLock(() => fn(db));
+      return withConnectionLock(() => fn(writer));
     }
 
     const connection = await acquireReadConnection();
     try {
       if (closed) throw closedError();
-      return fn(connection.db);
+      return fn(connection);
     } finally {
       releaseReadConnection(connection);
     }
@@ -609,13 +671,13 @@ export function sqliteAdapter(
     const data: Record<string, any> = { ...row, _id: id };
     const keys = Object.keys(data);
     const values = keys.map((k) => serializeValue(data[k]));
-    db.prepare(buildInsertSql(table, keys)).run(...values);
+    writer.statements.get(buildInsertSql(table, keys)).run(...values);
     changedTables.add(table);
     return id;
   }
 
   const exec = wrapSync(
-    db,
+    writer,
     changedTables,
     withConnectionLock,
     withReadConnection,
@@ -770,6 +832,7 @@ export function sqliteAdapter(
             'INSERT OR IGNORE INTO "__vex_sqlite_indexes" ("table", "name") VALUES (?, ?)',
           ).run(name, idxName);
         }
+        clearStatementCaches();
         db.exec("RELEASE SAVEPOINT __vex_ensure_table");
         exec.schemas.set(name, schema);
       } catch (error) {
@@ -796,7 +859,7 @@ export function sqliteAdapter(
         if (row) {
           if (Object.keys(data).length === 0) return;
           const { sql, values } = buildUpdateSql(table, data);
-          const result = db.prepare(sql).run(...values, row._id);
+          const result = writer.statements.get(sql).run(...values, row._id);
           if (result.changes > 0) changedTables.add(table);
         } else {
           insertUnlocked(table, { ...keys, ...data });
@@ -812,15 +875,15 @@ export function sqliteAdapter(
       await withConnectionLock(() => {
         if (Object.keys(data).length === 0) return;
         const { sql, values } = buildUpdateSql(table, data);
-        const result = db.prepare(sql).run(...values, id);
+        const result = writer.statements.get(sql).run(...values, id);
         if (result.changes > 0) changedTables.add(table);
       });
     },
 
     async delete(table: string, id: string): Promise<boolean> {
       return withConnectionLock(() => {
-        const result = db
-          .prepare(`DELETE FROM ${quoteIdent(table)} WHERE _id = ?`)
+        const result = writer.statements
+          .get(`DELETE FROM ${quoteIdent(table)} WHERE _id = ?`)
           .run(id);
         if (result.changes > 0) changedTables.add(table);
         return result.changes > 0;
@@ -871,7 +934,8 @@ export function sqliteAdapter(
       if (isPooledRawRead(sql)) {
         try {
           return await withReadConnection(
-            (readDb) => readDb.prepare(sql).all(...params) as T[],
+            (connection) =>
+              connection.statements.get(sql).all(...params) as T[],
           );
         } catch (error: unknown) {
           // A WITH statement can terminate in SELECT or in DML. Bun does not
@@ -883,7 +947,7 @@ export function sqliteAdapter(
         }
       }
       return withConnectionLock(() => {
-        const rows = db.prepare(sql).all(...params) as T[];
+        const rows = writer.statements.get(sql).all(...params) as T[];
         if (changesConnectionLocalState(sql)) writerReadsRequired = true;
         return rows;
       });
@@ -892,7 +956,7 @@ export function sqliteAdapter(
     async rawExec(sql: string, ...params: any[]): Promise<void> {
       await withConnectionLock(() => {
         if (params.length > 0) {
-          db.prepare(sql).run(...params);
+          writer.statements.get(sql).run(...params);
         } else {
           db.exec(sql);
         }
@@ -919,7 +983,7 @@ export function sqliteAdapter(
               .filter((key) => key !== "_id"),
           ),
         ];
-        const stmt = db.prepare(buildInsertSql(table, keys));
+        const stmt = writer.statements.get(buildInsertSql(table, keys));
 
         const insertMany = db.transaction((items: Record<string, any>[]) => {
           for (const row of items) {
@@ -950,7 +1014,11 @@ export function sqliteAdapter(
       if (closed) return;
       closed = true;
       rejectQueuedWork();
-      for (const connection of readConnections) connection.db.close();
+      writer.statements.close();
+      for (const connection of readConnections) {
+        connection.statements.close();
+        connection.db.close();
+      }
       db.close();
     },
   };
