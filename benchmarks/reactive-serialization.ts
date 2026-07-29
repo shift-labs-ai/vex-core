@@ -91,7 +91,7 @@ function reusedFrames(
   const json = JSON.stringify(result);
   return {
     hash: Number(Bun.hash(json)),
-    bytes: new TextEncoder().encode(json).byteLength,
+    bytes: Buffer.byteLength(json),
     frames: subscriberIds.map(
       (id) => `{"type":"data","id":${JSON.stringify(id)},"data":${json}}`,
     ),

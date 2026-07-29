@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
-import { SERIALIZED_SUBSCRIPTION_RESULT, Vex } from "../src/core/engine.js";
+import { Vex, withSerializedSubscriptionResult } from "../src/core/engine.js";
 
 const user = { id: "u1", name: "User", isAdmin: false };
 let open: Vex[] = [];
@@ -627,6 +627,30 @@ describe("reactive subscription bedrock", () => {
     ]);
   });
 
+  test("grouped invalidation never crosses subscriber user contexts", async () => {
+    const vex = await create({
+      plugins: [reactivityPlugin],
+      storage: sqliteAdapter(":memory:"),
+    });
+    const first: any[] = [];
+    const second: any[] = [];
+    await vex.subscribe("rx.viewer", {}, (data) => first.push(data), { user });
+    await vex.subscribe("rx.viewer", {}, (data) => second.push(data), {
+      user: { id: "u2", name: "Other", isAdmin: true },
+    });
+
+    await vex.mutate("rx.add", {
+      scope: "a",
+      kind: "one",
+      name: "a",
+      body: null,
+    });
+
+    expect(first.map((value) => value.userId)).toEqual(["u1", "u1"]);
+    expect(second.map((value) => value.userId)).toEqual(["u2", "u2"]);
+    expect(vex.describeSubscriptions()).toMatchObject({ total: 2, unique: 2 });
+  });
+
   test("initial subscribe budget failures include telemetry and do not register", async () => {
     const spans: any[] = [];
     const vex = await create({
@@ -799,11 +823,10 @@ describe("reactive subscription bedrock", () => {
       storage: sqliteAdapter(":memory:"),
     });
     const frames: string[] = [];
-    const deliver = Object.assign(
+    const deliver = withSerializedSubscriptionResult(
       (result: unknown, serialized?: string) => {
         frames.push(serialized ?? JSON.stringify(result));
       },
-      { [SERIALIZED_SUBSCRIPTION_RESULT]: true as const },
     );
     await vex.subscribe("rx.serializable", {}, deliver);
     await vex.subscribe("rx.serializable", {}, deliver);

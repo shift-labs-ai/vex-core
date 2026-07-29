@@ -166,7 +166,10 @@ async function reactiveScenario(
     for (let iteration = 0; iteration < iterations; iteration++) {
       const serialized = JSON.stringify(result);
       value = (value + Number(Bun.hash(serialized))) >>> 0;
-      value = (value + encoder.encode(serialized).byteLength) >>> 0;
+      const resultBytes = reused
+        ? Buffer.byteLength(serialized)
+        : encoder.encode(serialized).byteLength;
+      value = (value + resultBytes) >>> 0;
       for (const id of ids) {
         const frame = reused
           ? `{"type":"data","id":${JSON.stringify(id)},"data":${serialized}}`

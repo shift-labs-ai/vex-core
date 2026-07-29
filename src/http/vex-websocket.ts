@@ -75,7 +75,7 @@
  */
 
 import type { Server as BunServer, ServerWebSocket } from "bun";
-import { SERIALIZED_SUBSCRIPTION_RESULT, type Vex } from "../core/engine.js";
+import { type Vex, withSerializedSubscriptionResult } from "../core/engine.js";
 import type { VexUser } from "../core/types.js";
 
 // Bun's `Server` is generic over the websocket payload shape; we
@@ -450,11 +450,10 @@ async function handleSubscribe(
 
   let unsubscribe: (() => void) | null = null;
   try {
-    const sendSubscriptionData = Object.assign(
+    const sendSubscriptionData = withSerializedSubscriptionResult(
       (data: unknown, serialized?: string) => {
         sendData(ws, frame.id, data, serialized);
       },
-      { [SERIALIZED_SUBSCRIPTION_RESULT]: true as const },
     );
     unsubscribe = await vex.subscribe(
       frame.name,

@@ -29,22 +29,29 @@ import type {
   WebhookResponse,
 } from "./types.js";
 
-/** @internal Opt-in used by the WebSocket adapter; ordinary callbacks stay unary. */
-export const SERIALIZED_SUBSCRIPTION_RESULT = Symbol(
-  "vex.serializedSubscriptionResult",
-);
+type SubscriptionCallback = (data: any) => void;
+type SerializedSubscriptionCallback = (data: any, serialized?: string) => void;
 
-type SubscriptionCallback = ((data: any, serialized?: string) => void) & {
-  [SERIALIZED_SUBSCRIPTION_RESULT]?: true;
-};
+const serializedSubscriptionCallbacks = new WeakSet<SubscriptionCallback>();
+
+/** @internal Marks a transport callback that can consume measured JSON. */
+export function withSerializedSubscriptionResult<
+  T extends SerializedSubscriptionCallback,
+>(callback: T): T {
+  serializedSubscriptionCallbacks.add(callback);
+  return callback;
+}
 
 function deliverSubscriptionResult(
   callback: SubscriptionCallback,
   result: any,
   serialized: string | undefined,
 ): void {
-  if (callback[SERIALIZED_SUBSCRIPTION_RESULT]) callback(result, serialized);
-  else callback(result);
+  if (serializedSubscriptionCallbacks.has(callback)) {
+    (callback as SerializedSubscriptionCallback)(result, serialized);
+  } else {
+    callback(result);
+  }
 }
 
 // Trace metadata is operational telemetry, not a request archive.
@@ -59,11 +66,20 @@ interface Subscription {
   queryName: string;
   args: Record<string, any>;
   argsKey: string;
+  userKey: string;
   callback: SubscriptionCallback;
   lastHash: number;
   tables: Set<string>;
   dependencies: QueryDependency[];
   user?: VexUser | null;
+}
+
+function subscriptionGroupKey(subscription: Subscription): string {
+  return `${subscription.queryName}\0${subscription.argsKey}\0${subscription.userKey}`;
+}
+
+function subscriptionUserKey(user: VexUser | null | undefined): string {
+  return JSON.stringify(user ? [user.id, user.name, user.isAdmin] : null);
 }
 
 interface RegisteredQuery {
@@ -740,7 +756,7 @@ export class Vex {
     return {
       hash: Number(Bun.hash(serialized)),
       resultRows,
-      resultBytes: new TextEncoder().encode(serialized).byteLength,
+      resultBytes: Buffer.byteLength(serialized ?? "undefined"),
       serialized,
     };
   }
@@ -822,7 +838,7 @@ export class Vex {
             writes,
           );
           if (!affected) continue;
-          const key = `${sub.queryName}\0${sub.argsKey}`;
+          const key = subscriptionGroupKey(sub);
           let group = groups.get(key);
           if (!group) {
             group = [];
@@ -1012,6 +1028,7 @@ export class Vex {
         queryName: name,
         args,
         argsKey: JSON.stringify(args),
+        userKey: subscriptionUserKey(user),
         callback,
         lastHash: measurement.hash,
         tables,
@@ -1149,7 +1166,7 @@ export class Vex {
       { args: string; count: number; tables: string[] }
     >();
     for (const sub of this.subscriptions.values()) {
-      const key = `${sub.queryName}\0${sub.argsKey}`;
+      const key = subscriptionGroupKey(sub);
       const existing = byQuery.get(key);
       if (existing) {
         existing.count++;
