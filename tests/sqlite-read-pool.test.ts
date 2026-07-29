@@ -1,5 +1,5 @@
-import { Database as BunDatabase } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database as BunDatabase, Statement as BunStatement } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -104,6 +104,85 @@ describe("SQLite read-only connection pool", () => {
       Array.from({ length: 100 }, (_, index) => index),
     );
     expect(reads.every(([row]) => row.value === 42)).toBe(true);
+  });
+
+  test("recurring reads prepare once per pooled connection", async () => {
+    const adapter = await createRowsStorage();
+    await adapter.insert("rows", { _id: "kept", value: 42 });
+    const sql = "SELECT value FROM rows WHERE _id = ?";
+    const prepare = spyOn(BunDatabase.prototype, "prepare");
+
+    try {
+      for (let index = 0; index < 8; index++) {
+        expect(await adapter.rawQuery(sql, "kept")).toEqual([{ value: 42 }]);
+      }
+      expect(
+        prepare.mock.calls.filter(([preparedSql]) => preparedSql === sql),
+      ).toHaveLength(4);
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
+  test("recurring writes reuse their prepared statement", async () => {
+    const adapter = await createRowsStorage();
+    await adapter.insert("rows", { _id: "kept", value: 1 });
+    const sql = "UPDATE rows SET value = ? WHERE _id = ?";
+    const prepare = spyOn(BunDatabase.prototype, "prepare");
+
+    try {
+      await adapter.rawExec(sql, 2, "kept");
+      await adapter.rawExec(sql, 3, "kept");
+      expect(
+        prepare.mock.calls.filter(([preparedSql]) => preparedSql === sql),
+      ).toHaveLength(1);
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
+  test("statement caches are bounded and evict least-recently-used SQL", async () => {
+    storage = sqliteAdapter(":memory:");
+    const prepare = spyOn(BunDatabase.prototype, "prepare");
+
+    try {
+      for (let index = 0; index < 64; index++) {
+        await storage.rawQuery(`SELECT ${index} AS value /* shape-${index} */`);
+      }
+      await storage.rawQuery("SELECT 0 AS value /* shape-0 */");
+      await storage.rawQuery("SELECT 64 AS value /* shape-64 */");
+      await storage.rawQuery("SELECT 1 AS value /* shape-1 */");
+
+      const shapePrepares = prepare.mock.calls.filter(([sql]) =>
+        String(sql).includes("/* shape-"),
+      );
+      expect(shapePrepares).toHaveLength(66);
+      expect(
+        shapePrepares.filter(([sql]) => String(sql).includes("shape-0 */")),
+      ).toHaveLength(1);
+      expect(
+        shapePrepares.filter(([sql]) => String(sql).includes("shape-1 */")),
+      ).toHaveLength(2);
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
+  test("close finalizes every cached pooled statement", async () => {
+    const adapter = await createRowsStorage();
+    const sql = "SELECT value FROM rows";
+    const finalize = spyOn(BunStatement.prototype, "finalize");
+
+    try {
+      for (let index = 0; index < 4; index++) {
+        await adapter.rawQuery(sql);
+      }
+      await adapter.close();
+      storage = undefined;
+      expect(finalize).toHaveBeenCalledTimes(4);
+    } finally {
+      finalize.mockRestore();
+    }
   });
 
   test("failed reads release their connections to queued reads", async () => {
