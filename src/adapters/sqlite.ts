@@ -24,7 +24,18 @@ interface ExistingColumn {
   dflt_value: string | null;
 }
 
+interface ReadConnection {
+  db: Database;
+  busy: boolean;
+}
+
+interface Waiter<T> {
+  resolve: (value: T) => void;
+  reject: (error: Error) => void;
+}
+
 const SQLITE_INDEX_METADATA_TABLE = "__vex_sqlite_indexes";
+const SQLITE_READ_POOL_SIZE = 4;
 
 function toSqlType(type: TableSchema["columns"][string]["type"]): string {
   switch (type) {
@@ -343,6 +354,7 @@ function wrapSync(
   db: Database,
   changedTables: Set<string>,
   withConnectionLock: <T>(fn: () => Promise<T> | T) => Promise<T>,
+  withReadConnection: <T>(fn: (readDb: Database) => T) => Promise<T>,
 ): DbExec {
   return {
     schemas: new Map(),
@@ -350,10 +362,10 @@ function wrapSync(
       if (changes > 0) changedTables.add(table);
     },
     async all(sql, params) {
-      return withConnectionLock(() =>
+      return withReadConnection((readDb) =>
         params.length > 0
-          ? db.prepare(sql).all(...params)
-          : db.prepare(sql).all(),
+          ? readDb.prepare(sql).all(...params)
+          : readDb.prepare(sql).all(),
       );
     },
     async run(sql, params) {
@@ -370,28 +382,125 @@ export interface SqliteOptions {
   cacheSize?: number;
 }
 
+function isMemoryDatabase(path: string): boolean {
+  return path === ":memory:" || path === "" || path.startsWith("file::memory:");
+}
+
+function openReadConnections(
+  path: string,
+  opts: SqliteOptions | undefined,
+): ReadConnection[] {
+  if (isMemoryDatabase(path)) return [];
+
+  const connections: ReadConnection[] = [];
+  try {
+    for (let i = 0; i < SQLITE_READ_POOL_SIZE; i++) {
+      const readDb = new Database(path, { readonly: true });
+      try {
+        readDb.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
+        if (opts?.cacheSize) {
+          readDb.exec(`PRAGMA cache_size = ${opts.cacheSize}`);
+        }
+      } catch (error) {
+        readDb.close();
+        throw error;
+      }
+      connections.push({ db: readDb, busy: false });
+    }
+    return connections;
+  } catch (error) {
+    for (const connection of connections) connection.db.close();
+    throw error;
+  }
+}
+
+function sqlAfterLeadingComments(sql: string): string {
+  let offset = 0;
+  while (offset < sql.length) {
+    while (/\s/.test(sql[offset] ?? "")) offset++;
+    if (sql.startsWith("--", offset)) {
+      const newline = sql.indexOf("\n", offset + 2);
+      if (newline === -1) return "";
+      offset = newline + 1;
+      continue;
+    }
+    if (sql.startsWith("/*", offset)) {
+      const end = sql.indexOf("*/", offset + 2);
+      if (end === -1) return "";
+      offset = end + 2;
+      continue;
+    }
+    break;
+  }
+  return sql.slice(offset);
+}
+
+function leadingSqlKeyword(sql: string): string {
+  return (
+    sqlAfterLeadingComments(sql)
+      .match(/^[a-z]+/i)?.[0]
+      .toUpperCase() ?? ""
+  );
+}
+
+function isPooledRawRead(sql: string): boolean {
+  return ["EXPLAIN", "SELECT", "VALUES", "WITH"].includes(
+    leadingSqlKeyword(sql),
+  );
+}
+
+function isReadonlyError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "SQLITE_READONLY"
+  );
+}
+
+function changesConnectionLocalState(sql: string): boolean {
+  const statement = sqlAfterLeadingComments(sql);
+  return (
+    /(?:^|;)\s*(?:ATTACH|DETACH)\b/i.test(statement) ||
+    /(?:^|;)\s*CREATE\s+(?:TEMP|TEMPORARY)\b/i.test(statement) ||
+    /\btemp\s*\./i.test(statement) ||
+    /(?:^|;)\s*PRAGMA\b[^;]*=/i.test(statement)
+  );
+}
+
 export function sqliteAdapter(
   path: string = ":memory:",
   opts?: SqliteOptions,
 ): StorageAdapter {
   const db = new Database(path);
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA synchronous = NORMAL");
-  db.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
-  if (opts?.cacheSize) db.exec(`PRAGMA cache_size = ${opts.cacheSize}`);
+  let readConnections: ReadConnection[];
+  try {
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA synchronous = NORMAL");
+    db.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
+    if (opts?.cacheSize) db.exec(`PRAGMA cache_size = ${opts.cacheSize}`);
+    // Materialize a brand-new database's schema state before readonly handles
+    // open it. Without this read, Bun can return SQLITE_CANTOPEN until the
+    // writer executes its first schema-aware statement.
+    db.exec("PRAGMA schema_version");
+    readConnections = openReadConnections(path, opts);
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 
   const changedTables = new Set<string>();
-  // Bun's SQLite handle is a single connection. While it has an
-  // open BEGIN, every statement on that connection participates in
+  // The write handle is a single connection. While it has an open
+  // BEGIN, every statement on that connection participates in
   // that transaction. Track the async owner so same-call nesting can
   // reuse the connection, while unrelated concurrent calls queue
   // instead of accidentally sharing each other's COMMIT/ROLLBACK.
   const transactionContext = new AsyncLocalStorage<{ active: boolean }>();
   let writeLocked = false;
-  const writeWaiters: Array<{
-    resolve: () => void;
-    reject: (error: Error) => void;
-  }> = [];
+  const writeWaiters: Array<Waiter<void>> = [];
+  const readWaiters: Array<Waiter<ReadConnection>> = [];
+  let nextReadConnection = 0;
+  let writerReadsRequired = false;
   let closed = false;
 
   function closedError(): Error {
@@ -423,6 +532,33 @@ export function sqliteAdapter(
   function rejectQueuedWork(): void {
     const error = closedError();
     for (const waiter of writeWaiters.splice(0)) waiter.reject(error);
+    for (const waiter of readWaiters.splice(0)) waiter.reject(error);
+  }
+
+  function acquireReadConnection(): ReadConnection | Promise<ReadConnection> {
+    if (closed) throw closedError();
+    for (let offset = 0; offset < readConnections.length; offset++) {
+      const index = (nextReadConnection + offset) % readConnections.length;
+      const connection = readConnections[index];
+      if (!connection.busy) {
+        connection.busy = true;
+        nextReadConnection = (index + 1) % readConnections.length;
+        return connection;
+      }
+    }
+    return new Promise((resolve, reject) => {
+      readWaiters.push({ resolve, reject });
+    });
+  }
+
+  function releaseReadConnection(connection: ReadConnection): void {
+    if (closed) {
+      connection.busy = false;
+      return;
+    }
+    const next = readWaiters.shift();
+    if (next) next.resolve(connection);
+    else connection.busy = false;
   }
 
   async function withConnectionLock<T>(fn: () => Promise<T> | T): Promise<T> {
@@ -447,6 +583,27 @@ export function sqliteAdapter(
     }
   }
 
+  async function withReadConnection<T>(
+    fn: (readDb: Database) => T,
+  ): Promise<T> {
+    if (closed) throw closedError();
+    const owner = transactionContext.getStore();
+    // Transaction-owned reads must use the write handle to see uncommitted
+    // changes. Connection-local state (TEMP tables, ATTACH, PRAGMAs) also pins
+    // reads to that handle. In-memory databases have no shareable backing file.
+    if (owner?.active || writerReadsRequired || readConnections.length === 0) {
+      return withConnectionLock(() => fn(db));
+    }
+
+    const connection = await acquireReadConnection();
+    try {
+      if (closed) throw closedError();
+      return fn(connection.db);
+    } finally {
+      releaseReadConnection(connection);
+    }
+  }
+
   function insertUnlocked(table: string, row: Record<string, any>): string {
     const id = row._id ?? generateId(12);
     const data: Record<string, any> = { ...row, _id: id };
@@ -457,7 +614,12 @@ export function sqliteAdapter(
     return id;
   }
 
-  const exec = wrapSync(db, changedTables, withConnectionLock);
+  const exec = wrapSync(
+    db,
+    changedTables,
+    withConnectionLock,
+    withReadConnection,
+  );
 
   return {
     name: "sqlite",
@@ -706,7 +868,25 @@ export function sqliteAdapter(
       sql: string,
       ...params: any[]
     ): Promise<T[]> {
-      return withConnectionLock(() => db.prepare(sql).all(...params) as T[]);
+      if (isPooledRawRead(sql)) {
+        try {
+          return await withReadConnection(
+            (readDb) => readDb.prepare(sql).all(...params) as T[],
+          );
+        } catch (error: unknown) {
+          // A WITH statement can terminate in SELECT or in DML. Bun does not
+          // expose sqlite3_stmt_readonly(), so let SQLite classify that one
+          // ambiguous form and retry only its readonly failure on the writer.
+          if (leadingSqlKeyword(sql) !== "WITH" || !isReadonlyError(error)) {
+            throw error;
+          }
+        }
+      }
+      return withConnectionLock(() => {
+        const rows = db.prepare(sql).all(...params) as T[];
+        if (changesConnectionLocalState(sql)) writerReadsRequired = true;
+        return rows;
+      });
     },
 
     async rawExec(sql: string, ...params: any[]): Promise<void> {
@@ -715,6 +895,12 @@ export function sqliteAdapter(
           db.prepare(sql).run(...params);
         } else {
           db.exec(sql);
+        }
+        if (
+          leadingSqlKeyword(sql) === "PRAGMA" ||
+          changesConnectionLocalState(sql)
+        ) {
+          writerReadsRequired = true;
         }
       });
     },
@@ -764,6 +950,7 @@ export function sqliteAdapter(
       if (closed) return;
       closed = true;
       rejectQueuedWork();
+      for (const connection of readConnections) connection.db.close();
       db.close();
     },
   };

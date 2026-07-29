@@ -266,7 +266,7 @@ export class Vex {
 
     if (job.enabled !== false) {
       this.startJobTimer(name, job, ms);
-      await this.storage.rawQuery(
+      await this.storage.rawExec(
         "UPDATE _jobs SET nextRun = ? WHERE name = ?",
         Date.now() + ms,
         name,

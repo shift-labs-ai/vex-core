@@ -522,6 +522,17 @@ function adapterSuite(name: string, create: () => Promise<StorageAdapter>) {
       expect(rows[0].name).toBe("alice");
     });
 
+    test("rawQuery preserves write-statement compatibility", async () => {
+      await adapter.insert("users", { name: "alice", age: 30 });
+      const rows = await adapter.rawQuery<{ age: number }>(
+        'UPDATE "users" SET age = ? WHERE name = ? RETURNING age',
+        31,
+        "alice",
+      );
+      expect(rows).toEqual([{ age: 31 }]);
+      expect((await adapter.query("users").first<any>()).age).toBe(31);
+    });
+
     test("rawExec runs statements", async () => {
       await adapter.insert("users", { name: "alice", age: 30 });
       await adapter.rawExec('DELETE FROM "users" WHERE name = ?', "alice");
@@ -1342,6 +1353,41 @@ describe("sqlite-specific", () => {
     expect(busyTimeout[0].timeout).toBe(1234);
     expect(cacheSize[0].cache_size).toBe(-2000);
     adapter.close();
+  });
+
+  test("sqlite options apply to every pooled read connection", async () => {
+    const path = tempSqlitePath("pooled-options");
+    let adapter: StorageAdapter | undefined;
+
+    try {
+      adapter = sqliteAdapter(path, {
+        busyTimeout: 1234,
+        cacheSize: -2000,
+      });
+      const pooledAdapter = adapter;
+      const busyTimeouts = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          pooledAdapter.rawQuery<{ timeout: number }>(
+            "SELECT timeout FROM pragma_busy_timeout",
+          ),
+        ),
+      );
+      const cacheSizes = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          pooledAdapter.rawQuery<{ cache_size: number }>(
+            "SELECT cache_size FROM pragma_cache_size",
+          ),
+        ),
+      );
+
+      expect(busyTimeouts.every((rows) => rows[0].timeout === 1234)).toBe(true);
+      expect(cacheSizes.every((rows) => rows[0].cache_size === -2000)).toBe(
+        true,
+      );
+    } finally {
+      await adapter?.close();
+      cleanupSqlitePath(path);
+    }
   });
 
   test("persistent sqlite files retain data across reopen", async () => {

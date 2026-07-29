@@ -119,13 +119,14 @@ function makeJobPlugin(gate: {
 
 async function settleState(
   promise: Promise<unknown>,
+  timeoutMs = 25,
 ): Promise<"pending" | "settled"> {
   return Promise.race([
     promise.then(
       () => "settled" as const,
       () => "settled" as const,
     ),
-    sleep(25).then(() => "pending" as const),
+    sleep(timeoutMs).then(() => "pending" as const),
   ]);
 }
 
@@ -250,7 +251,7 @@ describe("SQLite transaction ownership", () => {
     }
   });
 
-  test("raw queries queue instead of reading dirty rows from an unrelated transaction", async () => {
+  test("raw queries bypass an unrelated transaction and read the committed snapshot", async () => {
     const storage = await buildStorage();
     const release = Promise.withResolvers<void>();
     const started = Promise.withResolvers<void>();
@@ -267,12 +268,39 @@ describe("SQLite transaction ownership", () => {
         "SELECT v FROM rows ORDER BY rowid",
       );
 
-      expect(await settleState(read)).toBe("pending");
+      expect(await settleState(read, 250)).toBe("settled");
+      expect((await read).map((row) => row.v)).toEqual([]);
       expect(peerValues()).toEqual([]);
 
       release.resolve();
       await long;
-      expect((await read).map((row) => row.v)).toEqual(["uncommitted"]);
+      expect(peerValues()).toEqual(["uncommitted"]);
+    } finally {
+      await storage.close();
+    }
+  });
+
+  test("query-builder reads bypass an unrelated transaction", async () => {
+    const storage = await buildStorage();
+    const release = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+
+    try {
+      await storage.insert("rows", { v: "committed" });
+      const long = storage.transaction(async () => {
+        await storage.insert("rows", { v: "uncommitted" });
+        started.resolve();
+        await release.promise;
+      });
+      await started.promise;
+
+      const read = storage.query("rows").order("v").all<{ v: string }>();
+
+      expect(await settleState(read, 250)).toBe("settled");
+      expect((await read).map((row) => row.v)).toEqual(["committed"]);
+
+      release.resolve();
+      await long;
     } finally {
       await storage.close();
     }
@@ -361,13 +389,40 @@ describe("SQLite transaction ownership", () => {
     await expect(long).rejects.toThrow();
   });
 
-  test("writes after close reject with a clear adapter error", async () => {
+  test("operations after close reject with a clear adapter error", async () => {
     const storage = await buildStorage();
     await storage.close();
 
     await expect(storage.insert("rows", { v: "after-close" })).rejects.toThrow(
       "SQLite adapter is closed",
     );
+    await expect(storage.rawQuery("SELECT * FROM rows")).rejects.toThrow(
+      "SQLite adapter is closed",
+    );
+    await expect(storage.query("rows").all()).rejects.toThrow(
+      "SQLite adapter is closed",
+    );
+  });
+
+  test("closing the adapter rejects reads waiting for a pooled connection", async () => {
+    const storage = await buildStorage();
+    const reads = Array.from({ length: 5 }, () =>
+      storage.rawQuery("SELECT * FROM rows"),
+    );
+
+    await storage.close();
+
+    const results = await Promise.allSettled(reads);
+    expect(results).toHaveLength(5);
+    for (const result of results) {
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected") {
+        expect(result.reason).toHaveProperty(
+          "message",
+          "SQLite adapter is closed",
+        );
+      }
+    }
   });
 
   test("timed-out handler's pre-timeout writes roll back with the parent transaction", async () => {
@@ -441,10 +496,16 @@ describe("SQLite transaction ownership", () => {
         await storage.insert("rows", { v: "outer" });
         await storage.transaction(async () => {
           await storage.insert("rows", { v: "inner" });
-          const rows = await storage.rawQuery<{ v: string }>(
+          const rawRows = await storage.rawQuery<{ v: string }>(
             "SELECT v FROM rows ORDER BY rowid",
           );
-          expect(rows.map((row) => row.v)).toEqual(["outer", "inner"]);
+          expect(rawRows.map((row) => row.v)).toEqual(["outer", "inner"]);
+
+          const queryRows = await storage
+            .query("rows")
+            .order("v")
+            .all<{ v: string }>();
+          expect(queryRows.map((row) => row.v)).toEqual(["inner", "outer"]);
         });
       });
 
