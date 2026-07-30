@@ -45,6 +45,7 @@
     "bench:reactive-concurrency": "bun benchmarks/reactive-group-concurrency.ts",
     "bench:reactive-serialization": "bun benchmarks/reactive-serialization.ts",
     "bench:memory": "bun benchmarks/memory-impact.ts",
+    "bench:engine-hot-paths": "bun benchmarks/engine-hot-paths.ts",
     "format": "bunx biome format --write src/",
     "lint": "bunx biome lint src/",
     "check": "bunx biome check src/",
