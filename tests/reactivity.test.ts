@@ -8,6 +8,7 @@ let open: Vex[] = [];
 let listRuns = 0;
 let rawRuns = 0;
 let flakyThrows = false;
+let cyclicNow = false;
 let serializationCalls = 0;
 async function create(options: Parameters<typeof Vex.create>[0]) {
   const vex = await Vex.create(options);
@@ -20,6 +21,7 @@ afterEach(async () => {
   listRuns = 0;
   rawRuns = 0;
   flakyThrows = false;
+  cyclicNow = false;
   serializationCalls = 0;
 });
 
@@ -125,6 +127,33 @@ function reactivityPlugin(api: VexPluginAPI) {
           .order("kind", "asc")
           .limit(10),
       };
+    },
+  });
+  api.registerQuery("twoPhase", {
+    args: {},
+    async handler(ctx) {
+      const q = ctx.db.table("items").where("scope", "=", "a");
+      const broad = await q.count();
+      q.where("kind", "=", "one");
+      const narrow = await q.count();
+      return { broad, narrow };
+    },
+  });
+  api.registerQuery("sometimesCyclic", {
+    args: {},
+    async handler(ctx) {
+      const rows = await ctx.db.table("items").order("name", "asc").all();
+      if (!cyclicNow) return rows;
+      const value: any = { rows };
+      value.self = value;
+      return value;
+    },
+  });
+  api.registerQuery("nothing", {
+    args: {},
+    async handler(ctx) {
+      await ctx.db.table("items").count();
+      return undefined;
     },
   });
   api.registerQuery("branched", {
@@ -451,6 +480,145 @@ describe("reactive subscription bedrock", () => {
       filters: [{ column: "scope", operator: "=" }],
       order: { column: "name", dir: "desc" },
     });
+  });
+
+  test("descriptors snapshot at each terminal read; later chaining cannot rewrite them", async () => {
+    const spans: any[] = [];
+    const vex = await create({
+      plugins: [reactivityPlugin],
+      storage: sqliteAdapter(":memory:"),
+      tracer: { onSpan: (span) => spans.push(span) },
+    });
+    await vex.mutate("rx.add", {
+      scope: "a",
+      kind: "one",
+      name: "a",
+      body: null,
+    });
+    await vex.mutate("rx.add", {
+      scope: "a",
+      kind: "two",
+      name: "b",
+      body: null,
+    });
+    const calls: any[] = [];
+    await vex.subscribe("rx.twoPhase", {}, (data) => calls.push(data));
+
+    // Both reads executed against their own chain state.
+    expect(calls).toEqual([{ broad: 2, narrow: 1 }]);
+    // Each terminal read froze its own descriptor: the second where()
+    // must not retroactively appear on the first recorded dependency.
+    const meta = JSON.parse(
+      spans.find((span) => span.type === "subscribe")!.meta,
+    );
+    expect(meta.dependencies).toHaveLength(2);
+    expect(meta.dependencies[0].filters).toEqual([
+      { column: "scope", operator: "=" },
+    ]);
+    expect(meta.dependencies[1].filters).toEqual([
+      { column: "scope", operator: "=" },
+      { column: "kind", operator: "=" },
+    ]);
+  });
+
+  test("cyclic results during invalidation do not kill the subscription, and it recovers", async () => {
+    const consoleError = spyOn(console, "error").mockImplementation(() => {});
+    const vex = await create({
+      plugins: [reactivityPlugin],
+      storage: sqliteAdapter(":memory:"),
+    });
+    const calls: any[] = [];
+    await vex.subscribe("rx.sometimesCyclic", {}, (rows) =>
+      calls.push(rows.map((row: any) => row.name)),
+    );
+
+    try {
+      // The re-run result becomes unserializable: measurement throws
+      // outside the handler, after middleware succeeded.
+      cyclicNow = true;
+      await vex.mutate("rx.add", {
+        scope: "a",
+        kind: "one",
+        name: "a",
+        body: null,
+      });
+      expect(calls).toEqual([[]]);
+      expect(vex.activeSubscriptionCount()).toBe(1);
+      expect(consoleError).toHaveBeenCalledWith(
+        "[vex] subscription rx.sometimesCyclic failed:",
+        expect.any(Error),
+      );
+
+      // Once results are serializable again, the same subscription
+      // resumes with the full current state — nothing was skipped.
+      cyclicNow = false;
+      await vex.mutate("rx.add", {
+        scope: "a",
+        kind: "one",
+        name: "b",
+        body: null,
+      });
+      expect(calls).toEqual([[], ["a", "b"]]);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  test("unsafeBulkInsert invalidation is value-precise for filtered subscriptions", async () => {
+    const vex = await create({
+      plugins: [reactivityPlugin],
+      storage: sqliteAdapter(":memory:"),
+    });
+    const calls: string[][] = [];
+    await vex.subscribe("rx.list", { scope: "a" }, (rows) =>
+      calls.push(rows.map((row: any) => row.name)),
+    );
+    const runsAfterSubscribe = listRuns;
+
+    // Bulk rows for a different scope: recorded write values miss the
+    // eq-filter, so the group must not even re-run.
+    await vex.unsafeBulkInsert("items", [
+      { scope: "other", kind: "one", name: "x", score: 0, body: null },
+      { scope: "other", kind: "two", name: "y", score: 0, body: null },
+    ]);
+    expect(listRuns).toBe(runsAfterSubscribe);
+    expect(calls).toEqual([[]]);
+
+    // Matching rows re-run and deliver.
+    await vex.unsafeBulkInsert("items", [
+      { scope: "a", kind: "one", name: "m", score: 0, body: null },
+    ]);
+    expect(listRuns).toBe(runsAfterSubscribe + 1);
+    expect(calls).toEqual([[], ["m"]]);
+  });
+
+  test("undefined reactive results deliver without serialized JSON and stay hash-stable", async () => {
+    const vex = await create({
+      plugins: [reactivityPlugin],
+      storage: sqliteAdapter(":memory:"),
+    });
+    const deliveries: Array<[unknown, string | undefined]> = [];
+    const deliver = withSerializedSubscriptionResult(
+      (result: unknown, serialized?: string) => {
+        deliveries.push([result, serialized]);
+      },
+    );
+    await vex.subscribe("rx.nothing", {}, deliver);
+
+    // JSON.stringify(undefined) is undefined: transports must receive
+    // the explicit absence, not the string "undefined".
+    expect(deliveries).toEqual([[undefined, undefined]]);
+
+    // Invalidations rerun the query, but the hash of an undefined
+    // result is stable — no duplicate push.
+    await vex.mutate("rx.add", {
+      scope: "a",
+      kind: "one",
+      name: "a",
+      body: null,
+    });
+    expect(deliveries).toHaveLength(1);
+    expect(vex.activeSubscriptionCount()).toBe(1);
   });
 
   test("webhook writes without recorded write metadata still invalidate filtered subscriptions", async () => {

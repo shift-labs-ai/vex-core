@@ -1184,6 +1184,41 @@ describe("trace metadata", () => {
     await tvex.close();
   });
 
+  test("resultBytes counts UTF-8 bytes, not characters", async () => {
+    const spans: Span[] = [];
+    const payload = 'caf\u00e9 \ud83d\udca5 "quoted\\path"';
+    const tvex = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      tracer: { onSpan: (span) => spans.push(span) },
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("utf8");
+          api.registerQuery("text", {
+            args: {},
+            reactive: false,
+            handler: () => payload,
+          });
+        },
+      ],
+    });
+
+    await tvex.query("utf8.text");
+
+    const span = spans.find(
+      (candidate) =>
+        candidate.type === "query" && candidate.name === "utf8.text",
+    );
+    if (!span?.meta) throw new Error("Missing utf8.text query span");
+    const meta = JSON.parse(span.meta);
+    const json = JSON.stringify(payload);
+    // Multibyte characters and JSON escapes make byte length diverge
+    // from string length in both directions — bytes must win.
+    expect(meta.resultBytes).toBe(Buffer.byteLength(json));
+    expect(meta.resultBytes).not.toBe(json.length);
+
+    await tvex.close();
+  });
+
   test("does not auto-capture query, mutation, subscription, or webhook args", async () => {
     const spans: Span[] = [];
     const tvex = await Vex.create({

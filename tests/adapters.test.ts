@@ -936,6 +936,48 @@ describe("sqlite-specific", () => {
     adapter.close();
   });
 
+  test("changing a json column back to string stops parsing stored text", async () => {
+    const adapter = sqliteAdapter(":memory:");
+    await adapter.ensureTable("items", {
+      columns: { body: { type: "json" } },
+    });
+    await adapter.insert("items", { body: { parsed: true } });
+    expect((await adapter.query("items").first<any>()).body).toEqual({
+      parsed: true,
+    });
+
+    await adapter.ensureTable("items", {
+      columns: { body: { type: "string" } },
+    });
+    expect((await adapter.query("items").first<any>()).body).toBe(
+      '{"parsed":true}',
+    );
+    adapter.close();
+  });
+
+  test("malformed json column values are returned as raw strings", async () => {
+    const adapter = sqliteAdapter(":memory:");
+    await adapter.ensureTable("items", {
+      columns: {
+        body: { type: "json", optional: true },
+        anything: { type: "any", optional: true },
+      },
+    });
+    await adapter.rawExec(
+      "INSERT INTO items (_id, body, anything) VALUES (?, ?, ?)",
+      "raw-row",
+      "{not valid json",
+      '{"parsed":1}',
+    );
+
+    const row = await adapter.query("items").first<any>();
+    // Unparseable json text is preserved verbatim, never dropped.
+    expect(row.body).toBe("{not valid json");
+    // "any" columns deserialize exactly like json columns.
+    expect(row.anything).toEqual({ parsed: 1 });
+    adapter.close();
+  });
+
   test("bulkInsert includes columns that are absent from the first row", async () => {
     const adapter = sqliteAdapter(":memory:");
     await adapter.ensureTable("items", {

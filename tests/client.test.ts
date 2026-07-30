@@ -38,6 +38,13 @@ beforeAll(async () => {
             args: {},
             handler: async (ctx) => ctx.user?.id ?? null,
           },
+          nothing: {
+            args: {},
+            handler: async (ctx) => {
+              await ctx.db.table("items").count();
+              return undefined;
+            },
+          },
         },
         mutations: {
           create: {
@@ -1593,6 +1600,77 @@ describe("WebSocket live channel", () => {
     // close event, but we still give it one tick.
     await Bun.sleep(50);
     expect(vex.activeSubscriptionCount()).toBe(before);
+  });
+
+  test("serialized data frames stay valid JSON for hostile ids and multibyte payloads", async () => {
+    // The serialized fast path splices pre-measured JSON into a
+    // hand-built frame. Every hostile input must survive: an id full
+    // of quotes/backslashes/emoji, and payload text with JSON escapes,
+    // multibyte characters, and newlines.
+    const hostileName = 'he said "hi" \\ \ud83d\udca5\nnewline';
+    await fetch(`${base}/vex/mutate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "items.create",
+        args: { name: hostileName, value: 7 },
+      }),
+    });
+
+    const client = await openClient();
+    try {
+      const hostileId = 'sub-"quote\\slash-\ud83d\udca5';
+      const initial = collectData(client, hostileId, 1);
+      client.send({
+        type: "subscribe",
+        id: hostileId,
+        name: "items.byName",
+        args: { name: hostileName },
+      });
+      const frames = (await initial) as Array<Array<{ name: string }>>;
+      expect(frames).toHaveLength(1);
+      expect(frames[0]).toHaveLength(1);
+      expect(frames[0][0].name).toBe(hostileName);
+
+      // The invalidation push takes the same spliced-frame path.
+      const update = collectData(client, hostileId, 1);
+      await fetch(`${base}/vex/mutate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: "items.create",
+          args: { name: hostileName, value: 8 },
+        }),
+      });
+      const updated = (await update) as Array<Array<{ name: string }>>;
+      expect(updated[0]).toHaveLength(2);
+      expect(updated[0].every((row) => row.name === hostileName)).toBe(true);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("undefined subscription results produce a data frame with no data key", async () => {
+    // JSON.stringify(undefined) is undefined, so the serialized fast
+    // path must fall back to object framing — which drops the data key
+    // entirely. Assert the exact wire bytes.
+    const ws = new WebSocket(`ws://localhost:${server.port}/vex/subscribe`);
+    await new Promise<void>((resolve) =>
+      ws.addEventListener("open", () => resolve(), { once: true }),
+    );
+    const texts: string[] = [];
+    ws.addEventListener("message", (ev) => texts.push(String(ev.data)));
+    try {
+      ws.send(
+        JSON.stringify({ type: "subscribe", id: "u-1", name: "items.nothing" }),
+      );
+      const deadline = Date.now() + 1_500;
+      while (texts.length === 0 && Date.now() < deadline) await Bun.sleep(10);
+      expect(texts).toEqual(['{"type":"data","id":"u-1"}']);
+    } finally {
+      ws.close();
+      await Bun.sleep(20);
+    }
   });
 
   test("HTTP GET to /vex/subscribe without upgrade returns 426", async () => {

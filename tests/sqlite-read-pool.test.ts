@@ -171,6 +171,57 @@ describe("SQLite read pool and statement cache", () => {
     }
   });
 
+  test("schema changes issued through rawQuery invalidate cached shapes", async () => {
+    const adapter = await createRowsStorage();
+    await adapter.insert("rows", { _id: "existing", value: 1 });
+    const sql = "SELECT * FROM rows WHERE _id = ?";
+    await Promise.all(
+      Array.from({ length: 4 }, () => adapter.rawQuery(sql, "existing")),
+    );
+
+    // DDL through rawQuery (not rawExec) must clear caches the same way.
+    await adapter.rawQuery(
+      "ALTER TABLE rows ADD COLUMN via_query TEXT DEFAULT 'q'",
+    );
+
+    const reads = await Promise.all(
+      Array.from({ length: 4 }, () =>
+        adapter.rawQuery<{ via_query: string }>(sql, "existing"),
+      ),
+    );
+    expect(reads.every((rows) => rows[0].via_query === "q")).toBe(true);
+  });
+
+  test("VACUUM clears every connection's statement cache", async () => {
+    const adapter = await createRowsStorage();
+    await adapter.insert("rows", { _id: "kept", value: 42 });
+    const sql = "SELECT value FROM rows WHERE _id = ?";
+    const prepare = spyOn(BunDatabase.prototype, "prepare");
+
+    try {
+      // Warm all four pooled reader caches.
+      for (let index = 0; index < 8; index++) {
+        await adapter.rawQuery(sql, "kept");
+      }
+      const warmPrepares = prepare.mock.calls.filter(
+        ([preparedSql]) => preparedSql === sql,
+      ).length;
+      expect(warmPrepares).toBe(4);
+
+      await adapter.rawExec("VACUUM");
+
+      // Every reader must re-prepare against the vacuumed database.
+      for (let index = 0; index < 8; index++) {
+        expect(await adapter.rawQuery(sql, "kept")).toEqual([{ value: 42 }]);
+      }
+      expect(
+        prepare.mock.calls.filter(([preparedSql]) => preparedSql === sql),
+      ).toHaveLength(8);
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
   test("statements that fail to prepare are not cached", async () => {
     storage = sqliteAdapter(":memory:");
     const sql = "SELECT * FROM missing_table";
