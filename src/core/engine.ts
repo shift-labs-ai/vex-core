@@ -82,6 +82,19 @@ function subscriptionUserKey(user: VexUser | null | undefined): string {
   return JSON.stringify(user ? [user.id, user.name, user.isAdmin] : null);
 }
 
+function groupWritesByTable(
+  writes: WriteDependency[] | undefined,
+): Map<string, WriteDependency[]> | undefined {
+  if (!writes) return undefined;
+  const byTable = new Map<string, WriteDependency[]>();
+  for (const write of writes) {
+    const group = byTable.get(write.table);
+    if (group) group.push(write);
+    else byTable.set(write.table, [write]);
+  }
+  return byTable;
+}
+
 interface RegisteredQuery {
   plugin: string;
   def: QueryDef;
@@ -527,101 +540,87 @@ export class Vex {
     builder: QueryBuilder,
     table: string,
     dependencies?: QueryDependency[],
-    descriptor: Omit<QueryDependency, "table"> = {},
   ): QueryBuilder {
-    const self = this;
+    // One wrapper per db.table() call, descriptor accumulated in place and
+    // snapshotted at each terminal read. The underlying builder is
+    // mutable-shared (chained calls return the same builder), so a shared
+    // wrapper keeps the recorded descriptor consistent with the SQL that
+    // actually executes — even when callers hold intermediate references.
+    let current = builder;
+    const descriptor: Omit<QueryDependency, "table"> = {};
     const record = () => dependencies?.push({ table, ...descriptor });
-    return {
+    const tracked: QueryBuilder = {
       where(column, operator, value) {
-        return self.trackQueryBuilder(
-          builder.where(column, operator, value),
-          table,
-          dependencies,
-          {
-            ...descriptor,
-            filters: [
-              ...(descriptor.filters ?? []),
-              { column, operator, value },
-            ],
-          },
-        );
+        current = current.where(column, operator, value);
+        descriptor.filters = [
+          ...(descriptor.filters ?? []),
+          { column, operator, value },
+        ];
+        return tracked;
       },
       select(...columns) {
-        return self.trackQueryBuilder(
-          builder.select(...columns),
-          table,
-          dependencies,
-          {
-            ...descriptor,
-            select: columns,
-          },
-        );
+        current = current.select(...columns);
+        descriptor.select = columns;
+        return tracked;
       },
       order(column, dir = "asc") {
-        return self.trackQueryBuilder(
-          builder.order(column, dir),
-          table,
-          dependencies,
-          {
-            ...descriptor,
-            order: { column, dir },
-          },
-        );
+        current = current.order(column, dir);
+        descriptor.order = { column, dir };
+        return tracked;
       },
       limit(n) {
-        return self.trackQueryBuilder(builder.limit(n), table, dependencies, {
-          ...descriptor,
-          limit: n,
-        });
+        current = current.limit(n);
+        descriptor.limit = n;
+        return tracked;
       },
       offset(n) {
-        return self.trackQueryBuilder(builder.offset(n), table, dependencies, {
-          ...descriptor,
-          offset: n,
-        });
+        current = current.offset(n);
+        descriptor.offset = n;
+        return tracked;
       },
       all: async () => {
         record();
-        return builder.all();
+        return current.all();
       },
       first: async () => {
         record();
-        return builder.first();
+        return current.first();
       },
       distinct: async (col) => {
         record();
-        return builder.distinct(col);
+        return current.distinct(col);
       },
       count: async () => {
         record();
-        return builder.count();
+        return current.count();
       },
       countDistinct: async (col) => {
         record();
-        return builder.countDistinct(col);
+        return current.countDistinct(col);
       },
       sum: async (col) => {
         record();
-        return builder.sum(col);
+        return current.sum(col);
       },
       avg: async (col) => {
         record();
-        return builder.avg(col);
+        return current.avg(col);
       },
       min: async (col) => {
         record();
-        return builder.min(col);
+        return current.min(col);
       },
       max: async (col) => {
         record();
-        return builder.max(col);
+        return current.max(col);
       },
       groupBy: (col, aggs) => {
         record();
-        return builder.groupBy(col, aggs);
+        return current.groupBy(col, aggs);
       },
-      delete: () => builder.delete(),
+      delete: () => current.delete(),
     };
+    return tracked;
   }
 
   private extractTables(sql: string): string[] {
@@ -783,15 +782,14 @@ export class Vex {
   private dependencyAffected(
     dependencies: QueryDependency[],
     changedSet: Set<string>,
-    writes?: WriteDependency[],
+    writesByTable?: Map<string, WriteDependency[]>,
   ): boolean {
     if (dependencies.length === 0) return true;
     for (const dep of dependencies) {
       if (dep.table === "*" && dep.raw) return true;
       if (!changedSet.has(dep.table)) continue;
       if (dep.raw) return true;
-      const tableWrites =
-        writes?.filter((write) => write.table === dep.table) ?? [];
+      const tableWrites = writesByTable?.get(dep.table) ?? [];
       if (
         tableWrites.length === 0 ||
         tableWrites.some((write) => write.raw || !write.values)
@@ -824,6 +822,7 @@ export class Vex {
     if (changed.length === 0) return;
 
     const changedSet = new Set(changed);
+    const writesByTable = groupWritesByTable(writes);
 
     return this.trace(
       "invalidation",
@@ -835,7 +834,7 @@ export class Vex {
           const affected = this.dependencyAffected(
             sub.dependencies,
             changedSet,
-            writes,
+            writesByTable,
           );
           if (!affected) continue;
           const key = subscriptionGroupKey(sub);
@@ -950,9 +949,11 @@ export class Vex {
         else if (result && typeof result === "object" && "rows" in result)
           meta.resultRows = (result as any).rows?.length;
         try {
-          meta.resultBytes = new TextEncoder().encode(
-            JSON.stringify(result),
-          ).byteLength;
+          // Same convention as measureReactiveResult: undefined results
+          // are counted as the literal "undefined".
+          meta.resultBytes = Buffer.byteLength(
+            JSON.stringify(result) ?? "undefined",
+          );
         } catch {}
       }
       return result as T;

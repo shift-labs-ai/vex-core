@@ -1137,6 +1137,53 @@ describe("trace metadata", () => {
     await tvex.close();
   });
 
+  test("traced queries measure undefined and cyclic results safely", async () => {
+    const spans: Span[] = [];
+    const tvex = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      tracer: { onSpan: (span) => spans.push(span) },
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("edge");
+          api.registerQuery("nothing", {
+            args: {},
+            reactive: false,
+            handler: () => undefined,
+          });
+          api.registerQuery("cyclic", {
+            args: {},
+            reactive: false,
+            handler: () => {
+              const value: any = { ok: true };
+              value.self = value;
+              return value;
+            },
+          });
+        },
+      ],
+    });
+
+    await tvex.query("edge.nothing");
+    await tvex.query("edge.cyclic");
+
+    const metaFor = (name: string) => {
+      const span = spans.find(
+        (candidate) => candidate.type === "query" && candidate.name === name,
+      );
+      if (!span?.meta) throw new Error(`Missing query span: ${name}`);
+      return JSON.parse(span.meta);
+    };
+    // Same convention as the reactive path: undefined serializes to the
+    // literal "undefined" for byte accounting.
+    expect(metaFor("edge.nothing").resultBytes).toBe(
+      Buffer.byteLength("undefined"),
+    );
+    // Cyclic results cannot be measured; the span still records cleanly.
+    expect(metaFor("edge.cyclic").resultBytes).toBeUndefined();
+
+    await tvex.close();
+  });
+
   test("does not auto-capture query, mutation, subscription, or webhook args", async () => {
     const spans: Span[] = [];
     const tvex = await Vex.create({

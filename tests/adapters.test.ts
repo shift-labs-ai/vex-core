@@ -917,6 +917,25 @@ describe("sqlite-specific", () => {
     adapter.close();
   });
 
+  test("changing a column type to json re-derives row deserialization", async () => {
+    const adapter = sqliteAdapter(":memory:");
+    await adapter.ensureTable("items", {
+      columns: { body: { type: "string" } },
+    });
+    await adapter.insert("items", { body: '{"parsed":true}' });
+    expect((await adapter.query("items").first<any>()).body).toBe(
+      '{"parsed":true}',
+    );
+
+    await adapter.ensureTable("items", {
+      columns: { body: { type: "json" } },
+    });
+    expect((await adapter.query("items").first<any>()).body).toEqual({
+      parsed: true,
+    });
+    adapter.close();
+  });
+
   test("bulkInsert includes columns that are absent from the first row", async () => {
     const adapter = sqliteAdapter(":memory:");
     await adapter.ensureTable("items", {

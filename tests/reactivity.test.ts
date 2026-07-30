@@ -127,6 +127,17 @@ function reactivityPlugin(api: VexPluginAPI) {
       };
     },
   });
+  api.registerQuery("branched", {
+    args: { scope: "string" },
+    async handler(ctx, args) {
+      // The underlying query builder is mutable-shared: this order() call
+      // changes the SQL that base.all() executes. The recorded descriptor
+      // must describe that SQL, not the pre-order chain state.
+      const base = ctx.db.table("items").where("scope", "=", args.scope);
+      base.order("name", "desc");
+      return base.all();
+    },
+  });
   api.registerQuery("raw", {
     args: {},
     async handler(ctx) {
@@ -219,6 +230,19 @@ function reactivityPlugin(api: VexPluginAPI) {
     args: { value: "string" },
     async handler(ctx, args) {
       await ctx.db.sql("INSERT INTO audit (value) VALUES (?)", args.value);
+    },
+  });
+  api.registerWebhook("ingest", {
+    path: "/rx/ingest",
+    async handler(ctx, req) {
+      await ctx.db.table("items").insert({
+        scope: req.body.scope,
+        kind: "hook",
+        name: req.body.name,
+        score: 0,
+        body: null,
+      });
+      return { ok: true };
     },
   });
 }
@@ -390,6 +414,66 @@ describe("reactive subscription bedrock", () => {
       limit: 1,
       offset: 1,
     });
+  });
+
+  test("tracked descriptors match the SQL executed through intermediate references", async () => {
+    const spans: any[] = [];
+    const vex = await create({
+      plugins: [reactivityPlugin],
+      storage: sqliteAdapter(":memory:"),
+      tracer: { onSpan: (span) => spans.push(span) },
+    });
+    await vex.mutate("rx.add", {
+      scope: "a",
+      kind: "one",
+      name: "a",
+      body: null,
+    });
+    await vex.mutate("rx.add", {
+      scope: "a",
+      kind: "one",
+      name: "b",
+      body: null,
+    });
+    const calls: string[][] = [];
+    await vex.subscribe("rx.branched", { scope: "a" }, (rows) =>
+      calls.push(rows.map((row: any) => row.name)),
+    );
+
+    // The order() call through the saved reference reached the SQL.
+    expect(calls).toEqual([["b", "a"]]);
+    // The descriptor must agree with that SQL.
+    const meta = JSON.parse(
+      spans.find((span) => span.type === "subscribe")!.meta,
+    );
+    expect(meta.dependencies[0]).toMatchObject({
+      table: "items",
+      filters: [{ column: "scope", operator: "=" }],
+      order: { column: "name", dir: "desc" },
+    });
+  });
+
+  test("webhook writes without recorded write metadata still invalidate filtered subscriptions", async () => {
+    const vex = await create({
+      plugins: [reactivityPlugin],
+      storage: sqliteAdapter(":memory:"),
+    });
+    const calls: string[][] = [];
+    await vex.subscribe("rx.list", { scope: "a" }, (rows) =>
+      calls.push(rows.map((row: any) => row.name)),
+    );
+
+    const response = await vex.handleWebhook({
+      body: { scope: "a", name: "hooked" },
+      rawBody: JSON.stringify({ scope: "a", name: "hooked" }),
+      headers: {},
+      method: "POST",
+      path: "/rx/ingest",
+      query: {},
+    });
+
+    expect(response.status).toBe(200);
+    expect(calls).toEqual([[], ["hooked"]]);
   });
 
   test("query-builder terminal reads record dependencies and stay reactive", async () => {
