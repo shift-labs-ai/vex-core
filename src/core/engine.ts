@@ -1,3 +1,5 @@
+import type { TableAccessPolicy } from "./access.js";
+import { governedRawSqlError, guardQueryBuilder } from "./access.js";
 import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
 import { INTERNAL_TABLES } from "./internal.js";
@@ -132,6 +134,9 @@ export class Vex {
   // on collision using this map.
   private tableOwners: Map<string, string> = new Map();
   private middleware: MiddlewareFn[] = [];
+  // Row-level access policies by table (core/access.ts). Applied to
+  // every query-context read; mutation contexts are the trusted tier.
+  private accessPolicies: Map<string, TableAccessPolicy<any>> = new Map();
   private cronTimers: Map<string, ReturnType<typeof setInterval>> = new Map();
   private jobHandlers: Map<string, JobDef> = new Map();
   private jobIntervalMs: Map<string, number> = new Map();
@@ -234,6 +239,7 @@ export class Vex {
       }
       this.tableOwners.set(tableName, plugin.name);
       this.tables.add(tableName);
+      if (schema.access) this.accessPolicies.set(tableName, schema.access);
       await this.storage.ensureTable(tableName, schema);
     }
 
@@ -507,20 +513,53 @@ export class Vex {
     dependencies?: QueryDependency[],
   ): QueryContext {
     const self = this;
+    // One prepared access context per governed table per operation:
+    // a handler reading `sessions` through three chains resolves the
+    // caller's standing once. Subscription re-runs rebuild the whole
+    // context, so revocations apply on the next invalidation.
+    const preparedAccess = new Map<string, Promise<unknown>>();
+    function baseBuilder(name: string) {
+      const query = self.storage.query(name);
+      if (!touchedTables && !dependencies) return query;
+      touchedTables?.add(name);
+      return self.trackQueryBuilder(query, name, dependencies);
+    }
+    // The policy's own reads: tracked (grant-table writes must
+    // invalidate subscriptions on governed tables) but unguarded (a
+    // policy consulting its own table must not recurse).
+    const accessReader = { table: baseBuilder };
+    function resolvePrepared(
+      name: string,
+      policy: TableAccessPolicy<any>,
+    ): Promise<unknown> {
+      let prepared = preparedAccess.get(name);
+      if (!prepared) {
+        prepared = Promise.resolve(policy.prepare(user, accessReader));
+        preparedAccess.set(name, prepared);
+      }
+      return prepared;
+    }
     return {
       db: {
         table(name: string) {
-          const query = self.storage.query(name);
-          if (!touchedTables && !dependencies) return query;
-          touchedTables?.add(name);
-          return self.trackQueryBuilder(query, name, dependencies);
+          const policy = self.accessPolicies.get(name);
+          if (!policy) return baseBuilder(name);
+          return guardQueryBuilder(name, baseBuilder(name), policy, () =>
+            resolvePrepared(name, policy),
+          );
         },
         sql<T = Record<string, any>>(
           sql: string,
           ...params: any[]
         ): Promise<T[]> {
+          const tables = self.extractTables(sql);
+          const governed = tables.filter((table) =>
+            self.accessPolicies.has(table),
+          );
+          if (governed.length > 0) {
+            return Promise.reject(governedRawSqlError(governed));
+          }
           if (touchedTables || dependencies) {
-            const tables = self.extractTables(sql);
             for (const table of tables) {
               touchedTables?.add(table);
               dependencies?.push({ table, raw: true });

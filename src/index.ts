@@ -2,6 +2,8 @@
 export { sqliteAdapter } from "./adapters/sqlite.js";
 
 // Core
+export type { AccessReader, TableAccessPolicy } from "./core/access.js";
+export { UNRESTRICTED } from "./core/access.js";
 export type { PluginFunction, VexPluginAPI } from "./core/api.js";
 export { createPluginAPI, resolvePlugin } from "./core/api.js";
 // Config

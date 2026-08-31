@@ -1,3 +1,4 @@
+import type { TableAccessPolicy } from "./access.js";
 import type { ExecContext } from "./tracer.js";
 
 export type ColumnType = "string" | "number" | "boolean" | "json" | "any";
@@ -13,6 +14,13 @@ export interface TableSchema {
   columns: Record<string, ColumnDef>;
   indexes?: [name: string, columns: string[]][];
   unique?: string[][];
+  /**
+   * Row-level access policy (see core/access.ts). When present, every
+   * query-context read of this table is filtered to the rows the
+   * caller's prepared context accepts, raw SQL naming the table is
+   * refused in query contexts, and mutation contexts stay ungoverned.
+   */
+  access?: TableAccessPolicy<any>;
 }
 
 export interface Filter {
