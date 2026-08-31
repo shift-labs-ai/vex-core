@@ -427,8 +427,19 @@ export function guardQueryBuilder(
       let order: { column: string; dir: "asc" | "desc" } | null = null;
       let groupLimit: number | null = null;
 
-      const execute = () =>
-        terminal(
+      const execute = () => {
+        // Without ORDER BY, grouped output order is the SQL plan's
+        // for unrestricted callers and JS insertion order for
+        // restricted ones — one query answering in two orders
+        // depending on who asks. Refused uniformly, like raw SQL.
+        if (!order) {
+          return Promise.reject(
+            new Error(
+              `groupBy on access-governed table "${table}" requires an explicit order() — grouped output order is undefined without one`,
+            ),
+          );
+        }
+        return terminal(
           () => {
             let chain = release().groupBy(columns, aggs);
             for (const filter of having) {
@@ -452,6 +463,7 @@ export function guardQueryBuilder(
               groupLimit,
             ),
         );
+      };
 
       const builder: GroupByBuilder = {
         having(column, operator, value) {

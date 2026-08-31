@@ -526,14 +526,6 @@ describe("table access policies", () => {
     }
   });
 
-  test("groupBy over a governed table matches the mirror", async () => {
-    const vex = await create();
-    await seed(vex);
-    const governed = await vex.query("dx.grouped", { table: "docs" }, { user: alice });
-    const mirror = await vex.query("dx.grouped", { table: "mirror" });
-    expect(governed).toEqual(mirror);
-  });
-
   test("filtered reads compose with the policy", async () => {
     const vex = await create();
     const accessible = await seed(vex);
@@ -639,7 +631,7 @@ describe("table access policies", () => {
     const vex = await create();
     await seed(vex);
     const specs: Array<Record<string, unknown>> = [
-      {},
+      { order: ["kind", "asc"] },
       { columns: ["kind", "ownerId"], order: ["kind", "asc"] },
       { having: [["count", ">", 2]], order: ["count", "desc"] },
       { having: [["top", "<", 100], ["owners", "IN", [1, 2]]], order: ["kind", "desc"], limit: 1 },
@@ -662,6 +654,30 @@ describe("table access policies", () => {
         value: sorted(await vex.query("dx.grouped", { table: "mirrorAll", spec })),
       });
     }
+  });
+
+  test("groupBy on a governed table requires an explicit order, for every caller", async () => {
+    // Without ORDER BY, grouped output order is SQLite's unspecified
+    // plan order for unrestricted callers and JS insertion order for
+    // restricted ones — the same query answering in two orders
+    // depending on who asks, which is the exact per-caller behavior
+    // split this module exists to make unrepresentable. Refused
+    // uniformly, like raw SQL.
+    const vex = await create();
+    await seed(vex, 4);
+    for (const user of [alice, admin, null]) {
+      await expect(
+        vex.query(
+          "dx.grouped",
+          { table: "docs", spec: {} },
+          user ? { user } : undefined,
+        ),
+      ).rejects.toThrow(/explicit order/);
+    }
+    // Ungoverned tables keep the engine's existing contract.
+    await expect(
+      vex.query("dx.grouped", { table: "mirror", spec: {} }),
+    ).resolves.toBeArray();
   });
 
   test("two governed tables resolve independent prepared contexts", async () => {
