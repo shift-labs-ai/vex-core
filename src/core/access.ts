@@ -71,11 +71,13 @@ export interface TableAccessPolicy<P = unknown> {
   row(prepared: P, row: Record<string, any>): boolean;
 }
 
-type Prepared = unknown | typeof UNRESTRICTED;
-type ResolvePrepared = () => Promise<Prepared>;
+/** Resolves the caller's prepared context — {@link UNRESTRICTED} or
+ *  whatever the policy's `prepare` produced. */
+type ResolvePrepared = () => Promise<unknown>;
 
-/** SQLite's "no limit" spelling — clears any earlier limit() on the
- *  shared underlying builder before an exhaustive fetch. */
+/** The adapter grammar reads `LIMIT -1` as "no limit" — the reset
+ *  that clears an earlier limit() on the shared underlying builder
+ *  before an exhaustive fetch. */
 const NO_LIMIT = -1;
 /** First fetch size when a bounded read drives the refill loop. */
 const MIN_FETCH = 64;

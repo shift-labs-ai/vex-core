@@ -349,6 +349,55 @@ describe("table access policies", () => {
     );
   });
 
+  test("a window past the accessible rows is empty, not an error", async () => {
+    const vex = await create();
+    const accessible = await seed(vex);
+    expect(
+      await run(vex, alice, {
+        table: "docs",
+        order: ["title", "asc"],
+        limit: 5,
+        offset: accessible.length,
+        terminal: "all",
+      }),
+    ).toEqual([]);
+    expect(
+      await run(vex, alice, {
+        table: "docs",
+        offset: accessible.length,
+        terminal: "first",
+      }),
+    ).toBeNull();
+  });
+
+  test("the refill loop grows past sparse prefixes until the window fills", async () => {
+    // 200 rows where only the LAST few are Alice's: the first fetch
+    // (needed*2, floored at the minimum fetch size) accepts nothing,
+    // and only a grown refetch reaches her rows. Pins the loop's
+    // growth branch — a refill that never refills returns an
+    // under-filled window instead of the caller's limit.
+    const vex = await create();
+    for (let i = 0; i < 200; i++) {
+      await vex.mutate("dx.addDoc", {
+        id: `sparse-${String(i).padStart(3, "0")}`,
+        ownerId: i >= 195 ? "alice" : "bob",
+        title: `s-${String(i).padStart(3, "0")}`,
+        kind: "memo",
+      });
+    }
+    const rows = (await run(vex, alice, {
+      table: "docs",
+      order: ["title", "asc"],
+      limit: 3,
+      terminal: "all",
+    })) as DocRow[];
+    expect(rows.map((r) => r._id)).toEqual([
+      "sparse-195",
+      "sparse-196",
+      "sparse-197",
+    ]);
+  });
+
   test("first returns the first accessible row", async () => {
     const vex = await create();
     const accessible = await seed(vex);
@@ -358,6 +407,13 @@ describe("table access policies", () => {
       terminal: "first",
     })) as DocRow;
     expect(first._id).toBe(accessible[accessible.length - 1]._id);
+    const projected = await run(vex, alice, {
+      table: "docs",
+      select: ["title"],
+      order: ["title", "asc"],
+      terminal: "first",
+    });
+    expect(projected).toEqual({ title: accessible[0].title });
     const none = await run(vex, alice, {
       table: "docs",
       where: [["ownerId", "=", "bob"], ["kind", "=", "memo"], ["score", "=", -1]],
