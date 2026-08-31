@@ -92,15 +92,50 @@ function docsPlugin(api: VexPluginAPI) {
       },
     },
   });
-  // The same rows with no policy — the equivalence oracle. A
+  // The same rows with no policy — the equivalence oracles. A
   // restricted read of `docs` must equal the same read of `mirror`
-  // holding only the accessible rows.
-  api.registerTable("mirror", {
-    columns: {
-      ownerId: { type: "string", index: true },
-      title: { type: "string" },
-      kind: { type: "string" },
-      score: { type: "number", optional: true },
+  // (only the accessible rows); an unrestricted read of `docs` must
+  // equal the same read of `mirrorAll` (every row) — which pins the
+  // guard's release path, where held select/limit/offset are handed
+  // back to SQL.
+  for (const oracle of ["mirror", "mirrorAll"]) {
+    api.registerTable(oracle, {
+      columns: {
+        ownerId: { type: "string", index: true },
+        title: { type: "string" },
+        kind: { type: "string" },
+        score: { type: "number", optional: true },
+      },
+    });
+  }
+  // A second governed table with its own policy: a handler reading
+  // both must resolve two independent prepared contexts.
+  api.registerTable("pets", {
+    columns: { ownerId: { type: "string", index: true }, name: { type: "string" } },
+    access: {
+      prepare(user) {
+        if (!user || user.isAdmin) return UNRESTRICTED;
+        return user.id;
+      },
+      row(prepared, row) {
+        return row.ownerId === prepared;
+      },
+    },
+  });
+  // A governed table whose policy fails — failures must reject the
+  // operation, never fail open.
+  api.registerTable("vault", {
+    columns: { name: { type: "string" } },
+    access: {
+      prepare(user) {
+        if (!user) return UNRESTRICTED;
+        if (user.id === "alice") throw new Error("prepare exploded");
+        return user.id;
+      },
+      row(_prepared, row) {
+        if (row.name === "mine") throw new Error("row verdict exploded");
+        return false;
+      },
     },
   });
 
@@ -161,18 +196,43 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerQuery("grouped", {
-    args: { table: "string" },
+    args: { table: "string", spec: "json" },
     async handler(ctx, args) {
-      return ctx.db
-        .table(args.table)
-        .groupBy("kind", {
-          count: "count",
-          total: ["sum", "score"],
-          top: ["max", "score"],
-        })
-        .having("count", ">=", 1)
-        .order("kind", "asc")
-        .limit(10);
+      const spec = (args.spec ?? {}) as {
+        columns?: string | string[];
+        having?: Array<[string, any, any]>;
+        order?: [string, "asc" | "desc"];
+        limit?: number;
+      };
+      let chain = ctx.db.table(args.table).groupBy(spec.columns ?? "kind", {
+        count: "count",
+        total: ["sum", "score"],
+        top: ["max", "score"],
+        mean: ["avg", "score"],
+        owners: ["countDistinct", "ownerId"],
+      });
+      for (const [col, op, val] of spec.having ?? [])
+        chain = chain.having(col, op, val);
+      if (spec.order) chain = chain.order(spec.order[0], spec.order[1]);
+      if (spec.limit !== undefined) chain = chain.limit(spec.limit);
+      return chain;
+    },
+  });
+
+  api.registerQuery("bothGoverned", {
+    args: {},
+    async handler(ctx) {
+      return {
+        docs: (await ctx.db.table("docs").all()).length,
+        pets: (await ctx.db.table("pets").all()).length,
+      };
+    },
+  });
+
+  api.registerQuery("vaultRead", {
+    args: {},
+    async handler(ctx) {
+      return ctx.db.table("vault").all();
     },
   });
 
@@ -287,6 +347,9 @@ async function seed(vex: Vex, total = 20): Promise<DocRow[]> {
       row.score,
     );
   }
+  await vex.unsafeSql(
+    "INSERT INTO mirrorAll (_id, ownerId, title, kind, score) SELECT 'a-' || _id, ownerId, title, kind, score FROM docs",
+  );
   return accessible;
 }
 
@@ -526,6 +589,117 @@ describe("table access policies", () => {
     };
     expect(prepareCalls).toBe(1);
     expect(result.count).toBe(result.rows);
+  });
+
+  test("every windowed read matches its oracle, restricted and unrestricted alike", async () => {
+    // The spec matrix × caller matrix: alice (restricted, JS
+    // evaluation) against the accessible mirror, admin (unrestricted,
+    // the guard's release path) against the full mirror. Any
+    // divergence between the two implementations of one read is a
+    // policy bug by definition.
+    const vex = await create();
+    await seed(vex);
+    const specs: Array<Record<string, unknown>> = [
+      { order: ["title", "asc"], limit: 3, offset: 2, terminal: "all" },
+      { select: ["title", "kind"], order: ["title", "desc"], limit: 4, terminal: "all" },
+      { where: [["kind", "=", "memo"]], order: ["title", "asc"], offset: 1, terminal: "all" },
+      { where: [["kind", "IN", ["memo", "report"]]], order: ["title", "asc"], terminal: "all" },
+      { where: [["score", "=", null]], order: ["title", "asc"], terminal: "all" },
+      { where: [["score", ">", 5]], order: ["score", "desc"], limit: 2, terminal: "all" },
+      { select: ["title"], order: ["title", "asc"], offset: 2, terminal: "first" },
+      { limit: 3, terminal: "count" },
+      { order: ["title", "asc"], limit: 2, offset: 1, terminal: "distinct", column: "kind" },
+      { terminal: "countDistinct", column: "ownerId" },
+      { where: [["kind", "=", "memo"]], terminal: "sum", column: "score" },
+      { where: [["kind", "=", "report"]], terminal: "avg", column: "score" },
+      { terminal: "min", column: "score" },
+      { terminal: "max", column: "score" },
+    ];
+    const strip = (value: unknown) =>
+      Array.isArray(value)
+        ? value.map((row) =>
+            row && typeof row === "object" && "_id" in (row as object)
+              ? { ...(row as object), _id: "~" }
+              : row,
+          )
+        : value && typeof value === "object" && "_id" in (value as object)
+          ? { ...(value as object), _id: "~" }
+          : value;
+    for (const spec of specs) {
+      const restricted = strip(await run(vex, alice, { ...spec, table: "docs" }));
+      const restrictedOracle = strip(await run(vex, null, { ...spec, table: "mirror" }));
+      expect({ spec, value: restricted }).toEqual({ spec, value: restrictedOracle });
+      const released = strip(await run(vex, admin, { ...spec, table: "docs" }));
+      const releasedOracle = strip(await run(vex, null, { ...spec, table: "mirrorAll" }));
+      expect({ spec, value: released }).toEqual({ spec, value: releasedOracle });
+    }
+  });
+
+  test("groupBy variants match their oracles for both caller kinds", async () => {
+    const vex = await create();
+    await seed(vex);
+    const specs: Array<Record<string, unknown>> = [
+      {},
+      { columns: ["kind", "ownerId"], order: ["kind", "asc"] },
+      { having: [["count", ">", 2]], order: ["count", "desc"] },
+      { having: [["top", "<", 100], ["owners", "IN", [1, 2]]], order: ["kind", "desc"], limit: 1 },
+    ];
+    const sorted = (rows: unknown) =>
+      JSON.parse(JSON.stringify(rows)) as Array<Record<string, unknown>>;
+    for (const spec of specs) {
+      expect({
+        spec,
+        value: sorted(await vex.query("dx.grouped", { table: "docs", spec }, { user: alice })),
+      }).toEqual({
+        spec,
+        value: sorted(await vex.query("dx.grouped", { table: "mirror", spec })),
+      });
+      expect({
+        spec,
+        value: sorted(await vex.query("dx.grouped", { table: "docs", spec }, { user: admin })),
+      }).toEqual({
+        spec,
+        value: sorted(await vex.query("dx.grouped", { table: "mirrorAll", spec })),
+      });
+    }
+  });
+
+  test("two governed tables resolve independent prepared contexts", async () => {
+    const vex = await create();
+    await seed(vex, 4);
+    await vex.unsafeSql(
+      "INSERT INTO pets (_id, ownerId, name) VALUES ('p1','alice','rex'), ('p2','bob','tux')",
+    );
+    prepareCalls = 0;
+    const result = (await vex.query("dx.bothGoverned", {}, { user: alice })) as {
+      docs: number;
+      pets: number;
+    };
+    // docs' prepare ran once (counter is docs-only); pets filtered by
+    // its own policy to Alice's single pet.
+    expect(prepareCalls).toBe(1);
+    expect(result.pets).toBe(1);
+    expect(result.docs).toBe(2);
+  });
+
+  test("policy failures reject the operation — never fail open", async () => {
+    const vex = await create();
+    await vex.unsafeSql("INSERT INTO vault (_id, name) VALUES ('v1','mine')");
+    // prepare throwing rejects the query…
+    await expect(vex.query("dx.vaultRead", {}, { user: alice })).rejects.toThrow(
+      "prepare exploded",
+    );
+    // …a row verdict throwing rejects the query…
+    await expect(vex.query("dx.vaultRead", {}, { user: bob })).rejects.toThrow(
+      "row verdict exploded",
+    );
+    // …and a failing subscribe registers nothing.
+    await expect(
+      vex.subscribe("dx.vaultRead", {}, () => {}, { user: alice }),
+    ).rejects.toThrow("prepare exploded");
+    expect(vex.activeSubscriptionCount()).toBe(0);
+    // Unrestricted callers are untouched by either failure mode.
+    expect((await vex.query("dx.vaultRead", {})) as unknown[]).toHaveLength(1);
   });
 
   test("subscriptions are policy-filtered per user and react to grant changes", async () => {
