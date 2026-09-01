@@ -235,6 +235,11 @@ export type DispatchClaim = { result: unknown } | null | undefined;
  * triggers no invalidation. Reads the hook makes are dependency-
  * tracked like any handler's, so a subscription answered by a claim
  * re-runs when the tables the hook consulted change.
+ *
+ * Hooks run on queries (one-shot, subscription initial runs, and
+ * invalidation re-runs) and mutations. Webhooks are never
+ * dispatched: they are a platform's inbound door, not a call that
+ * can be answered elsewhere.
  */
 export type DispatchFn = (
   ctx: QueryContext,
