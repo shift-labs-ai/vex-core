@@ -1,4 +1,5 @@
 import type {
+  DispatchFn,
   JobDef,
   MiddlewareFn,
   MutationDef,
@@ -16,6 +17,7 @@ export interface VexPluginAPI {
   registerJob(name: string, def: JobDef): void;
   registerWebhook(name: string, def: WebhookDef): void;
   use(fn: MiddlewareFn): void;
+  useDispatch(fn: DispatchFn): void;
 }
 
 export type PluginFunction = (api: VexPluginAPI) => void;
@@ -31,6 +33,7 @@ export function createPluginAPI(): {
   const jobs: Record<string, JobDef> = {};
   const webhooks: Record<string, WebhookDef> = {};
   const middleware: MiddlewareFn[] = [];
+  const dispatch: DispatchFn[] = [];
 
   const api: VexPluginAPI = {
     setName(n: string) {
@@ -54,6 +57,9 @@ export function createPluginAPI(): {
     use(fn: MiddlewareFn) {
       middleware.push(fn);
     },
+    useDispatch(fn: DispatchFn) {
+      dispatch.push(fn);
+    },
   };
 
   function resolve(): PluginDef {
@@ -65,6 +71,7 @@ export function createPluginAPI(): {
       jobs,
       webhooks,
       middleware: middleware.length > 0 ? middleware : undefined,
+      dispatch: dispatch.length > 0 ? dispatch : undefined,
     };
   }
 

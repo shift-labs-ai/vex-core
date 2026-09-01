@@ -216,6 +216,31 @@ export type MiddlewareFn = (
   next: () => Promise<any> | any,
 ) => Promise<any> | any;
 
+/**
+ * A dispatch hook's verdict: an object claims the call and supplies
+ * its result; null/undefined passes it to the next hook and
+ * ultimately the registered handler.
+ */
+export type DispatchClaim = { result: unknown } | null | undefined;
+
+/**
+ * Runs before the handler — and, for mutations, BEFORE the storage
+ * transaction opens — so a hook that answers a call with its own
+ * I/O (a federation proxy, a cache, a remote engine) never holds
+ * the write lock through that I/O. This is the difference from
+ * middleware, whose mutation chain runs inside the transaction.
+ *
+ * Hooks read through an ordinary query context; a claim performs no
+ * local writes, so a claimed mutation opens no transaction and
+ * triggers no invalidation. Reads the hook makes are dependency-
+ * tracked like any handler's, so a subscription answered by a claim
+ * re-runs when the tables the hook consulted change.
+ */
+export type DispatchFn = (
+  ctx: QueryContext,
+  info: MiddlewareInfo,
+) => Promise<DispatchClaim> | DispatchClaim;
+
 export interface PluginDef {
   name: string;
   version?: string;
@@ -225,4 +250,5 @@ export interface PluginDef {
   jobs?: Record<string, JobDef>;
   webhooks?: Record<string, WebhookDef>;
   middleware?: MiddlewareFn[];
+  dispatch?: DispatchFn[];
 }

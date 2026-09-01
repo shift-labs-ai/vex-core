@@ -14,6 +14,8 @@ import type { ExecContext, Tracer } from "./tracer.js";
 import { createRootSpan, isTraceRecording } from "./tracer.js";
 import type {
   CallContext,
+  DispatchClaim,
+  DispatchFn,
   JobDef,
   MiddlewareFn,
   MiddlewareInfo,
@@ -134,6 +136,7 @@ export class Vex {
   // on collision using this map.
   private tableOwners: Map<string, string> = new Map();
   private middleware: MiddlewareFn[] = [];
+  private dispatchHooks: DispatchFn[] = [];
   // Row-level access policies by table (core/access.ts). Applied to
   // every query-context read; mutation contexts are the trusted tier.
   private accessPolicies: Map<string, TableAccessPolicy<any>> = new Map();
@@ -227,6 +230,7 @@ export class Vex {
 
   private async registerPlugin(plugin: PluginDef): Promise<void> {
     if (plugin.middleware) this.middleware.push(...plugin.middleware);
+    if (plugin.dispatch) this.dispatchHooks.push(...plugin.dispatch);
 
     for (const [tableName, schema] of Object.entries(plugin.tables)) {
       const existingOwner = this.tableOwners.get(tableName);
@@ -909,12 +913,20 @@ export class Vex {
               first.user,
               dependencies,
             );
-            const result = await this.runMiddleware(
-              ctx,
-              { type: "query", name: first.queryName, args: first.args },
-              () => reg.def.handler(ctx, first.args),
-              _invEctx,
-            );
+            const info: MiddlewareInfo = {
+              type: "query",
+              name: first.queryName,
+              args: first.args,
+            };
+            const claim = await this.runDispatch(ctx, info);
+            const result = claim
+              ? claim.result
+              : await this.runMiddleware(
+                  ctx,
+                  info,
+                  () => reg.def.handler(ctx, first.args),
+                  _invEctx,
+                );
             const measurement = this.measureReactiveResult(result);
             try {
               this.assertReactiveBudget(measurement, budget);
@@ -955,10 +967,31 @@ export class Vex {
     );
   }
 
+  /**
+   * First claim wins. The context is the caller's — query paths pass
+   * their tracked context so a hook's reads join the operation's
+   * dependency set; the mutation path builds a read-only one, which
+   * is the point: a claim is answered without the transaction.
+   */
+  private async runDispatch(
+    ctx: QueryContext,
+    info: MiddlewareInfo,
+  ): Promise<DispatchClaim> {
+    for (const hook of this.dispatchHooks) {
+      const claim = await hook(ctx, info);
+      if (claim) return claim;
+    }
+    return null;
+  }
+
   // ─── Public API ───
 
   use(fn: MiddlewareFn) {
     this.middleware.push(fn);
+  }
+
+  useDispatch(fn: DispatchFn) {
+    this.dispatchHooks.push(fn);
   }
 
   async query<T = any>(
@@ -974,12 +1007,17 @@ export class Vex {
       const tables = recording ? new Set<string>() : undefined;
       const dependencies = recording ? ([] as QueryDependency[]) : undefined;
       const ctx = this.buildQueryContext(tables, user, dependencies);
-      const result = await this.runMiddleware(
-        ctx,
-        { type: "query", name, args },
-        () => reg.def.handler(ctx, args),
-        ectx,
-      );
+      const info: MiddlewareInfo = { type: "query", name, args };
+      const claim = await this.runDispatch(ctx, info);
+      if (recording && claim) meta.dispatched = true;
+      const result = claim
+        ? claim.result
+        : await this.runMiddleware(
+            ctx,
+            info,
+            () => reg.def.handler(ctx, args),
+            ectx,
+          );
       if (tables && dependencies) {
         meta.plugin = reg.plugin;
         meta.tables = [...tables];
@@ -1008,6 +1046,23 @@ export class Vex {
     return this.trace("mutation", name, parent, async (ectx, meta) => {
       const reg = this.mutations.get(name);
       if (!reg) throw new Error(`Mutation not found: ${name}`);
+      // A claimed mutation never opens the transaction — the hook's
+      // own I/O (network, cache) must not hold the write lock — and
+      // triggers no invalidation, because a claim writes nothing
+      // locally (its context is read-only by type).
+      if (this.dispatchHooks.length > 0) {
+        const claim = await this.runDispatch(
+          this.buildQueryContext(undefined, user),
+          { type: "mutation", name, args },
+        );
+        if (claim) {
+          if (isTraceRecording(ectx)) {
+            meta.plugin = reg.plugin;
+            meta.dispatched = true;
+          }
+          return claim.result as T;
+        }
+      }
       const writes: WriteDependency[] = [];
       const ctx = this.buildMutationContext(user, writes);
       const result = await this.storage.transaction(() =>
@@ -1046,12 +1101,16 @@ export class Vex {
       const tables = new Set<string>();
       const dependencies: QueryDependency[] = [];
       const ctx = this.buildQueryContext(tables, user, dependencies);
-      const result = await this.runMiddleware(
-        ctx,
-        { type: "query", name, args },
-        () => reg.def.handler(ctx, args),
-        _ectx,
-      );
+      const info: MiddlewareInfo = { type: "query", name, args };
+      const claim = await this.runDispatch(ctx, info);
+      const result = claim
+        ? claim.result
+        : await this.runMiddleware(
+            ctx,
+            info,
+            () => reg.def.handler(ctx, args),
+            _ectx,
+          );
       const measurement = this.measureReactiveResult(result);
       if (recording) {
         meta.resultRows = measurement.resultRows;

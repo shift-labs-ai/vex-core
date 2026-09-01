@@ -36,6 +36,8 @@ export type {
   CallContext,
   ColumnDef,
   ColumnType,
+  DispatchClaim,
+  DispatchFn,
   Filter,
   GroupByBuilder,
   JobDef,
