@@ -128,15 +128,6 @@ export class Vex {
   private mutations: Map<string, RegisteredMutation> = new Map();
   private subscriptions: Map<string, Subscription> = new Map();
   private tables: Set<string> = new Set();
-  // Who registered each table. Two plugins registering the same bare
-  // name silently share one SQL table with merged schemas — one plugin's
-  // NOT NULL can break the other's inserts. registerPlugin fails loudly
-  // on collision using this map.
-  private tableOwners: Map<string, string> = new Map();
-  // Previous table names claimed through `renamedFrom`, by plugin, keyed
-  // in lowercase because the rename matches table names case-insensitively.
-  // A rename must not take a table that another registration still uses.
-  private previousNameOwners: Map<string, string> = new Map();
   private middleware: MiddlewareFn[] = [];
   // Row-level access policies by table (core/access.ts). Applied to
   // every query-context read; mutation contexts are the trusted tier.
@@ -212,14 +203,16 @@ export class Vex {
       };
     }
 
+    const plugins = options.plugins.map(resolvePlugin);
+    claimTableNames(plugins);
+
     // Register internal tables
     for (const [name, schema] of Object.entries(INTERNAL_TABLES)) {
       vex.tables.add(name);
       await vex.storage.ensureTable(name, schema);
     }
 
-    for (const pluginInput of options.plugins) {
-      const plugin = resolvePlugin(pluginInput);
+    for (const plugin of plugins) {
       vex.plugins.push(plugin);
       await vex.registerPlugin(plugin);
     }
@@ -233,32 +226,6 @@ export class Vex {
     if (plugin.middleware) this.middleware.push(...plugin.middleware);
 
     for (const [tableName, schema] of Object.entries(plugin.tables)) {
-      const existingOwner = this.tableOwners.get(tableName);
-      if (existingOwner) {
-        throw new Error(
-          `Duplicate table "${tableName}": already registered by plugin "${existingOwner}", ` +
-            `now re-registered by plugin "${plugin.name}". ` +
-            `Rename one of them (table names are not namespaced by plugin).`,
-        );
-      }
-      const renamer = this.previousNameOwners.get(tableName.toLowerCase());
-      if (renamer) {
-        throw new Error(
-          `Table "${tableName}" is the previous name of a table in plugin "${renamer}".`,
-        );
-      }
-      const previous = schema.renamedFrom;
-      if (previous !== undefined) {
-        const key = previous.toLowerCase();
-        const inUse = [...this.tables].some((t) => t.toLowerCase() === key);
-        if (inUse || this.previousNameOwners.has(key)) {
-          throw new Error(
-            `Table "${tableName}" cannot be renamed from "${previous}": that name is still in use.`,
-          );
-        }
-        this.previousNameOwners.set(key, plugin.name);
-      }
-      this.tableOwners.set(tableName, plugin.name);
       this.tables.add(tableName);
       if (schema.access) this.accessPolicies.set(tableName, schema.access);
       await this.storage.ensureTable(tableName, schema);
@@ -1319,6 +1286,38 @@ export class Vex {
     await Promise.allSettled([...this.runningJobs.values()]);
     this.subscriptions.clear();
     await this.storage.close();
+  }
+}
+
+// Every table name, current or previous, has exactly one claimant: the
+// engine, or one plugin. Two plugins sharing a name silently share one
+// SQL table with merged schemas, where one plugin's NOT NULL breaks the
+// other's inserts, and a rename whose previous name is in use takes that
+// table away. Names are compared case-insensitively, as SQLite does, and
+// all of them are checked before any table is migrated.
+function claimTableNames(plugins: PluginDef[]): void {
+  const claimants = new Map<string, string>();
+  const claim = (table: string, claimant: string) => {
+    const existing = claimants.get(table.toLowerCase());
+    if (existing) {
+      throw new Error(
+        `Duplicate table "${table}": claimed by ${existing} and by ${claimant}. ` +
+          `Rename one of them (table names are not namespaced by plugin and ignore case).`,
+      );
+    }
+    claimants.set(table.toLowerCase(), claimant);
+  };
+  for (const table of Object.keys(INTERNAL_TABLES)) claim(table, "the engine");
+  for (const plugin of plugins) {
+    for (const [table, schema] of Object.entries(plugin.tables)) {
+      claim(table, `plugin "${plugin.name}"`);
+      for (const previous of schema.renamedFrom ?? []) {
+        claim(
+          previous,
+          `plugin "${plugin.name}" as a previous name of "${table}"`,
+        );
+      }
+    }
   }
 }
 

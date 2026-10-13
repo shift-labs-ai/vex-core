@@ -9,11 +9,13 @@ export interface ColumnDef {
   optional?: boolean;
   default?: any;
   /**
-   * The column's previous name. If the table has a column by that name
-   * and none by this one, it is renamed in place, keeping its data. If
-   * the table has neither, the migration fails.
+   * Every name this column has had before. When the table has a column
+   * by one of them and none by this name, that column is renamed in
+   * place, keeping its data. When the table has neither, the migration
+   * fails: a new table is created under the current names, so a previous
+   * name that matches nothing is a mistake.
    */
-  renamedFrom?: string;
+  renamedFrom?: string[];
 }
 
 export interface TableSchema {
@@ -21,11 +23,11 @@ export interface TableSchema {
   indexes?: [name: string, columns: string[]][];
   unique?: string[][];
   /**
-   * The table's previous name. If a table by that name exists and none
-   * by this one, it is renamed in place, keeping its rows. If neither
-   * exists, the migration fails.
+   * Every name this table has had before. When a table by one of them
+   * exists and none by this name, it is renamed in place, keeping its
+   * rows. When neither exists, the table is created as usual.
    */
-  renamedFrom?: string;
+  renamedFrom?: string[];
   /**
    * Row-level access policy (see core/access.ts). When present, every
    * query-context read of this table is filtered to the rows the

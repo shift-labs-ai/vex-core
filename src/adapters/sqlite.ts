@@ -175,118 +175,118 @@ function validateTableName(name: string): void {
   }
 }
 
-function validateTableNameAvailability(db: Database, name: string): void {
-  const existing = db
-    .prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(?) AND name != ? LIMIT 1",
-    )
-    .get(name, name) as { name: string } | null;
-  if (existing) {
-    throw new Error(
-      `table name already exists with different casing: ${quoteIdent(existing.name)}`,
-    );
-  }
-}
-
-function existingTableName(db: Database, name: string): string | null {
+// SQLite matches table names case-insensitively; this returns the stored
+// spelling of the table a name refers to.
+function existingTableName(db: Database, name: string): string | undefined {
   const row = db
     .prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(?) LIMIT 1",
     )
     .get(name) as { name: string } | null;
-  return row?.name ?? null;
+  return row?.name;
 }
 
-function validateRenames(name: string, schema: TableSchema): void {
-  if (
-    schema.renamedFrom !== undefined &&
-    schema.renamedFrom.toLowerCase() === name.toLowerCase()
-  ) {
-    throw new Error(`table ${quoteIdent(name)} cannot be renamed from itself`);
-  }
-  const declared = new Set(
-    Object.keys(schema.columns).map((col) => col.toLowerCase()),
-  );
-  const sources = new Set<string>();
-  for (const [colName, colDef] of Object.entries(schema.columns)) {
-    if (colDef.renamedFrom === undefined) continue;
-    const from = colDef.renamedFrom.toLowerCase();
-    if (from === "_id") {
-      throw new Error(
-        `reserved column name ${quoteIdent(colDef.renamedFrom)} cannot be renamed on table ${quoteIdent(name)}`,
-      );
-    }
-    if (declared.has(from) || sources.has(from)) {
-      throw new Error(
-        `ambiguous rename of ${quoteIdent(colDef.renamedFrom)} to ${quoteIdent(colName)} on table ${quoteIdent(name)}`,
-      );
-    }
-    sources.add(from);
+function validateTableNameAvailability(db: Database, name: string): void {
+  const existing = existingTableName(db, name);
+  if (existing !== undefined && existing !== name) {
+    throw new Error(
+      `table name already exists with different casing: ${quoteIdent(existing)}`,
+    );
   }
 }
 
+function validateTableRenames(name: string, schema: TableSchema): void {
+  for (const previous of schema.renamedFrom ?? []) {
+    validateTableName(previous);
+    if (previous.toLowerCase() === name.toLowerCase()) {
+      throw new Error(
+        `table ${quoteIdent(name)} cannot be renamed from itself`,
+      );
+    }
+  }
+}
+
+// The rule shared by table and column renames. Returns the existing
+// previous name to rename from, or undefined when nothing needs renaming.
+// A previous name beside the current one, or two existing previous names,
+// leave no single source, so the migration fails rather than guess.
+function renameSource(
+  kind: "table" | "column",
+  name: string,
+  previousNames: string[],
+  find: (candidate: string) => string | undefined,
+  location = "",
+): string | undefined {
+  const sources = [
+    ...new Set(previousNames.map(find).filter((n) => n !== undefined)),
+  ];
+  if (sources.length === 0) return undefined;
+  if (find(name) !== undefined) {
+    throw new Error(
+      `cannot rename ${kind} ${quoteIdent(sources[0])} to ${quoteIdent(name)}${location}: both exist. ` +
+        `If a build older than the rename recreated ${quoteIdent(sources[0])}, merge its data and drop it.`,
+    );
+  }
+  if (sources.length > 1) {
+    throw new Error(
+      `cannot rename ${kind} to ${quoteIdent(name)}${location}: several previous names exist (${sources.map(quoteIdent).join(", ")})`,
+    );
+  }
+  return sources[0];
+}
+
+// Returns the name the table was renamed from, if it was.
 function renameTableIfNeeded(
   db: Database,
   name: string,
   schema: TableSchema,
-): void {
-  if (schema.renamedFrom === undefined) return;
-  const from = existingTableName(db, schema.renamedFrom);
-  const current = existingTableName(db, name);
-  if (from && current) {
-    throw new Error(
-      `cannot rename table ${quoteIdent(from)} to ${quoteIdent(name)}: both tables exist`,
-    );
-  }
-  if (!from && !current) {
-    throw new Error(
-      `cannot rename table ${quoteIdent(schema.renamedFrom)} to ${quoteIdent(name)}: neither table exists`,
-    );
-  }
-  if (!from) return;
-  db.exec(`ALTER TABLE ${quoteIdent(from)} RENAME TO ${quoteIdent(name)}`);
-  // The index step below drops the old table's generated indexes and
-  // creates them under the new name once their records follow the table.
+): string | undefined {
+  const source = renameSource("table", name, schema.renamedFrom ?? [], (n) =>
+    existingTableName(db, n),
+  );
+  if (source === undefined) return undefined;
+  db.exec(`ALTER TABLE ${quoteIdent(source)} RENAME TO ${quoteIdent(name)}`);
+  // Index records follow the table, so the index step recognizes its
+  // generated indexes as Vex-managed and recreates them under the new name.
   db.prepare(
     `UPDATE ${quoteIdent(SQLITE_INDEX_METADATA_TABLE)} SET "table" = ? WHERE "table" = ?`,
-  ).run(name, from);
+  ).run(name, source);
+  return source;
 }
 
+// Renames columns in place and updates `existing` to match, so the
+// migration steps after it work from one read of the table's columns.
 function renameColumnsIfNeeded(
   db: Database,
   name: string,
   schema: TableSchema,
+  existing: ExistingColumn[],
 ): void {
-  const renames = Object.entries(schema.columns).flatMap(([colName, colDef]) =>
-    colDef.renamedFrom === undefined
-      ? []
-      : [[colName, colDef.renamedFrom] as const],
-  );
-  if (renames.length === 0) return;
-  const columns = (
-    db.prepare(`PRAGMA table_info(${quoteIdent(name)})`).all() as {
-      name: string;
-    }[]
-  ).map((col) => col.name);
-  const existingColumn = (col: string) =>
-    columns.find((c) => c.toLowerCase() === col.toLowerCase());
-  for (const [colName, renamedFrom] of renames) {
-    const from = existingColumn(renamedFrom);
-    const current = existingColumn(colName);
-    if (from && current) {
-      throw new Error(
-        `cannot rename column ${quoteIdent(from)} to ${quoteIdent(colName)} on table ${quoteIdent(name)}: both columns exist`,
-      );
-    }
-    if (!from && !current) {
-      throw new Error(
-        `cannot rename column ${quoteIdent(renamedFrom)} to ${quoteIdent(colName)} on table ${quoteIdent(name)}: neither column exists`,
-      );
-    }
-    if (!from) continue;
-    db.exec(
-      `ALTER TABLE ${quoteIdent(name)} RENAME COLUMN ${quoteIdent(from)} TO ${quoteIdent(colName)}`,
+  const column = (colName: string) =>
+    existing.find((col) => col.name.toLowerCase() === colName.toLowerCase());
+  const location = ` on table ${quoteIdent(name)}`;
+  for (const [colName, colDef] of Object.entries(schema.columns)) {
+    if (!colDef.renamedFrom?.length) continue;
+    const source = renameSource(
+      "column",
+      colName,
+      colDef.renamedFrom,
+      (n) => column(n)?.name,
+      location,
     );
+    if (source === undefined) {
+      if (column(colName) === undefined) {
+        throw new Error(
+          `cannot rename column to ${quoteIdent(colName)}${location}: neither it nor a previous name (${colDef.renamedFrom.map(quoteIdent).join(", ")}) exists`,
+        );
+      }
+      continue;
+    }
+    db.exec(
+      `ALTER TABLE ${quoteIdent(name)} RENAME COLUMN ${quoteIdent(source)} TO ${quoteIdent(colName)}`,
+    );
+    const renamed = column(source);
+    if (renamed) renamed.name = colName;
   }
 }
 
@@ -305,6 +305,25 @@ function validateColumns(name: string, schema: TableSchema): void {
       );
     }
     columnNames.add(normalizedColName);
+  }
+  // Each previous name belongs to exactly one column and is not declared
+  // itself; otherwise its data has more than one destination.
+  const previousNames = new Set<string>();
+  for (const [colName, colDef] of Object.entries(schema.columns)) {
+    for (const previous of colDef.renamedFrom ?? []) {
+      const normalized = previous.toLowerCase();
+      if (normalized === "_id") {
+        throw new Error(
+          `reserved column name ${quoteIdent(previous)} cannot be renamed on table ${quoteIdent(name)}`,
+        );
+      }
+      if (columnNames.has(normalized) || previousNames.has(normalized)) {
+        throw new Error(
+          `ambiguous rename of ${quoteIdent(previous)} to ${quoteIdent(colName)} on table ${quoteIdent(name)}`,
+        );
+      }
+      previousNames.add(normalized);
+    }
   }
 }
 
@@ -793,8 +812,8 @@ export function sqliteAdapter(
     ensureTable(name: string, schema: TableSchema) {
       validateTableName(name);
       validateTableNameAvailability(db, name);
+      validateTableRenames(name, schema);
       validateColumns(name, schema);
-      validateRenames(name, schema);
       validateIndexColumns(name, schema);
       const expectedIndexes = expectedIndexDefinitions(name, schema);
       db.exec("SAVEPOINT __vex_ensure_table");
@@ -805,7 +824,7 @@ export function sqliteAdapter(
         // Renames run first so every later step sees the new names. Until
         // the table is renamed, its explicit indexes count as another
         // table's, so index names are checked after it.
-        renameTableIfNeeded(db, name, schema);
+        const renamedFrom = renameTableIfNeeded(db, name, schema);
         validateIndexNameAvailability(db, name, expectedIndexes);
         db.exec(
           createTableSql(name, schema).replace(
@@ -813,12 +832,10 @@ export function sqliteAdapter(
             "CREATE TABLE IF NOT EXISTS",
           ),
         );
-        renameColumnsIfNeeded(db, name, schema);
-
-        // Migrate: add missing columns
         let existing = db
           .prepare(`PRAGMA table_info(${quoteIdent(name)})`)
           .all() as ExistingColumn[];
+        renameColumnsIfNeeded(db, name, schema, existing);
         let existingNames = new Set(existing.map((c) => c.name));
         const tableIsEmpty =
           (
@@ -826,6 +843,8 @@ export function sqliteAdapter(
               .prepare(`SELECT COUNT(*) as count FROM ${quoteIdent(name)}`)
               .get() as { count: number }
           ).count === 0;
+
+        // Migrate: add missing columns
         for (const [colName, colDef] of Object.entries(schema.columns)) {
           if (!existingNames.has(colName)) {
             if (
@@ -944,6 +963,7 @@ export function sqliteAdapter(
         }
         clearStatementCaches();
         db.exec("RELEASE SAVEPOINT __vex_ensure_table");
+        if (renamedFrom !== undefined) exec.schemas.delete(renamedFrom);
         exec.schemas.set(name, schema);
       } catch (error) {
         db.exec("ROLLBACK TO SAVEPOINT __vex_ensure_table");

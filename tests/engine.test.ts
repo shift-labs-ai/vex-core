@@ -694,9 +694,9 @@ describe("plugin name collisions", () => {
     ).rejects.toThrow('Duplicate table "runs"');
   });
 
-  test("a previous name cannot be a table that is still in use", async () => {
+  test("table names are claimed once across the engine and all plugins, ignoring case, before any migration", async () => {
     const plugin =
-      (name: string, table: string, renamedFrom?: string) =>
+      (name: string, table: string, renamedFrom?: string[]) =>
       (api: VexPluginAPI) => {
         api.setName(name);
         api.registerTable(table, {
@@ -708,24 +708,39 @@ describe("plugin name collisions", () => {
       Vex.create({ plugins, storage: sqliteAdapter(":memory:") });
 
     await expect(
-      create(plugin("a", "old_items"), plugin("b", "items", "old_items")),
-    ).rejects.toThrow("that name is still in use");
+      create(plugin("a", "old_items"), plugin("b", "items", ["OLD_ITEMS"])),
+    ).rejects.toThrow(
+      'Duplicate table "OLD_ITEMS": claimed by plugin "a" and by plugin "b" as a previous name of "items"',
+    );
     await expect(
-      create(plugin("a", "old_items"), plugin("b", "items", "OLD_ITEMS")),
-    ).rejects.toThrow("that name is still in use");
-    const renamed = sqliteAdapter(":memory:");
-    await renamed.ensureTable("old_items", {
+      create(plugin("a", "items"), plugin("b", "Items")),
+    ).rejects.toThrow('Duplicate table "Items"');
+    await expect(create(plugin("a", "_jobs"))).rejects.toThrow(
+      'Duplicate table "_jobs": claimed by the engine and by plugin "a"',
+    );
+    await expect(create(plugin("a", "jobs", ["_Jobs"]))).rejects.toThrow(
+      "claimed by the engine",
+    );
+
+    // The renaming plugin comes first, yet nothing is migrated.
+    const storage = sqliteAdapter(":memory:");
+    await storage.ensureTable("old_items", {
       columns: { name: { type: "string" } },
     });
     await expect(
       Vex.create({
-        plugins: [plugin("b", "items", "old_items"), plugin("a", "Old_Items")],
-        storage: renamed,
+        plugins: [
+          plugin("b", "items", ["old_items"]),
+          plugin("a", "Old_Items"),
+        ],
+        storage,
       }),
-    ).rejects.toThrow("is the previous name of a table");
-    await expect(create(plugin("a", "jobs", "_jobs"))).rejects.toThrow(
-      "that name is still in use",
+    ).rejects.toThrow('Duplicate table "Old_Items"');
+    const tables = await storage.rawQuery<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('old_items', 'items')",
     );
+    expect(tables).toEqual([{ name: "old_items" }]);
+    storage.close();
   });
 
   test("same name across different plugins is fine", async () => {

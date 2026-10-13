@@ -1991,7 +1991,7 @@ describe("sqlite renames (renamedFrom)", () => {
     await adapter.ensureTable("old_records", {
       columns: {
         ownerId: { type: "string", index: true },
-        version: { type: "number" },
+        version: { type: "number", index: true },
       },
       indexes: [["records_lookup", ["ownerId", "version"]]],
       unique: [["ownerId", "version"]],
@@ -1999,10 +1999,10 @@ describe("sqlite renames (renamedFrom)", () => {
     await adapter.insert("old_records", { ownerId: "o1", version: 3 });
 
     await adapter.ensureTable("records", {
-      renamedFrom: "old_records",
+      renamedFrom: ["old_records"],
       columns: {
         ownerId: { type: "string", index: true },
-        revision: { type: "number", renamedFrom: "version" },
+        revision: { type: "number", index: true, renamedFrom: ["version"] },
       },
       indexes: [["records_lookup", ["ownerId", "revision"]]],
       unique: [["ownerId", "revision"]],
@@ -2013,23 +2013,28 @@ describe("sqlite renames (renamedFrom)", () => {
     ]);
     expect(await sqliteIndexNames(adapter, "records")).toEqual([
       "idx_records_ownerId",
+      "idx_records_revision",
       "records_lookup",
       "sqlite_autoindex_records_1",
       "uq_records_ownerId_revision",
     ]);
+    expect(adapter.getSchema("old_records")).toBeNull();
     adapter.close();
   });
 
-  test("fails when neither name exists, and changes nothing once renamed", async () => {
-    const adapter = sqliteAdapter(":memory:");
+  test("a new database creates the table under its current names, and a migrated one changes nothing", async () => {
     const renamed: TableSchema = {
-      renamedFrom: "old_items",
-      columns: { title: { type: "string", renamedFrom: "label" } },
+      renamedFrom: ["old_items"],
+      columns: { title: { type: "string", renamedFrom: ["label"] } },
     };
-    expect(() => adapter.ensureTable("items", renamed)).toThrow(
-      "neither table exists",
-    );
 
+    const fresh = sqliteAdapter(":memory:");
+    await fresh.ensureTable("items", renamed);
+    await fresh.insert("items", { title: "a" });
+    expect(await fresh.query("items").all()).toMatchObject([{ title: "a" }]);
+    fresh.close();
+
+    const adapter = sqliteAdapter(":memory:");
     await adapter.ensureTable("old_items", {
       columns: { label: { type: "string" } },
     });
@@ -2037,21 +2042,48 @@ describe("sqlite renames (renamedFrom)", () => {
     await adapter.ensureTable("items", renamed);
     await adapter.ensureTable("items", renamed);
     expect(await adapter.query("items").all()).toMatchObject([{ title: "a" }]);
+    adapter.close();
+  });
+
+  test("migrates from any previous name, so a database can skip versions", async () => {
+    const adapter = sqliteAdapter(":memory:");
+    await adapter.ensureTable("v1_items", {
+      columns: { text: { type: "string" } },
+    });
+    await adapter.insert("v1_items", { text: "a" });
+
+    await adapter.ensureTable("items", {
+      renamedFrom: ["v1_items", "v2_items"],
+      columns: { title: { type: "string", renamedFrom: ["text", "label"] } },
+    });
+
+    expect(await adapter.query("items").all()).toMatchObject([{ title: "a" }]);
+    adapter.close();
+  });
+
+  test("fails when a previous column name matches nothing in an existing table", async () => {
+    const adapter = sqliteAdapter(":memory:");
+    await adapter.ensureTable("items", {
+      columns: { title: { type: "string" } },
+    });
 
     expect(() =>
       adapter.ensureTable("items", {
         columns: {
           title: { type: "string" },
-          body: { type: "string", optional: true, renamedFrom: "text" },
+          body: { type: "string", optional: true, renamedFrom: ["text"] },
         },
       }),
-    ).toThrow("neither column exists");
+    ).toThrow('neither it nor a previous name ("text") exists');
     adapter.close();
   });
 
-  test("refuses when both the old and the new name exist", async () => {
+  test("refuses when the current name and a previous one both exist, or several previous ones do", async () => {
     const adapter = sqliteAdapter(":memory:");
     await adapter.ensureTable("old_items", {
+      columns: { label: { type: "string" } },
+    });
+    await adapter.ensureTable("older_items", {
       columns: { label: { type: "string" } },
     });
     await adapter.ensureTable("items", {
@@ -2060,15 +2092,23 @@ describe("sqlite renames (renamedFrom)", () => {
 
     expect(() =>
       adapter.ensureTable("items", {
-        renamedFrom: "old_items",
+        renamedFrom: ["old_items"],
         columns: { label: { type: "string" }, title: { type: "string" } },
       }),
-    ).toThrow("both tables exist");
+    ).toThrow('cannot rename table "old_items" to "items": both exist');
     expect(() =>
       adapter.ensureTable("items", {
-        columns: { title: { type: "string", renamedFrom: "label" } },
+        columns: { title: { type: "string", renamedFrom: ["label"] } },
       }),
-    ).toThrow("both columns exist");
+    ).toThrow(
+      'cannot rename column "label" to "title" on table "items": both exist',
+    );
+    expect(() =>
+      adapter.ensureTable("new_items", {
+        renamedFrom: ["old_items", "older_items"],
+        columns: { label: { type: "string" } },
+      }),
+    ).toThrow("several previous names exist");
     adapter.close();
   });
 
@@ -2082,7 +2122,7 @@ describe("sqlite renames (renamedFrom)", () => {
 
     expect(() =>
       adapter.ensureTable("items", {
-        renamedFrom: "old_items",
+        renamedFrom: ["old_items"],
         columns: { label: { type: "string" } },
         unique: [["label"]],
       }),
@@ -2091,27 +2131,45 @@ describe("sqlite renames (renamedFrom)", () => {
     adapter.close();
   });
 
-  test("rejects ambiguous column renames and renaming _id", () => {
+  test("rejects ambiguous column renames and reserved or self-referencing previous names", () => {
     const adapter = sqliteAdapter(":memory:");
     const text = { type: "string" } as const;
     expect(() =>
       adapter.ensureTable("items", {
-        columns: { a: text, b: { ...text, renamedFrom: "a" } },
+        columns: { a: text, b: { ...text, renamedFrom: ["a"] } },
       }),
     ).toThrow("ambiguous rename");
     expect(() =>
       adapter.ensureTable("items", {
         columns: {
-          b: { ...text, renamedFrom: "a" },
-          c: { ...text, renamedFrom: "a" },
+          b: { ...text, renamedFrom: ["a"] },
+          c: { ...text, renamedFrom: ["A"] },
         },
       }),
     ).toThrow("ambiguous rename");
     expect(() =>
       adapter.ensureTable("items", {
-        columns: { id: { ...text, renamedFrom: "_id" } },
+        columns: { id: { ...text, renamedFrom: ["_id"] } },
       }),
     ).toThrow("reserved column name");
+    expect(() =>
+      adapter.ensureTable("items", {
+        renamedFrom: ["__vex_sqlite_indexes"],
+        columns: { a: text },
+      }),
+    ).toThrow("reserved SQLite metadata table name");
+    expect(() =>
+      adapter.ensureTable("items", {
+        renamedFrom: ["sqlite_sequence"],
+        columns: { a: text },
+      }),
+    ).toThrow("reserved SQLite internal table name");
+    expect(() =>
+      adapter.ensureTable("items", {
+        renamedFrom: ["Items"],
+        columns: { a: text },
+      }),
+    ).toThrow("cannot be renamed from itself");
     adapter.close();
   });
 });

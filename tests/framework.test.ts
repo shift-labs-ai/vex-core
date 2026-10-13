@@ -37,6 +37,20 @@ describe("define", () => {
     });
   });
 
+  test("table() takes table options and every column option", () => {
+    const t = table(
+      { title: { type: "string", default: "", renamedFrom: ["text"] } },
+      { renamedFrom: ["chat_msgs"], unique: [["title"]] },
+    );
+    expect(t.renamedFrom).toEqual(["chat_msgs"]);
+    expect(t.unique).toEqual([["title"]]);
+    expect(t.columns.title).toEqual({
+      type: "string",
+      default: "",
+      renamedFrom: ["text"],
+    });
+  });
+
   test("query() returns tagged query", () => {
     const handler = async () => [];
     const q = query({ limit: "number" }, handler);
@@ -248,5 +262,28 @@ describe("scanner", () => {
     const result = await scanDirectory(TMP);
     const plugin = result.plugins.find((p) => p.name === "chat");
     expect(plugin!.tables).toHaveProperty("chat_messages");
+  });
+
+  test("definitions keep every option except the definition tag", async () => {
+    writeFile(
+      "chat.ts",
+      `import { query, table } from "@vex/define";
+       const access = { prepare: () => null, filter: () => true };
+       export const messages = table(
+         { text: { type: "string", renamedFrom: ["body"] } },
+         { renamedFrom: ["chat_msgs"], unique: [["text"]], access },
+       );
+       export const exportAll = { ...query({}, async () => []), reactive: false };`,
+    );
+    const result = await scanDirectory(TMP);
+    const plugin = result.plugins.find((p) => p.name === "chat")!;
+    expect(isQuery(plugin.queries.exportAll)).toBe(false);
+    expect(plugin.queries.exportAll.reactive).toBe(false);
+    const schema = plugin.tables.chat_messages;
+    expect(isTable(schema)).toBe(false);
+    expect(schema.renamedFrom).toEqual(["chat_msgs"]);
+    expect(schema.unique).toEqual([["text"]]);
+    expect(schema.access).toBeDefined();
+    expect(schema.columns.text.renamedFrom).toEqual(["body"]);
   });
 });

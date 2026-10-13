@@ -51,21 +51,27 @@ const unsub = await vex.subscribe("counter.list", {}, (rows) => {
 
 ## Renaming tables and columns
 
-`registerTable` creates and migrates tables on startup. To rename instead of starting over, name the previous table or column with `renamedFrom`:
+`registerTable` creates and migrates tables on startup: it adds new columns, rebuilds changed ones and reconciles indexes, but never drops anything. A renamed table or column therefore starts out empty unless its previous names are listed in `renamedFrom`:
 
 ```ts
 api.registerTable("tasks", {
-  renamedFrom: "todos",
+  renamedFrom: ["todos"],
   columns: {
-    title: { type: "string", renamedFrom: "text" },
+    title: { type: "string", renamedFrom: ["text"] },
     done: { type: "boolean" },
   },
 });
+
+// File-based: table({ title: "string" }, { renamedFrom: ["chat_todos"] })
 ```
 
-If only the old name exists, it is renamed in place and its data stays. If only the new name exists, the rename already happened and nothing changes. If both or neither exist, startup fails rather than guess. The rename runs inside the same savepoint as the rest of the migration, so a later failure rolls it back. Leaving `renamedFrom` in place afterwards is harmless.
+- A previous name that exists, where the current one does not, is renamed in place with its data and indexes.
+- Where the current name exists, nothing changes. Keep every previous name listed: a database that is several versions behind migrates from whichever it has.
+- A new database creates the table under its current names. In an existing table, a column whose current and previous names all match nothing fails startup.
+- Where the current name and a previous one both exist, startup fails rather than guess.
+- Table names, current and previous, are checked across the engine and all plugins before any table is migrated. Each table's renames share its migration savepoint, so a later failure for that table rolls them back.
 
-A database renamed this way is not readable by an older build, which looks for the old names; restore a backup instead of rolling back.
+An older build run against a migrated database recreates the previous names empty where it can, after which the newer build refuses to start. Roll back by restoring a backup, not by redeploying an older build.
 
 ## Reactive safety
 

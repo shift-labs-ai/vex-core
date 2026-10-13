@@ -1,4 +1,6 @@
 import type {
+  ColumnDef,
+  ColumnType,
   MiddlewareFn,
   MutationContext,
   QueryContext,
@@ -50,22 +52,34 @@ export interface VexJob {
   retryDelayMs?: number;
 }
 
+type ColumnInput = string | (Omit<ColumnDef, "type"> & { type: string });
+
+/**
+ * A table. Its SQL name is its export name in `schema.ts` and
+ * `<plugin>_<export>` in any other file; `options.renamedFrom` lists
+ * previous SQL names.
+ */
 export function table(
-  columns: Record<
-    string,
-    string | { type: string; index?: boolean; optional?: boolean }
-  >,
+  columns: Record<string, ColumnInput>,
+  options: Omit<TableSchema, "columns"> = {},
 ): VexTable {
   const normalized: TableSchema["columns"] = {};
   for (const [name, def] of Object.entries(columns)) {
-    if (typeof def === "string") {
-      normalized[name] = { type: def as any };
-    } else {
-      normalized[name] = def as any;
-    }
+    normalized[name] =
+      typeof def === "string"
+        ? { type: def as ColumnType }
+        : { ...def, type: def.type as ColumnType };
   }
 
-  return { [KIND]: "table", columns: normalized } as VexTable;
+  return { [KIND]: "table", ...options, columns: normalized };
+}
+
+/** A definition without its kind tag: the plain def the engine registers. */
+export function untag<T extends { [KIND]: string }>(
+  def: T,
+): Omit<T, typeof KIND> {
+  const { [KIND]: _kind, ...plain } = def;
+  return plain;
 }
 
 export function query(
