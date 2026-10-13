@@ -694,6 +694,55 @@ describe("plugin name collisions", () => {
     ).rejects.toThrow('Duplicate table "runs"');
   });
 
+  test("table names are claimed once across the engine and all plugins, ignoring case, before any migration", async () => {
+    const plugin =
+      (name: string, table: string, renamedFrom?: string[]) =>
+      (api: VexPluginAPI) => {
+        api.setName(name);
+        api.registerTable(table, {
+          renamedFrom,
+          columns: { name: { type: "string" } },
+        });
+      };
+    const create = (...plugins: Array<(api: VexPluginAPI) => void>) =>
+      Vex.create({ plugins, storage: sqliteAdapter(":memory:") });
+
+    await expect(
+      create(plugin("a", "old_items"), plugin("b", "items", ["OLD_ITEMS"])),
+    ).rejects.toThrow(
+      'Duplicate table "OLD_ITEMS": claimed by plugin "a" and by plugin "b" as a previous name of "items"',
+    );
+    await expect(
+      create(plugin("a", "items"), plugin("b", "Items")),
+    ).rejects.toThrow('Duplicate table "Items"');
+    await expect(create(plugin("a", "_jobs"))).rejects.toThrow(
+      'Duplicate table "_jobs": claimed by the engine and by plugin "a"',
+    );
+    await expect(create(plugin("a", "jobs", ["_Jobs"]))).rejects.toThrow(
+      "claimed by the engine",
+    );
+
+    // The renaming plugin comes first, yet nothing is migrated.
+    const storage = sqliteAdapter(":memory:");
+    await storage.ensureTable("old_items", {
+      columns: { name: { type: "string" } },
+    });
+    await expect(
+      Vex.create({
+        plugins: [
+          plugin("b", "items", ["old_items"]),
+          plugin("a", "Old_Items"),
+        ],
+        storage,
+      }),
+    ).rejects.toThrow('Duplicate table "Old_Items"');
+    const tables = await storage.rawQuery<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('old_items', 'items')",
+    );
+    expect(tables).toEqual([{ name: "old_items" }]);
+    storage.close();
+  });
+
   test("same name across different plugins is fine", async () => {
     const mvex = await Vex.create({
       plugins: [

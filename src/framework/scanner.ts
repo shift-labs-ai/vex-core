@@ -8,6 +8,7 @@ import {
   isQuery,
   isTable,
   isWebhook,
+  untag,
 } from "./define.js";
 
 export interface ScanResult {
@@ -45,14 +46,6 @@ function fileToPluginName(filePath: string, root: string): string {
   return rel.replace(/\.ts$/, "").replace(/\//g, ".");
 }
 
-function extractTableSchema(value: any): TableSchema {
-  const { columns, indexes, unique } = value;
-  const schema: TableSchema = { columns };
-  if (indexes) schema.indexes = indexes;
-  if (unique) schema.unique = unique;
-  return schema;
-}
-
 export async function scanDirectory(dir: string): Promise<ScanResult> {
   if (!existsSync(dir)) {
     throw new Error(`Directory not found: ${dir}`);
@@ -78,7 +71,7 @@ export async function scanDirectory(dir: string): Promise<ScanResult> {
     const mod = await importFresh(schemaFile);
     for (const [name, value] of Object.entries(mod)) {
       if (isTable(value)) {
-        schemaTables[name] = extractTableSchema(value);
+        schemaTables[name] = untag(value);
         tableCount++;
       }
     }
@@ -116,32 +109,19 @@ export async function scanDirectory(dir: string): Promise<ScanResult> {
 
     for (const [exportName, value] of Object.entries(mod)) {
       if (isTable(value)) {
-        tables[`${pluginName}_${exportName}`] = extractTableSchema(value);
+        tables[`${pluginName}_${exportName}`] = untag(value);
         tableCount++;
       } else if (isQuery(value)) {
-        queries[exportName] = { args: value.args, handler: value.handler };
+        queries[exportName] = untag(value);
         queryCount++;
       } else if (isMutation(value)) {
-        mutations[exportName] = { args: value.args, handler: value.handler };
+        mutations[exportName] = untag(value);
         mutationCount++;
       } else if (isWebhook(value)) {
-        webhooks[exportName] = {
-          path: value.path,
-          method: value.method,
-          verify: value.verify,
-          handler: value.handler,
-        };
+        webhooks[exportName] = untag(value);
         webhookCount++;
       } else if (isJob(value)) {
-        jobs[exportName] = {
-          schedule: value.schedule,
-          handler: value.handler,
-          description: value.description,
-          enabled: value.enabled,
-          timeoutMs: value.timeoutMs,
-          retries: value.retries,
-          retryDelayMs: value.retryDelayMs,
-        };
+        jobs[exportName] = untag(value);
         jobCount++;
       } else if (isMiddleware(value)) {
         globalMiddleware.push(value);
