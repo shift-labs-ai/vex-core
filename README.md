@@ -8,7 +8,7 @@ npm install vex-core
 
 **Runtime requirement:** Bun 1.3+
 
-`vex-core` intentionally targets Bun. Its SQLite adapter, reactive hashing, and WebSocket server use Bun runtime APIs.
+`vex-core` intentionally targets Bun. Its SQLite adapter, reactive hashing, and WebSocket server use Bun runtime APIs. The engine's queries and mutations also run inside a Cloudflare Durable Object; see [Cloudflare Durable Objects](#cloudflare-durable-objects).
 
 Peer: `react` ^19 (only if you use `vex-core/client`).
 
@@ -48,6 +48,39 @@ const unsub = await vex.subscribe("counter.list", {}, (rows) => {
   console.log("changed:", rows);
 });
 ```
+
+## Cloudflare Durable Objects
+
+`durableObjectAdapter` stores a Vex engine's tables in a SQLite-backed Durable Object's own database:
+
+```ts
+import { DurableObject } from "cloudflare:workers";
+import { durableObjectAdapter, Vex } from "vex-core";
+
+export class App extends DurableObject {
+  vex = Vex.create({
+    storage: durableObjectAdapter(this.ctx.storage),
+    plugins: [counterPlugin],
+  });
+
+  async fetch() {
+    const vex = await this.vex;
+    await vex.mutate("counter.set", { key: "hits", value: 1 });
+    return Response.json(await vex.query("counter.list"));
+  }
+}
+```
+
+The class needs a SQLite migration (`new_sqlite_classes`) in its Wrangler config. Under the `workerd` export condition, which Wrangler and Vite apply, `vex-core` resolves to an entry without the Bun-only `sqliteAdapter` and `config`.
+
+The adapter shares its schema migrations, `renamedFrom` and writes with `sqliteAdapter`, and runs the same storage test suites in workerd. Each mutation runs in `ctx.storage.transaction()`, which rolls back the mutation's writes if it throws and holds the object's other requests until it settles. A transaction nested in another runs as a savepoint. `rawQuery` and `rawExec` go to the object's SQL API, which refuses `BEGIN`, `SAVEPOINT`, TEMP tables and most `PRAGMA`s.
+
+Not yet supported on Workers:
+
+- `vex.subscribe()`: reactive change detection hashes results with `Bun.hash`.
+- `vex-core/http`, `vex-core/framework`, and `config`: they use `bun`, `node:fs` and `node:crypto` APIs.
+- Jobs: their timers run only while the object is in memory. Drive them from a Durable Object alarm instead.
+- D1: it has no interactive transactions, so a mutation's writes could not roll back together.
 
 ## Renaming tables and columns
 
@@ -399,11 +432,12 @@ Age retention alone is not a hard volume bound. Production sinks should also cap
 
 | Entry | Contents |
 |-------|----------|
-| `vex-core` | `Vex`, `sqliteAdapter`, `id`, core types, tracer, `RateLimiter` |
+| `vex-core` | `Vex`, `sqliteAdapter`, `durableObjectAdapter`, `id`, core types, tracer, `RateLimiter`. Under the `workerd` condition, everything but `sqliteAdapter` and `config` |
 | `vex-core/framework` | `table`, `query`, `mutation`, `webhook`, `job`, `middleware`, `scanDirectory` |
 | `vex-core/http` | `Router`, `createRouter`, `HttpError`, `compose`, `vexHandler`, static handlers (`serveDir`, `serveFile`), plus middleware (`cors`, `bearerAuth`, `bodyParser`, `accessLog`, `requestId`, `rateLimit`, `errorBoundary`, `sessions`) |
 | `vex-core/client` | `VexProvider`, `useQuery`, `useMutation` |
 | `vex-core/adapters/sqlite` | `sqliteAdapter` |
+| `vex-core/adapters/durable-object` | `durableObjectAdapter` |
 
 ## License
 

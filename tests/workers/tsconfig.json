@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ESNext"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "customConditions": ["workerd"],
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"],
+    "noEmit": true,
+    "rootDir": "../..",
+    "paths": {
+      "bun:test": ["./bun-test.ts"]
+    }
+  },
+  "include": ["./**/*.ts"],
+  "exclude": ["vitest.config.ts"]
+}
