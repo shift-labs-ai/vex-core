@@ -254,6 +254,8 @@ ALL  /webhook/*          user-defined webhooks
 | `rateLimit({ requests, window, key, cost, limiter })` | Token-bucket limiting: 429 + `Retry-After`, full `X-RateLimit-*` on every response. Works as `use()` middleware or as a route-chain gate. |
 | `sessions({ storage, cookieName, maxAge, rolling })` | Server-side session store on any `StorageAdapter` (SQLite/custom). `ctx.session.get/set/delete/destroy`. |
 
+`cors`, `requestId`, `rateLimit` and `sessions` add their headers to the Response the handler returned, so a body's implicit content type (e.g. `text/plain` for `new Response("ok")`) is served as is. Return a new Response for every request, never a shared instance.
+
 ### Static serving — namespace owners, not fallbacks
 
 `serveDir` and `serveFile` are plain route handlers. Give each URL
