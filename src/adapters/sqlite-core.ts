@@ -629,22 +629,46 @@ export function ensureSqliteTable(
 }
 
 /**
- * Snapshots an adapter's change tracking and registered schemas before
- * a transaction. The returned function restores them after a rollback,
- * which undoes the writes and migrations they describe.
+ * What a SQLite adapter tracks beside its database: the schema each
+ * table was last ensured with, and the tables changed since the engine
+ * last asked. A rollback restores both, since it undoes the writes and
+ * migrations they describe.
  */
-export function snapshotAdapterState(
-  changedTables: Set<string>,
-  schemas: Map<string, TableSchema>,
-): () => void {
-  const changedBefore = new Set(changedTables);
-  const schemasBefore = new Map(schemas);
-  return () => {
-    changedTables.clear();
-    for (const table of changedBefore) changedTables.add(table);
-    schemas.clear();
-    for (const [table, schema] of schemasBefore) schemas.set(table, schema);
+export class SqliteAdapterState {
+  readonly schemas = new Map<string, TableSchema>();
+  private readonly changed = new Set<string>();
+
+  readonly markChanged = (table: string, rows: number): void => {
+    if (rows > 0) this.changed.add(table);
   };
+
+  registerSchema(
+    name: string,
+    schema: TableSchema,
+    renamedFrom: string | undefined,
+  ): void {
+    if (renamedFrom !== undefined) this.schemas.delete(renamedFrom);
+    this.schemas.set(name, schema);
+  }
+
+  /** The tables changed since the last call. */
+  takeChanged(): string[] {
+    const tables = [...this.changed];
+    this.changed.clear();
+    return tables;
+  }
+
+  /** Returns a function that restores the state as it is now. */
+  snapshot(): () => void {
+    const changed = new Set(this.changed);
+    const schemas = new Map(this.schemas);
+    return () => {
+      this.changed.clear();
+      for (const table of changed) this.changed.add(table);
+      this.schemas.clear();
+      for (const [table, schema] of schemas) this.schemas.set(table, schema);
+    };
+  }
 }
 
 // ─── writes ──────────────────────────────────────────────────────────

@@ -4,8 +4,8 @@
  *
  * Bun hashes natively with `Bun.hash` (wyhash, ~30 GB/s). Elsewhere the
  * hash is SHA-1 from `node:crypto` (~2-3 GB/s), loaded on first use, so
- * on Cloudflare Workers the engine needs the `nodejs_compat` flag only
- * for subscriptions. No JavaScript hash comes close to `Bun.hash`, and
+ * on a Cloudflare Worker without Node.js compatibility only subscriptions
+ * fail. No JavaScript hash comes close to `Bun.hash`, and
  * the WebAssembly ones that do cannot load on Workers, which refuse to
  * compile WebAssembly at runtime. Hashes are only compared within one
  * process, so the two need not agree.
@@ -26,7 +26,7 @@ function sha1(serialized: string): number {
     | undefined;
   if (!nodeCrypto) {
     throw new Error(
-      "vex-core subscriptions need node:crypto outside Bun; on Cloudflare Workers, enable the nodejs_compat compatibility flag",
+      "vex-core subscriptions need node:crypto outside Bun; on Cloudflare Workers, enable Node.js compatibility (the nodejs_compat flag, on by default from compatibility date 2026-08-04)",
     );
   }
   // The first 52 bits, the most a number holds exactly.

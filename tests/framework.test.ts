@@ -232,7 +232,7 @@ describe("scanner", () => {
   });
 
   test("throws on missing directory", async () => {
-    expect(scanDirectory("/tmp/does-not-exist-vex")).rejects.toThrow(
+    await expect(scanDirectory("/tmp/does-not-exist-vex")).rejects.toThrow(
       "Directory not found",
     );
   });

@@ -122,9 +122,9 @@ export interface VexOptions {
   reactive?: ReactiveBudget;
   /**
    * What runs jobs when they come due. "timers" (default): the engine,
-   * on in-process intervals. "external": the host calls `runDueJobs()`
-   * at `nextJobRun()`, e.g. from a Durable Object alarm. The engine then
-   * starts no timers, and a job's pending `nextRun` survives a restart.
+   * on in-process timers. "external": the host calls `runDueJobs()` at
+   * `nextJobRun()`, e.g. from a Durable Object alarm, and the engine
+   * starts no timers.
    */
   jobScheduler?: "timers" | "external";
 }
@@ -140,7 +140,7 @@ export class Vex {
   // Row-level access policies by table (core/access.ts). Applied to
   // every query-context read; mutation contexts are the trusted tier.
   private accessPolicies: Map<string, TableAccessPolicy<any>> = new Map();
-  private cronTimers: Map<string, ReturnType<typeof setInterval>> = new Map();
+  private cronTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private jobHandlers: Map<string, JobDef> = new Map();
   private jobIntervalMs: Map<string, number> = new Map();
   private runningJobs: Map<string, Promise<JobRunResult>> = new Map();
@@ -260,20 +260,31 @@ export class Vex {
     }
   }
 
-  private startJobTimer(cronName: string, job: JobDef, ms: number) {
+  // Runs the job at `firstRun`, then every `ms`. Under an external
+  // scheduler the host runs due jobs instead.
+  private startJobTimer(
+    cronName: string,
+    job: JobDef,
+    ms: number,
+    firstRun: number,
+  ) {
     if (this.jobScheduler !== "timers" || this.cronTimers.has(cronName)) return;
-    this.cronTimers.set(
-      cronName,
-      setInterval(() => {
-        this.executeJob(cronName, job);
-      }, ms),
+    const run = () => this.executeJob(cronName, job);
+    const first = setTimeout(
+      () => {
+        this.cronTimers.set(cronName, setInterval(run, ms));
+        run();
+      },
+      Math.max(0, firstRun - Date.now()),
     );
+    this.cronTimers.set(cronName, first);
   }
 
   private stopJobTimer(cronName: string) {
     const timer = this.cronTimers.get(cronName);
     if (timer) {
-      clearInterval(timer);
+      // Clears a pending first run and a running interval alike.
+      clearTimeout(timer);
       this.cronTimers.delete(cronName);
     }
   }
@@ -289,44 +300,26 @@ export class Vex {
     const existing = await this.storage
       .rawQuery<any>("SELECT _id, nextRun FROM _jobs WHERE name = ?", name)
       .then((r) => r[0]);
-    if (existing) {
-      await this.storage.update("_jobs", existing._id, {
-        plugin,
-        schedule: job.schedule,
-        description: job.description ?? null,
-        enabled: job.enabled !== false ? 1 : 0,
-        timeoutMs: job.timeoutMs ?? null,
-        retries: job.retries ?? 0,
-        retryDelayMs: job.retryDelayMs ?? null,
-      });
-    } else {
-      await this.storage.insert("_jobs", {
-        name,
-        plugin,
-        schedule: job.schedule,
-        description: job.description ?? null,
-        enabled: job.enabled !== false ? 1 : 0,
-        timeoutMs: job.timeoutMs ?? null,
-        retries: job.retries ?? 0,
-        retryDelayMs: job.retryDelayMs ?? null,
-        runs: 0,
-      });
-    }
+    const enabled = job.enabled !== false;
+    // A pending run survives a restart: the job runs when it was due, or
+    // one interval from now if that is sooner.
+    const nextRun = enabled
+      ? Math.min(existing?.nextRun ?? Number.POSITIVE_INFINITY, Date.now() + ms)
+      : null;
+    const row = {
+      plugin,
+      schedule: job.schedule,
+      description: job.description ?? null,
+      enabled: enabled ? 1 : 0,
+      timeoutMs: job.timeoutMs ?? null,
+      retries: job.retries ?? 0,
+      retryDelayMs: job.retryDelayMs ?? null,
+      nextRun,
+    };
+    if (existing) await this.storage.update("_jobs", existing._id, row);
+    else await this.storage.insert("_jobs", { name, ...row, runs: 0 });
 
-    if (job.enabled !== false) {
-      this.startJobTimer(name, job, ms);
-      // A timer runs the job one interval from now. An external scheduler
-      // keeps a pending run, so a restarted engine still runs it on time.
-      let nextRun = Date.now() + ms;
-      if (this.jobScheduler === "external" && existing?.nextRun != null) {
-        nextRun = Math.min(existing.nextRun, nextRun);
-      }
-      await this.storage.rawExec(
-        "UPDATE _jobs SET nextRun = ? WHERE name = ?",
-        nextRun,
-        name,
-      );
-    }
+    if (nextRun !== null) this.startJobTimer(name, job, ms, nextRun);
   }
 
   async removeJob(name: string) {
@@ -350,11 +343,9 @@ export class Vex {
     if (!row) throw new Error(`Job not found in DB: ${name}`);
 
     if (enabled && ms > 0) {
-      this.startJobTimer(name, handler, ms);
-      await this.storage.update("_jobs", row._id, {
-        enabled: 1,
-        nextRun: Date.now() + ms,
-      });
+      const nextRun = Date.now() + ms;
+      this.startJobTimer(name, handler, ms, nextRun);
+      await this.storage.update("_jobs", row._id, { enabled: 1, nextRun });
     } else {
       this.stopJobTimer(name);
       await this.storage.update("_jobs", row._id, {
@@ -820,15 +811,17 @@ export class Vex {
     serialized: string | undefined;
   } {
     const serialized = JSON.stringify(result);
+    // An undefined result measures as the literal "undefined".
+    const measured = serialized ?? "undefined";
     const resultRows = Array.isArray(result)
       ? result.length
       : result && typeof result === "object" && Array.isArray(result.rows)
         ? result.rows.length
         : undefined;
     return {
-      hash: hashResult(serialized ?? "undefined"),
+      hash: hashResult(measured),
       resultRows,
-      resultBytes: utf8ByteLength(serialized ?? "undefined"),
+      resultBytes: utf8ByteLength(measured),
       serialized,
     };
   }
@@ -1327,7 +1320,7 @@ export class Vex {
   }
 
   async close() {
-    for (const timer of this.cronTimers.values()) clearInterval(timer);
+    for (const timer of this.cronTimers.values()) clearTimeout(timer);
     this.cronTimers.clear();
     await Promise.allSettled([...this.runningJobs.values()]);
     this.subscriptions.clear();

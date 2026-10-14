@@ -75,11 +75,9 @@ The class needs a SQLite migration (`new_sqlite_classes`) in its Wrangler config
 
 The adapter shares its schema migrations, `renamedFrom` and writes with `sqliteAdapter`, and runs the same storage test suites in workerd. Each mutation runs in `ctx.storage.transaction()`, which rolls back the mutation's writes if it throws and holds the object's other requests until it settles. A transaction nested in another runs as a savepoint. `rawQuery` and `rawExec` go to the object's SQL API, which refuses `BEGIN`, `SAVEPOINT`, TEMP tables and most `PRAGMA`s.
 
-Subscriptions work as on Bun. Outside Bun they hash results with SHA-1 from `node:crypto`, so the Worker needs the `nodejs_compat` compatibility flag.
+Subscriptions work as on Bun. Outside Bun they hash results with SHA-1 from `node:crypto`. `vex-core/http` also runs in a Durable Object: its router, middleware, `sessions` (on `durableObjectAdapter`) and `vexHandler`, e.g. `fetch(request) { return router.handle(request); }`. Both need Node.js compatibility, which Wrangler turns on by default from compatibility date 2026-08-04; for earlier dates, add the `nodejs_compat` flag.
 
-`vex-core/http` also runs in a Durable Object with `nodejs_compat`: its router, middleware, `sessions` (on `durableObjectAdapter`) and `vexHandler`, e.g. `fetch(request) { return router.handle(request); }`.
-
-Jobs need the object's alarm: an idle Durable Object is evicted, and in-process timers with it. With `jobScheduler: "external"` the engine starts no timers and keeps each job's pending run in `_jobs`; the alarm runs what is due and schedules the next. Call `scheduleJobs` again after `addJob`, `removeJob` or `setJobEnabled`, which change when the next job is due:
+Jobs need the object's alarm: an idle Durable Object is evicted, and in-process timers with it. Each job's pending run is kept in `_jobs`, so an eviction loses none. With `jobScheduler: "external"` the engine starts no timers; the alarm runs the jobs that are due and schedules the next. Call `scheduleJobs` again after `addJob`, `removeJob` or `setJobEnabled`, which change when the next job is due:
 
 ```ts
 export class App extends DurableObject {

@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { StorageAdapter } from "../src/core/storage.js";
 import type { TableSchema } from "../src/core/types.js";
 
-export const schema: TableSchema = {
+const schema: TableSchema = {
   columns: {
     name: { type: "string" },
     age: { type: "number" },
@@ -18,7 +18,7 @@ export const schema: TableSchema = {
   },
 };
 
-export const indexedSchema: TableSchema = {
+const indexedSchema: TableSchema = {
   columns: {
     category: { type: "string", index: true },
     value: { type: "number" },
@@ -38,7 +38,7 @@ export async function sqliteIndexNames(
   return indexes.map((idx) => idx.name);
 }
 
-export async function sqliteIndexColumns(
+async function sqliteIndexColumns(
   adapter: StorageAdapter,
   indexName: string,
 ): Promise<string[]> {
@@ -477,7 +477,7 @@ export function adapterSuite(
     test("nested transaction joins outer (no BEGIN error)", async () => {
       await adapter.transaction(async () => {
         await adapter.insert("users", { name: "alice", age: 30 });
-        // Nested transaction should piggyback on the outer one
+        // A nested transaction commits with the outer one.
         await adapter.transaction(async () => {
           await adapter.insert("users", { name: "bob", age: 25 });
         });

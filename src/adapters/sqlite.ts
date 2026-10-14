@@ -8,8 +8,8 @@ import {
   deleteRow,
   ensureSqliteTable,
   insertRow,
+  SqliteAdapterState,
   type SqliteDriver,
-  snapshotAdapterState,
   updateRow,
   upsertRow,
 } from "./sqlite-core.js";
@@ -70,15 +70,15 @@ const SQLITE_STATEMENT_CACHE_SIZE = 64;
 
 function wrapSync(
   writer: SqliteConnection,
-  markChanged: (table: string, changes: number) => void,
+  state: SqliteAdapterState,
   withConnectionLock: <T>(fn: () => Promise<T> | T) => Promise<T>,
   withReadConnection: <T>(
     fn: (connection: SqliteConnection) => T,
   ) => Promise<T>,
 ): DbExec {
   return {
-    schemas: new Map(),
-    markChanged,
+    schemas: state.schemas,
+    markChanged: state.markChanged,
     async all(sql, params) {
       return withReadConnection((connection) =>
         params.length > 0
@@ -222,7 +222,7 @@ export function sqliteAdapter(
   const writer: SqliteConnection = {
     statements: new StatementCache(db, SQLITE_STATEMENT_CACHE_SIZE),
   };
-  const changedTables = new Set<string>();
+  const state = new SqliteAdapterState();
   // The write handle is a single connection. While it has an open
   // BEGIN, every statement on that connection participates in
   // that transaction. Track the async owner so same-call nesting can
@@ -342,10 +342,6 @@ export function sqliteAdapter(
     }
   }
 
-  function markChanged(table: string, changes: number): void {
-    if (changes > 0) changedTables.add(table);
-  }
-
   // Writes and migrations run on the writer, under the connection lock
   // or, for ensureTable, synchronously between awaits.
   const writerDriver: SqliteDriver = {
@@ -354,21 +350,19 @@ export function sqliteAdapter(
     atomically: (fn) => db.transaction(fn)(),
   };
 
-  const exec = wrapSync(
-    writer,
-    markChanged,
-    withConnectionLock,
-    withReadConnection,
-  );
+  const { markChanged } = state;
+  const exec = wrapSync(writer, state, withConnectionLock, withReadConnection);
 
   return {
     name: "sqlite",
 
     ensureTable(name: string, schema: TableSchema) {
       try {
-        const renamedFrom = ensureSqliteTable(writerDriver, name, schema);
-        if (renamedFrom !== undefined) exec.schemas.delete(renamedFrom);
-        exec.schemas.set(name, schema);
+        state.registerSchema(
+          name,
+          schema,
+          ensureSqliteTable(writerDriver, name, schema),
+        );
       } finally {
         // Bun caches each statement's column list at prepare time.
         clearStatementCaches();
@@ -426,7 +420,7 @@ export function sqliteAdapter(
 
       await acquireWriteLock();
       const context = { active: true };
-      const restore = snapshotAdapterState(changedTables, exec.schemas);
+      const restore = state.snapshot();
       db.exec("BEGIN");
       try {
         const result = await transactionContext.run(context, () => fn());
@@ -496,13 +490,11 @@ export function sqliteAdapter(
     },
 
     getChangedTables(): string[] {
-      const tables = [...changedTables];
-      changedTables.clear();
-      return tables;
+      return state.takeChanged();
     },
 
     getSchema(table: string) {
-      return exec.schemas.get(table) ?? null;
+      return state.schemas.get(table) ?? null;
     },
 
     close() {

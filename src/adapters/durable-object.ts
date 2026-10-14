@@ -28,8 +28,8 @@ import {
   deleteRow,
   ensureSqliteTable,
   insertRow,
+  SqliteAdapterState,
   type SqliteDriver,
-  snapshotAdapterState,
   updateRow,
   upsertRow,
 } from "./sqlite-core.js";
@@ -71,13 +71,10 @@ export function durableObjectAdapter(
     atomically: (fn) => storage.transactionSync(fn),
   };
 
-  const changedTables = new Set<string>();
-  function markChanged(table: string, count: number): void {
-    if (count > 0) changedTables.add(table);
-  }
-
+  const state = new SqliteAdapterState();
+  const { markChanged } = state;
   const exec: DbExec = {
-    schemas: new Map<string, TableSchema>(),
+    schemas: state.schemas,
     markChanged,
     async all(query, params) {
       open();
@@ -101,9 +98,11 @@ export function durableObjectAdapter(
 
     ensureTable(name: string, schema: TableSchema) {
       open();
-      const renamedFrom = ensureSqliteTable(driver, name, schema);
-      if (renamedFrom !== undefined) exec.schemas.delete(renamedFrom);
-      exec.schemas.set(name, schema);
+      state.registerSchema(
+        name,
+        schema,
+        ensureSqliteTable(driver, name, schema),
+      );
     },
 
     async insert(table, row) {
@@ -140,7 +139,7 @@ export function durableObjectAdapter(
         // Snapshot and restore inside the transaction: it may wait for
         // another one to commit first, and the next may start as soon
         // as this one settles.
-        const restore = snapshotAdapterState(changedTables, exec.schemas);
+        const restore = state.snapshot();
         try {
           return await fn();
         } catch (error) {
@@ -169,13 +168,11 @@ export function durableObjectAdapter(
     },
 
     getChangedTables() {
-      const tables = [...changedTables];
-      changedTables.clear();
-      return tables;
+      return state.takeChanged();
     },
 
     getSchema(table) {
-      return exec.schemas.get(table) ?? null;
+      return state.schemas.get(table) ?? null;
     },
 
     close() {
