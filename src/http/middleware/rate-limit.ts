@@ -24,6 +24,7 @@
 import type { RateLimitDecision } from "../../core/rate-limit.js";
 import { RateLimiter } from "../../core/rate-limit.js";
 import { HttpError } from "../error.js";
+import { withHeaders } from "../response.js";
 import type { Handler, Middleware, RequestCtx } from "../types.js";
 
 export interface RateLimitOptions {
@@ -100,15 +101,10 @@ export function rateLimit(options: RateLimitOptions = {}): RateLimitGate {
     // in the route chain.
     if (!next) return undefined;
 
-    const response = await next();
-    const headers = new Headers(response.headers);
-    for (const [name, value] of Object.entries(rateHeaders(decision))) {
-      headers.set(name, value);
-    }
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers,
+    return withHeaders(await next(), (headers) => {
+      for (const [name, value] of Object.entries(rateHeaders(decision))) {
+        headers.set(name, value);
+      }
     });
   };
   return gate as RateLimitGate;

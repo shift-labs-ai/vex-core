@@ -6,6 +6,7 @@
  */
 
 import { id as generateId } from "../../core/id.js";
+import { withHeaders } from "../response.js";
 import type { Middleware } from "../types.js";
 
 export interface RequestIdOptions {
@@ -24,13 +25,8 @@ export function requestId(options: RequestIdOptions = {}): Middleware {
     const id = incoming && incoming.length > 0 ? incoming : gen();
     ctx.state.requestId = id;
 
-    const response = await next();
-    const headers = new Headers(response.headers);
-    if (!headers.has(header)) headers.set(header, id);
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers,
+    return withHeaders(await next(), (headers) => {
+      if (!headers.has(header)) headers.set(header, id);
     });
   };
 }

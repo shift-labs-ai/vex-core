@@ -13,6 +13,7 @@
  * credentials — this silently does the right thing instead of 500ing).
  */
 
+import { withHeaders } from "../response.js";
 import type { Middleware } from "../types.js";
 
 export interface CorsOptions {
@@ -60,6 +61,12 @@ export function cors(options: CorsOptions = {}): Middleware {
     if (origin) corsHeaders.set("access-control-allow-origin", origin);
     if (opts.credentials)
       corsHeaders.set("access-control-allow-credentials", "true");
+    if (options.exposedHeaders && options.exposedHeaders.length > 0) {
+      corsHeaders.set(
+        "access-control-expose-headers",
+        options.exposedHeaders.join(", "),
+      );
+    }
 
     if (ctx.req.method === "OPTIONS") {
       // Preflight. We answer without consulting the downstream chain.
@@ -71,34 +78,16 @@ export function cors(options: CorsOptions = {}): Middleware {
         "access-control-allow-headers",
         opts.allowedHeaders.join(", "),
       );
-      if (options.exposedHeaders && options.exposedHeaders.length > 0) {
-        corsHeaders.set(
-          "access-control-expose-headers",
-          options.exposedHeaders.join(", "),
-        );
-      }
       if (options.maxAge !== undefined) {
         corsHeaders.set("access-control-max-age", String(options.maxAge));
       }
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    const response = await next();
-    if (options.exposedHeaders && options.exposedHeaders.length > 0) {
-      corsHeaders.set(
-        "access-control-expose-headers",
-        options.exposedHeaders.join(", "),
-      );
-    }
-    // Merge onto the downstream response without cloning the body.
-    const headers = new Headers(response.headers);
-    corsHeaders.forEach((v, k) => {
-      headers.set(k, v);
-    });
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers,
+    return withHeaders(await next(), (headers) => {
+      corsHeaders.forEach((v, k) => {
+        headers.set(k, v);
+      });
     });
   };
 }

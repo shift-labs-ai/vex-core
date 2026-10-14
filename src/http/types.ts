@@ -53,6 +53,10 @@ export interface RequestCtx {
  * A handler returns a Response, or `undefined` to fall through to the
  * next matcher. This is what makes `router.get(p, mw1, mw2, handler)`
  * chains work — each step can pass or short-circuit.
+ *
+ * Return a new Response for every request, never a shared instance:
+ * middleware such as `cors`, `requestId`, `rateLimit` and `sessions`
+ * add their headers to the Response the handler returned.
  */
 export type Handler = (
   ctx: RequestCtx,

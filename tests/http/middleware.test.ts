@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { sqliteAdapter } from "../../src/adapters/sqlite.js";
 import { RateLimiter } from "../../src/core/rate-limit.js";
 import type { SpanHandle } from "../../src/core/tracer.js";
 import {
@@ -9,9 +10,12 @@ import {
   createRouter,
   errorBoundary,
   HttpError,
+  type Middleware,
   rateLimit,
   requestId,
+  sessions,
 } from "../../src/http/index.js";
+import { withHeaders } from "../../src/http/response.js";
 
 describe("cors", () => {
   test("OPTIONS preflight", async () => {
@@ -442,5 +446,76 @@ describe("accessLog", () => {
     await app.handle(new Request("http://x/hi"));
     expect(lines[0]).toContain("500");
     expect(lines[0]).toContain("error");
+  });
+});
+
+describe("middleware that add response headers", () => {
+  // A string body's content type is implicit: Bun only applies it when
+  // it serves the Response it was built with, so this goes over HTTP.
+  async function serve(middleware: Middleware): Promise<Headers> {
+    const app = createRouter()
+      .use(middleware)
+      .get("/", (ctx) => {
+        // Session data makes `sessions` attach its cookie.
+        ctx.session?.set("seen", true);
+        return new Response("ok");
+      });
+    const server = Bun.serve({ port: 0, fetch: (req) => app.handle(req) });
+    try {
+      const res = await fetch(`http://127.0.0.1:${server.port}/`);
+      await res.text();
+      return res.headers;
+    } finally {
+      server.stop(true);
+    }
+  }
+
+  test.each([
+    ["cors", "access-control-allow-origin", () => cors()],
+    ["requestId", "x-request-id", () => requestId()],
+    [
+      "rateLimit",
+      "x-ratelimit-limit",
+      () => rateLimit({ requests: 10, window: 60 }),
+    ],
+    [
+      "sessions",
+      "set-cookie",
+      () => sessions({ storage: sqliteAdapter(":memory:") }),
+    ],
+  ])(
+    "%s adds %s and keeps a string response's implicit content type",
+    async (_, header, make) => {
+      const headers = await serve(make());
+      expect(headers.get(header)).toBeTruthy();
+      expect(headers.get("content-type")).toBe("text/plain;charset=utf-8");
+    },
+  );
+
+  test("a response with immutable headers is rebuilt with the headers added", async () => {
+    const original = new Response("a,b", {
+      status: 201,
+      headers: { "content-type": "text/csv" },
+    });
+    const immutable = new Proxy(original.headers, {
+      get(target, prop) {
+        if (prop === "set" || prop === "append" || prop === "delete") {
+          return () => {
+            throw new TypeError("immutable headers");
+          };
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    Object.defineProperty(original, "headers", { value: immutable });
+
+    const res = withHeaders(original, (headers) => headers.set("x-added", "1"));
+
+    expect(res).not.toBe(original);
+    expect(res.status).toBe(201);
+    expect(res.headers.get("x-added")).toBe("1");
+    expect(res.headers.get("content-type")).toBe("text/csv");
+    expect(await res.text()).toBe("a,b");
   });
 });

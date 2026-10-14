@@ -30,6 +30,7 @@
 
 import { randomBytes } from "node:crypto";
 import type { StorageAdapter } from "../../core/storage.js";
+import { withHeaders } from "../response.js";
 import type { Middleware, Session } from "../types.js";
 
 export interface SessionOptions {
@@ -329,12 +330,8 @@ function clearCookie(
 }
 
 function attachCookie(res: Response, setCookie: string): Response {
-  const headers = new Headers(res.headers);
-  headers.append("set-cookie", setCookie);
-  return new Response(res.body, {
-    status: res.status,
-    statusText: res.statusText,
-    headers,
+  return withHeaders(res, (headers) => {
+    headers.append("set-cookie", setCookie);
   });
 }
 
