@@ -3,6 +3,7 @@ import { governedRawSqlError, guardQueryBuilder } from "./access.js";
 import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
 import { INTERNAL_TABLES } from "./internal.js";
+import { hashResult, utf8ByteLength } from "./result-measure.js";
 import type { StorageAdapter } from "./storage.js";
 import {
   describeQueryDependencies,
@@ -119,6 +120,13 @@ export interface VexOptions {
   appId?: string;
   handlerTimeoutMs?: number;
   reactive?: ReactiveBudget;
+  /**
+   * What runs jobs when they come due. "timers" (default): the engine,
+   * on in-process intervals. "external": the host calls `runDueJobs()`
+   * at `nextJobRun()`, e.g. from a Durable Object alarm. The engine then
+   * starts no timers, and a job's pending `nextRun` survives a restart.
+   */
+  jobScheduler?: "timers" | "external";
 }
 
 export class Vex {
@@ -136,6 +144,7 @@ export class Vex {
   private jobHandlers: Map<string, JobDef> = new Map();
   private jobIntervalMs: Map<string, number> = new Map();
   private runningJobs: Map<string, Promise<JobRunResult>> = new Map();
+  private jobScheduler: "timers" | "external" = "timers";
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
   private appId: string = "unknown";
@@ -194,6 +203,7 @@ export class Vex {
     const vex = new Vex(options.storage);
     if (options.tracer) vex.tracer = options.tracer;
     if (options.appId) vex.appId = options.appId;
+    if (options.jobScheduler) vex.jobScheduler = options.jobScheduler;
     if (options.handlerTimeoutMs)
       vex.handlerTimeoutMs = options.handlerTimeoutMs;
     if (options.reactive) {
@@ -251,7 +261,7 @@ export class Vex {
   }
 
   private startJobTimer(cronName: string, job: JobDef, ms: number) {
-    if (this.cronTimers.has(cronName)) return;
+    if (this.jobScheduler !== "timers" || this.cronTimers.has(cronName)) return;
     this.cronTimers.set(
       cronName,
       setInterval(() => {
@@ -277,7 +287,7 @@ export class Vex {
     this.jobIntervalMs.set(name, ms);
 
     const existing = await this.storage
-      .rawQuery<any>("SELECT _id FROM _jobs WHERE name = ?", name)
+      .rawQuery<any>("SELECT _id, nextRun FROM _jobs WHERE name = ?", name)
       .then((r) => r[0]);
     if (existing) {
       await this.storage.update("_jobs", existing._id, {
@@ -305,9 +315,15 @@ export class Vex {
 
     if (job.enabled !== false) {
       this.startJobTimer(name, job, ms);
+      // A timer runs the job one interval from now. An external scheduler
+      // keeps a pending run, so a restarted engine still runs it on time.
+      let nextRun = Date.now() + ms;
+      if (this.jobScheduler === "external" && existing?.nextRun != null) {
+        nextRun = Math.min(existing.nextRun, nextRun);
+      }
       await this.storage.rawExec(
         "UPDATE _jobs SET nextRun = ? WHERE name = ?",
-        Date.now() + ms,
+        nextRun,
         name,
       );
     }
@@ -485,6 +501,36 @@ export class Vex {
     const handler = this.jobHandlers.get(name);
     if (!handler) throw new Error(`Job not found: ${name}`);
     return this.executeJob(name, handler);
+  }
+
+  /** When the next enabled job comes due (epoch ms), or null if none will. */
+  async nextJobRun(): Promise<number | null> {
+    const jobs = await this.scheduledJobs();
+    return jobs.find((job) => this.jobHandlers.has(job.name))?.nextRun ?? null;
+  }
+
+  /**
+   * Runs, one after another, every enabled job due by `now`. Each run
+   * sets the job's next run one interval later; missed runs coalesce
+   * into one.
+   */
+  async runDueJobs(
+    now = Date.now(),
+  ): Promise<Array<JobRunResult & { name: string }>> {
+    const results: Array<JobRunResult & { name: string }> = [];
+    for (const { name, nextRun } of await this.scheduledJobs()) {
+      const handler = this.jobHandlers.get(name);
+      if (!handler || nextRun > now) continue;
+      results.push({ name, ...(await this.executeJob(name, handler)) });
+    }
+    return results;
+  }
+
+  // Enabled jobs with a pending run, soonest first.
+  private scheduledJobs(): Promise<{ name: string; nextRun: number }[]> {
+    return this.storage.rawQuery(
+      "SELECT name, nextRun FROM _jobs WHERE enabled = 1 AND nextRun IS NOT NULL ORDER BY nextRun",
+    );
   }
 
   private runtime(): VexRuntime {
@@ -780,9 +826,9 @@ export class Vex {
         ? result.rows.length
         : undefined;
     return {
-      hash: Number(Bun.hash(serialized)),
+      hash: hashResult(serialized ?? "undefined"),
       resultRows,
-      resultBytes: Buffer.byteLength(serialized ?? "undefined"),
+      resultBytes: utf8ByteLength(serialized ?? "undefined"),
       serialized,
     };
   }
@@ -978,7 +1024,7 @@ export class Vex {
         try {
           // Same convention as measureReactiveResult: undefined results
           // are counted as the literal "undefined".
-          meta.resultBytes = Buffer.byteLength(
+          meta.resultBytes = utf8ByteLength(
             JSON.stringify(result) ?? "undefined",
           );
         } catch {}

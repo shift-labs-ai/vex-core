@@ -42,6 +42,12 @@ function ledgerPlugin(api: VexPluginAPI) {
         .insert({ account: args.from, amount: -args.amount });
     },
   });
+  api.registerQuery("total", {
+    args: {},
+    async handler(ctx) {
+      return ctx.db.table("entries").sum("amount");
+    },
+  });
   api.registerMutation("deposit", {
     args: { account: "string", amount: "number" },
     async handler(ctx, args) {
@@ -112,4 +118,71 @@ describe("Vex on a Durable Object", () => {
     );
     expect(sizes.sort()).toEqual([1, 2, 3, 4, 5]);
   });
+
+  test("subscriptions push a result only when it changes", async () => {
+    const vex = await Vex.create({
+      plugins: [ledgerPlugin],
+      storage: durableObjectAdapter(objectStorage()),
+    });
+    const seen: number[] = [];
+    const unsubscribe = await vex.subscribe("ledger.total", {}, (total) =>
+      seen.push(total),
+    );
+    await vex.mutate("ledger.deposit", { account: "a", amount: 5 });
+    // Re-runs the query; the total, and so its hash, stays the same.
+    await vex.mutate("ledger.deposit", { account: "b", amount: 0 });
+    await vex.mutate("ledger.deposit", { account: "a", amount: 2 });
+    expect(seen).toEqual([0, 5, 7]);
+    unsubscribe();
+    await vex.close();
+  });
+
+  vitest.test(
+    "a Durable Object alarm runs due jobs and schedules the next",
+    async () => {
+      const jobs = env.JOBS.get(env.JOBS.newUniqueId());
+      const ticks = async () =>
+        (await (await jobs.fetch("http://jobs/")).json()) as number;
+      expect(await ticks()).toBe(0);
+      const deadline = Date.now() + 8_000;
+      while ((await ticks()) < 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      expect(await ticks()).toBeGreaterThanOrEqual(2);
+    },
+    10_000,
+  );
+
+  vitest.test(
+    "vex-core/http serves Vex and sessions from the object",
+    async () => {
+      const api = env.API.get(env.API.newUniqueId());
+      const call = (path: string, body: unknown) =>
+        api.fetch(`http://api${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+
+      const mutated = await call("/vex/mutate", {
+        name: "counter.set",
+        args: { key: "hits", value: 3 },
+      });
+      expect(mutated.status).toBe(200);
+      expect(mutated.headers.get("access-control-allow-origin")).toBe("*");
+      const queried = await call("/vex/query", { name: "counter.list" });
+      expect(await queried.json()).toMatchObject({
+        data: [{ key: "hits", value: 3 }],
+      });
+
+      const login = await api.fetch("http://api/login", {
+        method: "POST",
+        body: "ada",
+      });
+      const cookie = login.headers.get("set-cookie")?.split(";")[0] ?? "";
+      expect(cookie).toMatch(/^vex_session=/);
+      const me = await api.fetch("http://api/me", { headers: { cookie } });
+      expect(await me.json()).toBe("ada");
+    },
+  );
 });

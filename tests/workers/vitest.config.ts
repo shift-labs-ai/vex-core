@@ -10,9 +10,13 @@ export default defineConfig({
       main: fileURLToPath(new URL("./worker.ts", import.meta.url)),
       miniflare: {
         compatibilityDate: "2026-10-01",
+        // Subscriptions hash results with node:crypto outside Bun.
+        compatibilityFlags: ["nodejs_compat"],
         durableObjects: {
           STORE: { className: "TestStore", useSQLite: true },
           APP: { className: "App", useSQLite: true },
+          JOBS: { className: "Jobs", useSQLite: true },
+          API: { className: "Api", useSQLite: true },
         },
       },
     }),

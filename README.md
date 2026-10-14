@@ -8,7 +8,7 @@ npm install vex-core
 
 **Runtime requirement:** Bun 1.3+
 
-`vex-core` intentionally targets Bun. Its SQLite adapter, reactive hashing, and WebSocket server use Bun runtime APIs. The engine's queries and mutations also run inside a Cloudflare Durable Object; see [Cloudflare Durable Objects](#cloudflare-durable-objects).
+`vex-core` intentionally targets Bun. Its SQLite adapter and WebSocket server use Bun runtime APIs. The engine, with queries, mutations, subscriptions and jobs, and the HTTP router also run inside a Cloudflare Durable Object; see [Cloudflare Durable Objects](#cloudflare-durable-objects).
 
 Peer: `react` ^19 (only if you use `vex-core/client`).
 
@@ -75,11 +75,40 @@ The class needs a SQLite migration (`new_sqlite_classes`) in its Wrangler config
 
 The adapter shares its schema migrations, `renamedFrom` and writes with `sqliteAdapter`, and runs the same storage test suites in workerd. Each mutation runs in `ctx.storage.transaction()`, which rolls back the mutation's writes if it throws and holds the object's other requests until it settles. A transaction nested in another runs as a savepoint. `rawQuery` and `rawExec` go to the object's SQL API, which refuses `BEGIN`, `SAVEPOINT`, TEMP tables and most `PRAGMA`s.
 
-Not yet supported on Workers:
+Subscriptions work as on Bun. Outside Bun they hash results with SHA-1 from `node:crypto`, so the Worker needs the `nodejs_compat` compatibility flag.
 
-- `vex.subscribe()`: reactive change detection hashes results with `Bun.hash`.
-- `vex-core/http`, `vex-core/framework`, and `config`: they use `bun`, `node:fs` and `node:crypto` APIs.
-- Jobs: their timers run only while the object is in memory. Drive them from a Durable Object alarm instead.
+`vex-core/http` also runs in a Durable Object with `nodejs_compat`: its router, middleware, `sessions` (on `durableObjectAdapter`) and `vexHandler`, e.g. `fetch(request) { return router.handle(request); }`.
+
+Jobs need the object's alarm: an idle Durable Object is evicted, and in-process timers with it. With `jobScheduler: "external"` the engine starts no timers and keeps each job's pending run in `_jobs`; the alarm runs what is due and schedules the next. Call `scheduleJobs` again after `addJob`, `removeJob` or `setJobEnabled`, which change when the next job is due:
+
+```ts
+export class App extends DurableObject {
+  vex = Vex.create({
+    storage: durableObjectAdapter(this.ctx.storage),
+    plugins: [tickerPlugin],
+    jobScheduler: "external",
+  }).then(async (vex) => {
+    await this.scheduleJobs(vex);
+    return vex;
+  });
+
+  async alarm() {
+    const vex = await this.vex;
+    await vex.runDueJobs();
+    await this.scheduleJobs(vex);
+  }
+
+  async scheduleJobs(vex: Vex) {
+    const next = await vex.nextJobRun();
+    if (next !== null) await this.ctx.storage.setAlarm(next);
+  }
+}
+```
+
+Not supported on Workers:
+
+- `vexWebSocket`: it is built on `Bun.serve` WebSockets. Durable Objects have their own WebSocket API.
+- `serveDir`, `serveFile`, `scanDirectory` and `config`: they read the local filesystem, which a Worker does not have. Use Workers static assets and bindings instead.
 - D1: it has no interactive transactions, so a mutation's writes could not roll back together.
 
 ## Renaming tables and columns
