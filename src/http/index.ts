@@ -5,10 +5,8 @@ export type {
   BoundedBody,
   ReadLimits,
 } from "./body.js";
-// Request bodies under a byte ceiling
 export {
   discardBody,
-  formatBytes,
   readBody,
   readBoundedBody,
   readForm,

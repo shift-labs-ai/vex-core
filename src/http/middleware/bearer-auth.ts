@@ -18,16 +18,15 @@ import { RateLimiter } from "../../core/rate-limit.js";
 import {
   type BodyLimits,
   type BodyRefusalStatus,
-  discardBody,
   readBoundedBody,
 } from "../body.js";
 import type { Middleware } from "../types.js";
 
 /**
  * The login form carries one token field and is read before anyone is
- * authenticated, so it is held to a small fixed ceiling and deadline:
- * a request past either costs a failed attempt and is drained (or the
- * connection closed), never buffered.
+ * authenticated, so it is held to a small fixed ceiling and deadline
+ * whatever its type: a request past either costs a failed attempt and
+ * is drained (or the connection closed), never buffered.
  */
 const LOGIN_BODY_LIMITS: BodyLimits = {
   maxBytes: 16 * 1024,
@@ -300,23 +299,19 @@ type SubmittedToken =
   | { token: string | null }
   | { refused: BodyRefusalStatus; closeConnection: boolean };
 
+/** The token a login POST submits as a form or JSON; null for any
+ *  other body. */
 async function readSubmittedToken(req: Request): Promise<SubmittedToken> {
-  const contentType = req.headers.get("content-type") ?? "";
-  const isForm = contentType.includes("application/x-www-form-urlencoded");
-  const isJson = contentType.includes("application/json");
-  if (!isForm && !isJson) {
-    // Not a body we read, but never one left on the socket.
-    const { closeConnection } = await discardBody(req, LOGIN_BODY_LIMITS);
-    return closeConnection
-      ? { refused: 413, closeConnection }
-      : { token: null };
-  }
   const read = await readBoundedBody(req, LOGIN_BODY_LIMITS);
   if (!read.ok) {
     return { refused: read.status, closeConnection: read.closeConnection };
   }
+  const contentType = req.headers.get("content-type") ?? "";
   const text = new TextDecoder().decode(read.bytes);
-  if (isForm) return { token: new URLSearchParams(text).get("token") };
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    return { token: new URLSearchParams(text).get("token") };
+  }
+  if (!contentType.includes("application/json")) return { token: null };
   try {
     const body = JSON.parse(text) as { token?: unknown } | null;
     return {

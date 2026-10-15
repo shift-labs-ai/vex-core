@@ -66,8 +66,6 @@ function deadline(timeoutMs: number | undefined) {
       : new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Stalled()), timeoutMs);
         });
-  // A deadline nobody races any more must not surface as unhandled.
-  expired.catch(() => {});
   return { expired, clear: () => clearTimeout(timer) };
 }
 
@@ -99,7 +97,9 @@ async function drain(
   return clean;
 }
 
-function declaredLength(req: Request): number | null | "invalid" {
+/** `req`'s declared `Content-Length`: null when absent, "invalid" when
+ *  it is not a plain byte count. */
+export function declaredLength(req: Request): number | null | "invalid" {
   const header = req.headers.get("content-length");
   if (header === null) return null;
   const trimmed = header.trim();
@@ -117,8 +117,7 @@ export async function discardBody(
   req: Request,
   limits: BodyLimits,
 ): Promise<{ closeConnection: boolean }> {
-  if (!req.body) return { closeConnection: false };
-  if (req.bodyUsed) return { closeConnection: false };
+  if (!req.body || req.bodyUsed) return { closeConnection: false };
   const reader = req.body.getReader();
   const declared = declaredLength(req);
   const ceiling = drainCeiling(limits);

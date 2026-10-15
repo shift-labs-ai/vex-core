@@ -18,7 +18,12 @@
  * middleware that can expose each part without buffering.
  */
 
-import { type ReadLimits, readText, refuseBody } from "../body.js";
+import {
+  declaredLength,
+  type ReadLimits,
+  readText,
+  refuseBody,
+} from "../body.js";
 import { HttpError } from "../error.js";
 import type { Middleware } from "../types.js";
 
@@ -97,8 +102,8 @@ export function bodyParser(options: BodyParserOptions = {}): Middleware {
 
     // A type left unparsed is still held to the limit when it declares
     // its length past it: refused, drained, before the handler runs.
-    const declared = Number(ctx.req.headers.get("content-length") ?? "0");
-    if (declared > limits.maxBytes) {
+    const declared = declaredLength(ctx.req);
+    if (typeof declared === "number" && declared > limits.maxBytes) {
       await refuseBody(ctx.req, limits, 413, TOO_LARGE);
     }
 

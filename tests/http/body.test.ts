@@ -23,13 +23,13 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { sqliteAdapter } from "../../src/adapters/sqlite.js";
 import { Vex } from "../../src/core/engine.js";
+import { formatBytes } from "../../src/http/body.js";
 import {
   bearerAuth,
   bodyParser,
   createRouter,
   DEFAULT_MAX_BODY_BYTES,
   discardBody,
-  formatBytes,
   HttpError,
   readBody,
   readBoundedBody,
@@ -358,7 +358,7 @@ describe("vexHandler", () => {
     await vex.close();
   });
 
-  const json = (body: unknown) => JSON.stringify(body) as unknown as BodyInit;
+  const json = (body: unknown) => JSON.stringify(body);
 
   test("the default ceiling is 8 MiB", () => {
     expect(DEFAULT_MAX_BODY_BYTES).toBe(8 * 1024 * 1024);
@@ -395,13 +395,16 @@ describe("vexHandler", () => {
     }
   });
 
-  test("an unparseable body still answers the missing-name 400", async () => {
+  test("a body that names no call answers the missing-name 400", async () => {
     const app = vexHandler(vex);
     const res = await app.handle(post("{", {}, "http://x/query"));
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "Missing query name" });
-    const nul = await app.handle(post("null", {}, "http://x/mutate"));
-    expect(nul.status).toBe(400);
+    for (const body of ["null", "[]", '{"name":42}', '{"name":""}']) {
+      const res = await app.handle(post(body, {}, "http://x/mutate"));
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "Missing mutation name" });
+    }
   });
 
   test("a stalled body is a 408 when a timeout is set", async () => {
@@ -413,19 +416,24 @@ describe("vexHandler", () => {
     expect(res.headers.get("connection")).toBe("close");
   });
 
-  test("a body bodyParser already read is used, not re-read", async () => {
+  test("behind bodyParser, the body it already read is used for calls and webhooks", async () => {
+    hooked.length = 0;
     const app = createRouter().use(bodyParser()).mount("/vex", vexHandler(vex));
+    const headers = { "content-type": "application/json" };
     const res = await app.handle(
       post(
         json({ name: "echo.size", args: { text: "abcd" } }),
-        {
-          "content-type": "application/json",
-        },
+        headers,
         "http://x/vex/query",
       ),
     );
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ data: 4 });
+    const hook = await app.handle(
+      post('{"b":2}', headers, "http://x/vex/webhook/hook"),
+    );
+    expect(await hook.json()).toEqual({ bytes: 7 });
+    expect(hooked).toEqual(['{"b":2}']);
   });
 
   test("webhooks are refused past their ceiling before the handler runs", async () => {
@@ -482,7 +490,7 @@ describe("bodyParser", () => {
     expect(await at.json()).toEqual({ body: emoji });
   });
 
-  test("parses JSON and forms under the limit as before", async () => {
+  test("parses JSON and forms under the limit", async () => {
     const j = await app(100).handle(
       post('{"a":1}', { "content-type": "application/json" }),
     );
@@ -522,7 +530,7 @@ describe("bearerAuth login form", () => {
   const login = (body: BodyInit, headers: Record<string, string>) =>
     post(body, headers, "http://x/login");
 
-  test("a token form under the ceiling still logs in", async () => {
+  test("a token form or JSON body under the ceiling logs in", async () => {
     const res = await app().handle(
       login(`token=${token}`, {
         "content-type": "application/x-www-form-urlencoded",
@@ -569,12 +577,16 @@ describe("bearerAuth login form", () => {
     ).toBe(429);
   });
 
-  test("a body of another type is drained, not left on the socket", async () => {
+  test("a body of another type submits no token, under the same ceiling", async () => {
     const res = await app().handle(
       login(chunked(1024), { "content-type": "text/plain" }),
     );
     expect(res.status).toBe(401);
     expect(res.headers.get("connection")).toBeNull();
+    const big = await app().handle(
+      login(chunked(17 * 1024), { "content-type": "text/plain" }),
+    );
+    expect(big.status).toBe(413);
   });
 
   test("a non-string JSON token is a failed login, not a crash", async () => {

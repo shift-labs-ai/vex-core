@@ -21,9 +21,10 @@
  *   plumbs into Bun.serve directly.
  *
  * Bodies are read under a byte ceiling (body.ts): a request past
- * `maxBodyBytes` is answered 413 before it is buffered, never parsed
- * as `{}`. Webhooks share the ceiling unless `maxWebhookBodyBytes`
- * gives them their own.
+ * `maxBodyBytes` is answered 413 before it is buffered, and no handler
+ * runs. Webhooks share the ceiling unless `maxWebhookBodyBytes` gives
+ * them their own. Behind `bodyParser`, the body it already read is
+ * used as is.
  *
  * No CORS headers, no auth — those are separate middleware the caller
  * composes on top. This file is the dispatcher only.
@@ -71,8 +72,24 @@ export function vexHandler(vex: Vex, opts: VexHandlerOptions = {}): Router {
 
   const router = createRouter();
 
-  router.post("/query", makeQueryHandler(vex, getUser, rpcLimits));
-  router.post("/mutate", makeMutateHandler(vex, getUser, rpcLimits));
+  router.post(
+    "/query",
+    makeCallHandler(
+      "query",
+      (name, args, user) => vex.query(name, args, { user }),
+      getUser,
+      rpcLimits,
+    ),
+  );
+  router.post(
+    "/mutate",
+    makeCallHandler(
+      "mutation",
+      (name, args, user) => vex.mutate(name, args, { user }),
+      getUser,
+      rpcLimits,
+    ),
+  );
   router.all("/webhook/*", makeWebhookHandler(vex, webhookLimits));
 
   return router;
@@ -80,42 +97,24 @@ export function vexHandler(vex: Vex, opts: VexHandlerOptions = {}): Router {
 
 // ─── handlers ────────────────────────────────────────────────────────
 
-function makeQueryHandler(
-  vex: Vex,
-  getUser: (ctx: RequestCtx) => VexUser | null | undefined,
-  limits: ReadLimits,
-): Handler {
-  return async (ctx: RequestCtx): Promise<Response> => {
-    const body = await readRpcBody(ctx, limits);
-    if (!body.name) {
-      return json({ error: "Missing query name" }, 400);
-    }
-    try {
-      const data = await vex.query(body.name, body.args ?? {}, {
-        user: getUser(ctx),
-      });
-      return json({ data });
-    } catch (err: unknown) {
-      return json({ error: errorMessage(err) }, 500);
-    }
-  };
-}
+type Call = (
+  name: string,
+  args: Record<string, unknown>,
+  user: VexUser | null | undefined,
+) => Promise<unknown>;
 
-function makeMutateHandler(
-  vex: Vex,
+/** `/query` or `/mutate`: a `{ name, args? }` body → `{ data }`. */
+function makeCallHandler(
+  kind: "query" | "mutation",
+  call: Call,
   getUser: (ctx: RequestCtx) => VexUser | null | undefined,
   limits: ReadLimits,
 ): Handler {
   return async (ctx: RequestCtx): Promise<Response> => {
-    const body = await readRpcBody(ctx, limits);
-    if (!body.name) {
-      return json({ error: "Missing mutation name" }, 400);
-    }
+    const { name, args } = parseCall(await bodyText(ctx, limits));
+    if (!name) return json({ error: `Missing ${kind} name` }, 400);
     try {
-      const data = await vex.mutate(body.name, body.args ?? {}, {
-        user: getUser(ctx),
-      });
-      return json({ data });
+      return json({ data: await call(name, args, getUser(ctx)) });
     } catch (err: unknown) {
       return json({ error: errorMessage(err) }, 500);
     }
@@ -130,7 +129,7 @@ function makeWebhookHandler(vex: Vex, limits: ReadLimits): Handler {
     const captured = ctx.params["0"] ?? "";
     const webhookPath = captured ? `/${captured}` : "/";
 
-    const rawBody = await readText(ctx.req, limits);
+    const rawBody = await bodyText(ctx, limits);
     let body: unknown;
     try {
       body = JSON.parse(rawBody);
@@ -179,27 +178,34 @@ function makeWebhookHandler(vex: Vex, limits: ReadLimits): Handler {
 // ─── helpers ─────────────────────────────────────────────────────────
 
 /**
- * The `{ name, args? }` body of a /query or /mutate call; `{}` when it
- * is empty or does not parse, so the handler answers "Missing … name".
- * A body past the ceiling throws the 413 HttpError instead. When
- * `bodyParser` already read the body, its `rawBody` is parsed rather
- * than re-reading a consumed stream.
+ * The request body as text, read once under `limits`. Behind
+ * `bodyParser` the stream is already consumed, and its `rawBody` is
+ * the body; a body consumed by anything else reads as empty.
  */
-async function readRpcBody(ctx: RequestCtx, limits: ReadLimits): Promise<any> {
-  let text: string;
-  if (ctx.req.bodyUsed) {
-    const raw = ctx.state.rawBody;
-    if (typeof raw !== "string") return {};
-    text = raw;
-  } else {
-    text = await readText(ctx.req, limits);
-  }
+async function bodyText(ctx: RequestCtx, limits: ReadLimits): Promise<string> {
+  if (!ctx.req.bodyUsed) return readText(ctx.req, limits);
+  const raw = ctx.state.rawBody;
+  return typeof raw === "string" ? raw : "";
+}
+
+/** A call's name and args; a body that is not a JSON object, or a
+ *  name that is not a non-empty string, names nothing. `args` passes
+ *  as sent: the engine validates it against the call's declaration. */
+function parseCall(text: string): {
+  name: string | null;
+  args: Record<string, unknown>;
+} {
+  let body: { name?: unknown; args?: unknown } | null;
   try {
-    const parsed = JSON.parse(text);
-    return parsed !== null && typeof parsed === "object" ? parsed : {};
+    body = JSON.parse(text);
   } catch {
-    return {};
+    body = null;
   }
+  const name = body?.name;
+  return {
+    name: typeof name === "string" && name ? name : null,
+    args: (body?.args ?? {}) as Record<string, unknown>,
+  };
 }
 
 function json(body: unknown, status = 200): Response {
