@@ -301,6 +301,24 @@ GET  /subscribe          ?name=...&args=... (SSE)
 ALL  /webhook/*          user-defined webhooks
 ```
 
+Request bodies are read under a byte ceiling: `vexHandler(vex, { maxBodyBytes, maxWebhookBodyBytes, bodyTimeoutMs })`. `maxBodyBytes` defaults to 8 MiB (`DEFAULT_MAX_BODY_BYTES`) and covers `/query` and `/mutate`. Webhooks use the same ceiling unless `maxWebhookBodyBytes` gives them their own. A body past the ceiling gets a 413 before it is buffered, and no query, mutation or webhook runs. With `bodyTimeoutMs` set, a body that stalls gets a 408. Mounted behind `bodyParser`, the dispatcher uses the body the parser already read.
+
+### Request bodies under a byte ceiling
+
+```ts
+import { readBoundedBody, discardBody, readBody, readText, readJson, readForm, refuseBody } from "vex-core/http";
+
+const read = await readBoundedBody(req, { maxBytes, drainBytes?, timeoutMs? });
+// { ok: true, bytes: Uint8Array } | { ok: false, status: 400 | 408 | 413, closeConnection }
+```
+
+- A declared `Content-Length` past `maxBytes` is refused before any bytes are read. An undeclared (chunked) body is counted as it streams and refused as soon as it passes the ceiling.
+- A refused body is drained up to `drainBytes` (default 4x `maxBytes`). That keeps a kept-alive socket clean, so the client reads the refusal instead of an ECONNRESET. If the body is past the drain ceiling, or past `timeoutMs` (one deadline covers both the read and the drain), `closeConnection` is true.
+- `discardBody(req, limits)` refuses a body without reading it in (wrong content type, etc.) under the same drain rule.
+- `readBody` / `readText` / `readJson` / `readForm` / `refuseBody` throw the `HttpError` that explains the refusal as `{ error }`, and add `Connection: close` exactly when bytes remain on the socket.
+
+Web Streams only, so it runs in Bun and workerd alike.
+
 ### Middleware catalog
 
 | Middleware    | What it does |
@@ -309,8 +327,8 @@ ALL  /webhook/*          user-defined webhooks
 | `requestId({ header, generator })`          | Read or mint `X-Request-Id`; stash on `ctx.state.requestId`; echo on response. |
 | `accessLog({ logger, skipPaths })`          | One line per request: `GET /path -> 200 (12ms)`. |
 | `cors({ origin, credentials, allowedHeaders, maxAge })` | Fetch-standard CORS. Downgrades `*` to request origin when `credentials: true`. |
-| `bearerAuth({ token, publicPaths, loginPage })` | Single-token HTTP gate: `Authorization: Bearer` OR session cookie. Built-in `/login` + `/logout`; per-IP rate limit on failures. |
-| `bodyParser({ limit, json, urlencoded, text })` | Parse request body into `ctx.state.body`. |
+| `bearerAuth({ token, publicPaths, loginPage })` | Single-token HTTP gate: `Authorization: Bearer` OR session cookie. Built-in `/login` + `/logout`; per-IP rate limit on failures. The login form is read under a 16 KiB / 10 s ceiling, and a refused form counts as a failure. |
+| `bodyParser({ limit, drainLimit, timeoutMs, json, urlencoded, text })` | Parse request body into `ctx.state.body`. `limit` is in bytes (default 1 MiB), enforced as the body streams; an oversized body gets a 413 and is drained. |
 | `rateLimit({ requests, window, key, cost, limiter })` | Token-bucket limiting: 429 + `Retry-After`, full `X-RateLimit-*` on every response. Works as `use()` middleware or as a route-chain gate. |
 | `sessions({ storage, cookieName, maxAge, rolling })` | Server-side session store on any `StorageAdapter` (SQLite/custom). `ctx.session.get/set/delete/destroy`. |
 

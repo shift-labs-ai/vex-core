@@ -15,7 +15,23 @@
 
 import { timingSafeEqual } from "node:crypto";
 import { RateLimiter } from "../../core/rate-limit.js";
+import {
+  type BodyLimits,
+  type BodyRefusalStatus,
+  readBoundedBody,
+} from "../body.js";
 import type { Middleware } from "../types.js";
+
+/**
+ * The login form carries one token field and is read before anyone is
+ * authenticated, so it is held to a small fixed ceiling and deadline
+ * whatever its type: a request past either costs a failed attempt and
+ * is drained (or the connection closed), never buffered.
+ */
+const LOGIN_BODY_LIMITS: BodyLimits = {
+  maxBytes: 16 * 1024,
+  timeoutMs: 10_000,
+};
 
 export interface BearerAuthOptions {
   /** The shared secret. Required. */
@@ -221,7 +237,19 @@ async function handleLogin(
     });
   }
 
-  const submitted = await readSubmittedToken(ctx.req);
+  const read = await readSubmittedToken(ctx.req);
+  if ("refused" in read) {
+    limiter.tryConsume(ip);
+    const headers: Record<string, string> = {
+      "content-type": "text/html; charset=utf-8",
+    };
+    if (read.closeConnection) headers.connection = "close";
+    return new Response(renderLoginPage(LOGIN_REFUSALS[read.refused]), {
+      status: read.refused,
+      headers,
+    });
+  }
+  const submitted = read.token;
   if (!submitted || !constantTimeEq(submitted, token)) {
     limiter.tryConsume(ip);
     return new Response(renderLoginPage("Invalid token."), {
@@ -261,21 +289,37 @@ function handleLoginPage(_ctx: { url: URL }, brand: string): Response {
   });
 }
 
-async function readSubmittedToken(req: Request): Promise<string | null> {
+const LOGIN_REFUSALS: Record<BodyRefusalStatus, string> = {
+  400: "Invalid request.",
+  408: "The request timed out.",
+  413: "Request too large.",
+};
+
+type SubmittedToken =
+  | { token: string | null }
+  | { refused: BodyRefusalStatus; closeConnection: boolean };
+
+/** The token a login POST submits as a form or JSON; null for any
+ *  other body. */
+async function readSubmittedToken(req: Request): Promise<SubmittedToken> {
+  const read = await readBoundedBody(req, LOGIN_BODY_LIMITS);
+  if (!read.ok) {
+    return { refused: read.status, closeConnection: read.closeConnection };
+  }
   const contentType = req.headers.get("content-type") ?? "";
+  const text = new TextDecoder().decode(read.bytes);
   if (contentType.includes("application/x-www-form-urlencoded")) {
-    const body = await req.text();
-    return new URLSearchParams(body).get("token");
+    return { token: new URLSearchParams(text).get("token") };
   }
-  if (contentType.includes("application/json")) {
-    try {
-      const body = (await req.json()) as { token?: string };
-      return body?.token ?? null;
-    } catch {
-      return null;
-    }
+  if (!contentType.includes("application/json")) return { token: null };
+  try {
+    const body = JSON.parse(text) as { token?: unknown } | null;
+    return {
+      token: typeof body?.token === "string" ? body.token : null,
+    };
+  } catch {
+    return { token: null };
   }
-  return null;
 }
 
 // ─── login page ──────────────────────────────────────────────────────

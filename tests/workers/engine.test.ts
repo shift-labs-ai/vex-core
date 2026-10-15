@@ -175,6 +175,18 @@ describe("Vex on a Durable Object", () => {
         data: [{ key: "hits", value: 3 }],
       });
 
+      // The bounded reader holds in workerd too: past the default
+      // 8 MiB ceiling is a 413, never a call with `{}`.
+      const oversized = await api.fetch("http://api/vex/query", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: new Uint8Array(8 * 1024 * 1024 + 1),
+      });
+      expect(oversized.status).toBe(413);
+      expect(await oversized.json()).toEqual({
+        error: "The request body exceeds the 8MB limit",
+      });
+
       const login = await api.fetch("http://api/login", {
         method: "POST",
         body: "ada",

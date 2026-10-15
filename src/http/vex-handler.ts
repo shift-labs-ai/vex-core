@@ -20,12 +20,19 @@
  *   collection of `(upgrade, open, message, close)` hooks the host
  *   plumbs into Bun.serve directly.
  *
+ * Bodies are read under a byte ceiling (body.ts): a request past
+ * `maxBodyBytes` is answered 413 before it is buffered, and no handler
+ * runs. Webhooks share the ceiling unless `maxWebhookBodyBytes` gives
+ * them their own. Behind `bodyParser`, the body it already read is
+ * used as is.
+ *
  * No CORS headers, no auth — those are separate middleware the caller
  * composes on top. This file is the dispatcher only.
  */
 
 import type { Vex } from "../core/engine.js";
 import type { VexUser } from "../core/types.js";
+import { type ReadLimits, readText } from "./body.js";
 import { createRouter, type Router } from "./router.js";
 import type { Handler, RequestCtx } from "./types.js";
 
@@ -36,63 +43,85 @@ export interface VexHandlerOptions {
    * ignore user attribution entirely by returning null.
    */
   getUser?: (ctx: RequestCtx) => VexUser | null | undefined;
+  /**
+   * The most bytes a `/query` or `/mutate` body may carry; a larger
+   * one is refused 413 before it is buffered. Default 8 MiB.
+   */
+  maxBodyBytes?: number;
+  /** The most bytes a `/webhook/*` body may carry. Defaults to
+   *  `maxBodyBytes`. */
+  maxWebhookBodyBytes?: number;
+  /** How long reading a body may take before it is refused 408;
+   *  none when absent. */
+  bodyTimeoutMs?: number;
 }
+
+/** The default ceiling on a `/query`, `/mutate` or webhook body. */
+export const DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
 
 export function vexHandler(vex: Vex, opts: VexHandlerOptions = {}): Router {
   const getUser = opts.getUser ?? ((c: RequestCtx) => c.user ?? null);
+  const rpcLimits: ReadLimits = {
+    maxBytes: opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+    timeoutMs: opts.bodyTimeoutMs,
+  };
+  const webhookLimits: ReadLimits = {
+    maxBytes: opts.maxWebhookBodyBytes ?? rpcLimits.maxBytes,
+    timeoutMs: opts.bodyTimeoutMs,
+  };
 
   const router = createRouter();
 
-  router.post("/query", makeQueryHandler(vex, getUser));
-  router.post("/mutate", makeMutateHandler(vex, getUser));
-  router.all("/webhook/*", makeWebhookHandler(vex));
+  router.post(
+    "/query",
+    makeCallHandler(
+      "query",
+      (name, args, user) => vex.query(name, args, { user }),
+      getUser,
+      rpcLimits,
+    ),
+  );
+  router.post(
+    "/mutate",
+    makeCallHandler(
+      "mutation",
+      (name, args, user) => vex.mutate(name, args, { user }),
+      getUser,
+      rpcLimits,
+    ),
+  );
+  router.all("/webhook/*", makeWebhookHandler(vex, webhookLimits));
 
   return router;
 }
 
 // ─── handlers ────────────────────────────────────────────────────────
 
-function makeQueryHandler(
-  vex: Vex,
+type Call = (
+  name: string,
+  args: Record<string, unknown>,
+  user: VexUser | null | undefined,
+) => Promise<unknown>;
+
+/** `/query` or `/mutate`: a `{ name, args? }` body → `{ data }`. */
+function makeCallHandler(
+  kind: "query" | "mutation",
+  call: Call,
   getUser: (ctx: RequestCtx) => VexUser | null | undefined,
+  limits: ReadLimits,
 ): Handler {
   return async (ctx: RequestCtx): Promise<Response> => {
-    const body = await readJson(ctx.req);
-    if (!body.name) {
-      return json({ error: "Missing query name" }, 400);
-    }
+    const { name, args } = parseCall(await bodyText(ctx, limits));
+    if (!name) return json({ error: `Missing ${kind} name` }, 400);
     try {
-      const data = await vex.query(body.name, body.args ?? {}, {
-        user: getUser(ctx),
-      });
-      return json({ data });
+      return json({ data: await call(name, args, getUser(ctx)) });
     } catch (err: unknown) {
       return json({ error: errorMessage(err) }, 500);
     }
   };
 }
 
-function makeMutateHandler(
-  vex: Vex,
-  getUser: (ctx: RequestCtx) => VexUser | null | undefined,
-): Handler {
-  return async (ctx: RequestCtx): Promise<Response> => {
-    const body = await readJson(ctx.req);
-    if (!body.name) {
-      return json({ error: "Missing mutation name" }, 400);
-    }
-    try {
-      const data = await vex.mutate(body.name, body.args ?? {}, {
-        user: getUser(ctx),
-      });
-      return json({ data });
-    } catch (err: unknown) {
-      return json({ error: errorMessage(err) }, 500);
-    }
-  };
-}
-
-function makeWebhookHandler(vex: Vex): Handler {
+function makeWebhookHandler(vex: Vex, limits: ReadLimits): Handler {
   return async (ctx: RequestCtx): Promise<Response> => {
     // URLPattern's `*` capture for `/webhook/*` lands in params["0"].
     // The leading slash is not captured, so prepend one; an empty
@@ -100,7 +129,7 @@ function makeWebhookHandler(vex: Vex): Handler {
     const captured = ctx.params["0"] ?? "";
     const webhookPath = captured ? `/${captured}` : "/";
 
-    const rawBody = await ctx.req.text();
+    const rawBody = await bodyText(ctx, limits);
     let body: unknown;
     try {
       body = JSON.parse(rawBody);
@@ -148,12 +177,35 @@ function makeWebhookHandler(vex: Vex): Handler {
 
 // ─── helpers ─────────────────────────────────────────────────────────
 
-async function readJson(req: Request): Promise<any> {
+/**
+ * The request body as text, read once under `limits`. Behind
+ * `bodyParser` the stream is already consumed, and its `rawBody` is
+ * the body; a body consumed by anything else reads as empty.
+ */
+async function bodyText(ctx: RequestCtx, limits: ReadLimits): Promise<string> {
+  if (!ctx.req.bodyUsed) return readText(ctx.req, limits);
+  const raw = ctx.state.rawBody;
+  return typeof raw === "string" ? raw : "";
+}
+
+/** A call's name and args; a body that is not a JSON object, or a
+ *  name that is not a non-empty string, names nothing. `args` passes
+ *  as sent: the engine validates it against the call's declaration. */
+function parseCall(text: string): {
+  name: string | null;
+  args: Record<string, unknown>;
+} {
+  let body: { name?: unknown; args?: unknown } | null;
   try {
-    return await req.json();
+    body = JSON.parse(text);
   } catch {
-    return {};
+    body = null;
   }
+  const name = body?.name;
+  return {
+    name: typeof name === "string" && name ? name : null,
+    args: (body?.args ?? {}) as Record<string, unknown>,
+  };
 }
 
 function json(body: unknown, status = 200): Response {
