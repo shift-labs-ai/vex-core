@@ -8,6 +8,7 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
+      "workerd": "./dist/portable.js",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
@@ -30,6 +31,11 @@
       "types": "./dist/adapters/sqlite.d.ts",
       "import": "./dist/adapters/sqlite.js",
       "default": "./dist/adapters/sqlite.js"
+    },
+    "./adapters/durable-object": {
+      "types": "./dist/adapters/durable-object.d.ts",
+      "import": "./dist/adapters/durable-object.js",
+      "default": "./dist/adapters/durable-object.js"
     }
   },
   "files": [
@@ -40,6 +46,7 @@
   "scripts": {
     "build": "tsc",
     "test": "bun test",
+    "test:workers": "tsc && tsc -p tests/workers && vitest run --config tests/workers/vitest.config.ts",
     "bench:sqlite-read": "bun benchmarks/sqlite-read-contention.ts",
     "format": "bunx biome format --write src/",
     "lint": "bunx biome lint src/",
@@ -74,9 +81,12 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.3.14",
+    "@cloudflare/vitest-plugin": "^1.4.2",
+    "@cloudflare/workers-types": "^5.20261014.1",
     "@types/bun": "^1.2.17",
     "@types/react": "^19.2.14",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.0"
   },
   "dependencies": {
     "nanoid": "^5.1.7"

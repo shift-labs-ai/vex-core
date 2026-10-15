@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
@@ -471,9 +474,9 @@ describe("middleware", () => {
     });
 
     await mvex.mutate("kv.set", { scope: "s1", key: "x", value: 1 });
-    expect(async () =>
+    await expect(
       mvex.mutate("kv.delete", { scope: "s1", key: "x" }),
-    ).toThrow("Deletes are disabled");
+    ).rejects.toThrow("Deletes are disabled");
     expect(await mvex.query("kv.get", { scope: "s1", key: "x" })).toBe(1);
 
     await mvex.close();
@@ -617,7 +620,7 @@ describe("middleware", () => {
 
 describe("plugin name collisions", () => {
   test("duplicate query name throws", async () => {
-    expect(
+    await expect(
       Vex.create({
         plugins: [
           (api: VexPluginAPI) => {
@@ -644,7 +647,7 @@ describe("plugin name collisions", () => {
   });
 
   test("duplicate mutation name throws", async () => {
-    expect(
+    await expect(
       Vex.create({
         plugins: [
           (api: VexPluginAPI) => {
@@ -673,7 +676,7 @@ describe("plugin name collisions", () => {
   });
 
   test("duplicate table name throws", async () => {
-    expect(
+    await expect(
       Vex.create({
         plugins: [
           (api: VexPluginAPI) => {
@@ -1038,6 +1041,124 @@ describe("jobs", () => {
 
     expect(active).toBe(0);
     expect(completed).toBe(true);
+  });
+
+  const counter = (runs: { count: number }) => (api: VexPluginAPI) => {
+    api.setName("ext");
+    api.registerJob("tick", {
+      schedule: "every 1s",
+      handler() {
+        runs.count += 1;
+      },
+    });
+  };
+
+  async function withJobsFile(fn: (path: string) => Promise<void>) {
+    const path = join(
+      tmpdir(),
+      `vex-core-jobs-${Date.now()}-${Math.random()}.db`,
+    );
+    try {
+      await fn(path);
+    } finally {
+      for (const suffix of ["", "-wal", "-shm"]) {
+        rmSync(`${path}${suffix}`, { force: true });
+      }
+    }
+  }
+
+  test.each(["timers", "external"] as const)(
+    "a restarted engine keeps the pending run (%s)",
+    (jobScheduler) =>
+      withJobsFile(async (path) => {
+        const first = await Vex.create({
+          storage: sqliteAdapter(path),
+          plugins: [counter({ count: 0 })],
+          jobScheduler,
+        });
+        const pending = await first.nextJobRun();
+        await first.close();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        const second = await Vex.create({
+          storage: sqliteAdapter(path),
+          plugins: [counter({ count: 0 })],
+          jobScheduler,
+        });
+        expect(await second.nextJobRun()).toBe(pending);
+        await second.close();
+      }),
+  );
+
+  test("a restarted engine runs a job that came due while it was down", () =>
+    withJobsFile(async (path) => {
+      const first = await Vex.create({
+        storage: sqliteAdapter(path),
+        plugins: [counter({ count: 0 })],
+      });
+      await first.unsafeSql(
+        "UPDATE _jobs SET nextRun = ?",
+        Date.now() - 60_000,
+      );
+      await first.close();
+
+      const runs = { count: 0 };
+      const second = await Vex.create({
+        storage: sqliteAdapter(path),
+        plugins: [counter(runs)],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(runs.count).toBe(1);
+      await second.close();
+    }));
+
+  describe("external scheduler", () => {
+    test("starts no timers", async () => {
+      const runs = { count: 0 };
+      const jvex = await Vex.create({
+        storage: sqliteAdapter(":memory:"),
+        plugins: [counter(runs)],
+        jobScheduler: "external",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_150));
+      expect(runs.count).toBe(0);
+      await jvex.close();
+    });
+
+    test("runDueJobs runs the jobs due by now and advances nextJobRun", async () => {
+      const runs = { count: 0 };
+      const created = Date.now();
+      const jvex = await Vex.create({
+        storage: sqliteAdapter(":memory:"),
+        plugins: [counter(runs)],
+        jobScheduler: "external",
+      });
+      const first = await jvex.nextJobRun();
+      expect(first).toBeGreaterThanOrEqual(created + 1_000);
+
+      expect(await jvex.runDueJobs(first! - 1)).toEqual([]);
+      const ranAt = Date.now();
+      const ran = await jvex.runDueJobs(first!);
+      expect(ran).toMatchObject([{ name: "ext.tick", status: "ok" }]);
+      expect(runs.count).toBe(1);
+      // The next run is one interval after this run started.
+      expect(await jvex.nextJobRun()).toBeGreaterThanOrEqual(ranAt + 1_000);
+      await jvex.close();
+    });
+
+    test("disabled jobs are neither due nor scheduled", async () => {
+      const runs = { count: 0 };
+      const jvex = await Vex.create({
+        storage: sqliteAdapter(":memory:"),
+        plugins: [counter(runs)],
+        jobScheduler: "external",
+      });
+      await jvex.setJobEnabled("ext.tick", false);
+      expect(await jvex.nextJobRun()).toBeNull();
+      expect(await jvex.runDueJobs(Date.now() + 10_000)).toEqual([]);
+      expect(runs.count).toBe(0);
+      await jvex.close();
+    });
   });
 });
 

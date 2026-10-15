@@ -1,0 +1,3 @@
+[test]
+# tests/workers/ runs in workerd through vitest (bun run test:workers).
+pathIgnorePatterns = ["tests/workers/**"]

@@ -14,6 +14,11 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
+      # vitest and workerd (tests/workers/) run on Node.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - run: bun install
 
       - name: Typecheck
@@ -24,3 +29,6 @@ jobs:
 
       - name: Test
         run: bun test
+
+      - name: Test on workerd
+        run: bun run test:workers

@@ -3,6 +3,7 @@ import { governedRawSqlError, guardQueryBuilder } from "./access.js";
 import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
 import { INTERNAL_TABLES } from "./internal.js";
+import { hashResult, utf8ByteLength } from "./result-measure.js";
 import type { StorageAdapter } from "./storage.js";
 import {
   describeQueryDependencies,
@@ -119,6 +120,13 @@ export interface VexOptions {
   appId?: string;
   handlerTimeoutMs?: number;
   reactive?: ReactiveBudget;
+  /**
+   * What runs jobs when they come due. "timers" (default): the engine,
+   * on in-process timers. "external": the host calls `runDueJobs()` at
+   * `nextJobRun()`, e.g. from a Durable Object alarm, and the engine
+   * starts no timers.
+   */
+  jobScheduler?: "timers" | "external";
 }
 
 export class Vex {
@@ -132,10 +140,11 @@ export class Vex {
   // Row-level access policies by table (core/access.ts). Applied to
   // every query-context read; mutation contexts are the trusted tier.
   private accessPolicies: Map<string, TableAccessPolicy<any>> = new Map();
-  private cronTimers: Map<string, ReturnType<typeof setInterval>> = new Map();
+  private cronTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private jobHandlers: Map<string, JobDef> = new Map();
   private jobIntervalMs: Map<string, number> = new Map();
   private runningJobs: Map<string, Promise<JobRunResult>> = new Map();
+  private jobScheduler: "timers" | "external" = "timers";
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
   private appId: string = "unknown";
@@ -194,6 +203,7 @@ export class Vex {
     const vex = new Vex(options.storage);
     if (options.tracer) vex.tracer = options.tracer;
     if (options.appId) vex.appId = options.appId;
+    if (options.jobScheduler) vex.jobScheduler = options.jobScheduler;
     if (options.handlerTimeoutMs)
       vex.handlerTimeoutMs = options.handlerTimeoutMs;
     if (options.reactive) {
@@ -250,20 +260,31 @@ export class Vex {
     }
   }
 
-  private startJobTimer(cronName: string, job: JobDef, ms: number) {
-    if (this.cronTimers.has(cronName)) return;
-    this.cronTimers.set(
-      cronName,
-      setInterval(() => {
-        this.executeJob(cronName, job);
-      }, ms),
+  // Runs the job at `firstRun`, then every `ms`. Under an external
+  // scheduler the host runs due jobs instead.
+  private startJobTimer(
+    cronName: string,
+    job: JobDef,
+    ms: number,
+    firstRun: number,
+  ) {
+    if (this.jobScheduler !== "timers" || this.cronTimers.has(cronName)) return;
+    const run = () => this.executeJob(cronName, job);
+    const first = setTimeout(
+      () => {
+        this.cronTimers.set(cronName, setInterval(run, ms));
+        run();
+      },
+      Math.max(0, firstRun - Date.now()),
     );
+    this.cronTimers.set(cronName, first);
   }
 
   private stopJobTimer(cronName: string) {
     const timer = this.cronTimers.get(cronName);
     if (timer) {
-      clearInterval(timer);
+      // Clears a pending first run and a running interval alike.
+      clearTimeout(timer);
       this.cronTimers.delete(cronName);
     }
   }
@@ -277,40 +298,28 @@ export class Vex {
     this.jobIntervalMs.set(name, ms);
 
     const existing = await this.storage
-      .rawQuery<any>("SELECT _id FROM _jobs WHERE name = ?", name)
+      .rawQuery<any>("SELECT _id, nextRun FROM _jobs WHERE name = ?", name)
       .then((r) => r[0]);
-    if (existing) {
-      await this.storage.update("_jobs", existing._id, {
-        plugin,
-        schedule: job.schedule,
-        description: job.description ?? null,
-        enabled: job.enabled !== false ? 1 : 0,
-        timeoutMs: job.timeoutMs ?? null,
-        retries: job.retries ?? 0,
-        retryDelayMs: job.retryDelayMs ?? null,
-      });
-    } else {
-      await this.storage.insert("_jobs", {
-        name,
-        plugin,
-        schedule: job.schedule,
-        description: job.description ?? null,
-        enabled: job.enabled !== false ? 1 : 0,
-        timeoutMs: job.timeoutMs ?? null,
-        retries: job.retries ?? 0,
-        retryDelayMs: job.retryDelayMs ?? null,
-        runs: 0,
-      });
-    }
+    const enabled = job.enabled !== false;
+    // A pending run survives a restart: the job runs when it was due, or
+    // one interval from now if that is sooner.
+    const nextRun = enabled
+      ? Math.min(existing?.nextRun ?? Number.POSITIVE_INFINITY, Date.now() + ms)
+      : null;
+    const row = {
+      plugin,
+      schedule: job.schedule,
+      description: job.description ?? null,
+      enabled: enabled ? 1 : 0,
+      timeoutMs: job.timeoutMs ?? null,
+      retries: job.retries ?? 0,
+      retryDelayMs: job.retryDelayMs ?? null,
+      nextRun,
+    };
+    if (existing) await this.storage.update("_jobs", existing._id, row);
+    else await this.storage.insert("_jobs", { name, ...row, runs: 0 });
 
-    if (job.enabled !== false) {
-      this.startJobTimer(name, job, ms);
-      await this.storage.rawExec(
-        "UPDATE _jobs SET nextRun = ? WHERE name = ?",
-        Date.now() + ms,
-        name,
-      );
-    }
+    if (nextRun !== null) this.startJobTimer(name, job, ms, nextRun);
   }
 
   async removeJob(name: string) {
@@ -334,11 +343,9 @@ export class Vex {
     if (!row) throw new Error(`Job not found in DB: ${name}`);
 
     if (enabled && ms > 0) {
-      this.startJobTimer(name, handler, ms);
-      await this.storage.update("_jobs", row._id, {
-        enabled: 1,
-        nextRun: Date.now() + ms,
-      });
+      const nextRun = Date.now() + ms;
+      this.startJobTimer(name, handler, ms, nextRun);
+      await this.storage.update("_jobs", row._id, { enabled: 1, nextRun });
     } else {
       this.stopJobTimer(name);
       await this.storage.update("_jobs", row._id, {
@@ -485,6 +492,36 @@ export class Vex {
     const handler = this.jobHandlers.get(name);
     if (!handler) throw new Error(`Job not found: ${name}`);
     return this.executeJob(name, handler);
+  }
+
+  /** When the next enabled job comes due (epoch ms), or null if none will. */
+  async nextJobRun(): Promise<number | null> {
+    const jobs = await this.scheduledJobs();
+    return jobs.find((job) => this.jobHandlers.has(job.name))?.nextRun ?? null;
+  }
+
+  /**
+   * Runs, one after another, every enabled job due by `now`. Each run
+   * sets the job's next run one interval later; missed runs coalesce
+   * into one.
+   */
+  async runDueJobs(
+    now = Date.now(),
+  ): Promise<Array<JobRunResult & { name: string }>> {
+    const results: Array<JobRunResult & { name: string }> = [];
+    for (const { name, nextRun } of await this.scheduledJobs()) {
+      const handler = this.jobHandlers.get(name);
+      if (!handler || nextRun > now) continue;
+      results.push({ name, ...(await this.executeJob(name, handler)) });
+    }
+    return results;
+  }
+
+  // Enabled jobs with a pending run, soonest first.
+  private scheduledJobs(): Promise<{ name: string; nextRun: number }[]> {
+    return this.storage.rawQuery(
+      "SELECT name, nextRun FROM _jobs WHERE enabled = 1 AND nextRun IS NOT NULL ORDER BY nextRun",
+    );
   }
 
   private runtime(): VexRuntime {
@@ -774,15 +811,17 @@ export class Vex {
     serialized: string | undefined;
   } {
     const serialized = JSON.stringify(result);
+    // An undefined result measures as the literal "undefined".
+    const measured = serialized ?? "undefined";
     const resultRows = Array.isArray(result)
       ? result.length
       : result && typeof result === "object" && Array.isArray(result.rows)
         ? result.rows.length
         : undefined;
     return {
-      hash: Number(Bun.hash(serialized)),
+      hash: hashResult(measured),
       resultRows,
-      resultBytes: Buffer.byteLength(serialized ?? "undefined"),
+      resultBytes: utf8ByteLength(measured),
       serialized,
     };
   }
@@ -978,7 +1017,7 @@ export class Vex {
         try {
           // Same convention as measureReactiveResult: undefined results
           // are counted as the literal "undefined".
-          meta.resultBytes = Buffer.byteLength(
+          meta.resultBytes = utf8ByteLength(
             JSON.stringify(result) ?? "undefined",
           );
         } catch {}
@@ -1281,7 +1320,7 @@ export class Vex {
   }
 
   async close() {
-    for (const timer of this.cronTimers.values()) clearInterval(timer);
+    for (const timer of this.cronTimers.values()) clearTimeout(timer);
     this.cronTimers.clear();
     await Promise.allSettled([...this.runningJobs.values()]);
     this.subscriptions.clear();
