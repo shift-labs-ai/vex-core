@@ -1,4 +1,21 @@
 // Core
+export type {
+  BodyLimits,
+  BodyRefusalStatus,
+  BoundedBody,
+  ReadLimits,
+} from "./body.js";
+// Request bodies under a byte ceiling
+export {
+  discardBody,
+  formatBytes,
+  readBody,
+  readBoundedBody,
+  readForm,
+  readJson,
+  readText,
+  refuseBody,
+} from "./body.js";
 export { compose } from "./compose.js";
 export { HttpError, isHttpError } from "./error.js";
 export type {
@@ -38,7 +55,7 @@ export type {
 } from "./types.js";
 export type { VexHandlerOptions } from "./vex-handler.js";
 // Vex HTTP RPC dispatcher (Router you can mount anywhere)
-export { vexHandler } from "./vex-handler.js";
+export { DEFAULT_MAX_BODY_BYTES, vexHandler } from "./vex-handler.js";
 export type {
   VexWebSocketConnection,
   VexWebSocketConnectionState,

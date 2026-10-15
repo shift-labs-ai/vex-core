@@ -6,19 +6,31 @@
  * body from state instead of re-awaiting req.json(), which matters
  * because Request bodies can only be consumed once.
  *
- * Respects a size limit (default 1 MiB). Oversized requests produce a
- * 413 HttpError before any downstream work.
+ * Respects a size limit in bytes (default 1 MiB), read through the
+ * bounded body reader (../body.ts): a declared `Content-Length` past
+ * it is refused 413 before a byte is read, an undeclared (chunked)
+ * body is counted as it streams and refused the moment it passes, and
+ * a refused body is drained so the client reads the 413 rather than a
+ * reset. A body declared past the limit is refused even when its type
+ * is not one this middleware parses.
  *
  * Not run: multipart/form-data. Streaming uploads belong to a future
  * middleware that can expose each part without buffering.
  */
 
+import { type ReadLimits, readText, refuseBody } from "../body.js";
 import { HttpError } from "../error.js";
 import type { Middleware } from "../types.js";
 
 export interface BodyParserOptions {
   /** Max bytes for any parsed body. Default 1 MiB. */
   limit?: number;
+  /** Max bytes read and discarded to refuse an oversized body before
+   *  the connection is closed instead. Default 4x `limit`. */
+  drainLimit?: number;
+  /** How long reading a body may take before it is refused 408; none
+   *  when absent. */
+  timeoutMs?: number;
   /** Parse application/json. Default true. */
   json?: boolean;
   /** Parse application/x-www-form-urlencoded. Default true. */
@@ -28,9 +40,15 @@ export interface BodyParserOptions {
 }
 
 const DEFAULT_LIMIT = 1024 * 1024;
+const TOO_LARGE = "Payload too large";
 
 export function bodyParser(options: BodyParserOptions = {}): Middleware {
-  const limit = options.limit ?? DEFAULT_LIMIT;
+  const limits: ReadLimits = {
+    maxBytes: options.limit ?? DEFAULT_LIMIT,
+    drainBytes: options.drainLimit,
+    timeoutMs: options.timeoutMs,
+    tooLarge: TOO_LARGE,
+  };
   const parseJson = options.json ?? true;
   const parseUrl = options.urlencoded ?? true;
   const parseText = options.text ?? true;
@@ -46,14 +64,9 @@ export function bodyParser(options: BodyParserOptions = {}): Middleware {
 
     const contentType =
       ctx.req.headers.get("content-type")?.toLowerCase() ?? "";
-    const contentLength = Number(ctx.req.headers.get("content-length") ?? "0");
-    if (contentLength && contentLength > limit) {
-      throw new HttpError(413, "Payload too large");
-    }
 
     if (parseJson && contentType.startsWith("application/json")) {
-      const raw = await ctx.req.text();
-      if (raw.length > limit) throw new HttpError(413, "Payload too large");
+      const raw = await readText(ctx.req, limits);
       ctx.state.rawBody = raw;
       try {
         ctx.state.body = raw.length > 0 ? JSON.parse(raw) : null;
@@ -67,8 +80,7 @@ export function bodyParser(options: BodyParserOptions = {}): Middleware {
       parseUrl &&
       contentType.startsWith("application/x-www-form-urlencoded")
     ) {
-      const raw = await ctx.req.text();
-      if (raw.length > limit) throw new HttpError(413, "Payload too large");
+      const raw = await readText(ctx.req, limits);
       ctx.state.rawBody = raw;
       const parsed: Record<string, string> = {};
       for (const [k, v] of new URLSearchParams(raw)) parsed[k] = v;
@@ -77,11 +89,17 @@ export function bodyParser(options: BodyParserOptions = {}): Middleware {
     }
 
     if (parseText && contentType.startsWith("text/")) {
-      const raw = await ctx.req.text();
-      if (raw.length > limit) throw new HttpError(413, "Payload too large");
+      const raw = await readText(ctx.req, limits);
       ctx.state.rawBody = raw;
       ctx.state.body = raw;
       return next();
+    }
+
+    // A type left unparsed is still held to the limit when it declares
+    // its length past it: refused, drained, before the handler runs.
+    const declared = Number(ctx.req.headers.get("content-length") ?? "0");
+    if (declared > limits.maxBytes) {
+      await refuseBody(ctx.req, limits, 413, TOO_LARGE);
     }
 
     // Unknown or multipart — leave the Request untouched; handlers

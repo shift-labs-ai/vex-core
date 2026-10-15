@@ -20,12 +20,18 @@
  *   collection of `(upgrade, open, message, close)` hooks the host
  *   plumbs into Bun.serve directly.
  *
+ * Bodies are read under a byte ceiling (body.ts): a request past
+ * `maxBodyBytes` is answered 413 before it is buffered, never parsed
+ * as `{}`. Webhooks share the ceiling unless `maxWebhookBodyBytes`
+ * gives them their own.
+ *
  * No CORS headers, no auth — those are separate middleware the caller
  * composes on top. This file is the dispatcher only.
  */
 
 import type { Vex } from "../core/engine.js";
 import type { VexUser } from "../core/types.js";
+import { type ReadLimits, readText } from "./body.js";
 import { createRouter, type Router } from "./router.js";
 import type { Handler, RequestCtx } from "./types.js";
 
@@ -36,16 +42,38 @@ export interface VexHandlerOptions {
    * ignore user attribution entirely by returning null.
    */
   getUser?: (ctx: RequestCtx) => VexUser | null | undefined;
+  /**
+   * The most bytes a `/query` or `/mutate` body may carry; a larger
+   * one is refused 413 before it is buffered. Default 8 MiB.
+   */
+  maxBodyBytes?: number;
+  /** The most bytes a `/webhook/*` body may carry. Defaults to
+   *  `maxBodyBytes`. */
+  maxWebhookBodyBytes?: number;
+  /** How long reading a body may take before it is refused 408;
+   *  none when absent. */
+  bodyTimeoutMs?: number;
 }
+
+/** The default ceiling on a `/query`, `/mutate` or webhook body. */
+export const DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
 
 export function vexHandler(vex: Vex, opts: VexHandlerOptions = {}): Router {
   const getUser = opts.getUser ?? ((c: RequestCtx) => c.user ?? null);
+  const rpcLimits: ReadLimits = {
+    maxBytes: opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+    timeoutMs: opts.bodyTimeoutMs,
+  };
+  const webhookLimits: ReadLimits = {
+    maxBytes: opts.maxWebhookBodyBytes ?? rpcLimits.maxBytes,
+    timeoutMs: opts.bodyTimeoutMs,
+  };
 
   const router = createRouter();
 
-  router.post("/query", makeQueryHandler(vex, getUser));
-  router.post("/mutate", makeMutateHandler(vex, getUser));
-  router.all("/webhook/*", makeWebhookHandler(vex));
+  router.post("/query", makeQueryHandler(vex, getUser, rpcLimits));
+  router.post("/mutate", makeMutateHandler(vex, getUser, rpcLimits));
+  router.all("/webhook/*", makeWebhookHandler(vex, webhookLimits));
 
   return router;
 }
@@ -55,9 +83,10 @@ export function vexHandler(vex: Vex, opts: VexHandlerOptions = {}): Router {
 function makeQueryHandler(
   vex: Vex,
   getUser: (ctx: RequestCtx) => VexUser | null | undefined,
+  limits: ReadLimits,
 ): Handler {
   return async (ctx: RequestCtx): Promise<Response> => {
-    const body = await readJson(ctx.req);
+    const body = await readRpcBody(ctx, limits);
     if (!body.name) {
       return json({ error: "Missing query name" }, 400);
     }
@@ -75,9 +104,10 @@ function makeQueryHandler(
 function makeMutateHandler(
   vex: Vex,
   getUser: (ctx: RequestCtx) => VexUser | null | undefined,
+  limits: ReadLimits,
 ): Handler {
   return async (ctx: RequestCtx): Promise<Response> => {
-    const body = await readJson(ctx.req);
+    const body = await readRpcBody(ctx, limits);
     if (!body.name) {
       return json({ error: "Missing mutation name" }, 400);
     }
@@ -92,7 +122,7 @@ function makeMutateHandler(
   };
 }
 
-function makeWebhookHandler(vex: Vex): Handler {
+function makeWebhookHandler(vex: Vex, limits: ReadLimits): Handler {
   return async (ctx: RequestCtx): Promise<Response> => {
     // URLPattern's `*` capture for `/webhook/*` lands in params["0"].
     // The leading slash is not captured, so prepend one; an empty
@@ -100,7 +130,7 @@ function makeWebhookHandler(vex: Vex): Handler {
     const captured = ctx.params["0"] ?? "";
     const webhookPath = captured ? `/${captured}` : "/";
 
-    const rawBody = await ctx.req.text();
+    const rawBody = await readText(ctx.req, limits);
     let body: unknown;
     try {
       body = JSON.parse(rawBody);
@@ -148,9 +178,25 @@ function makeWebhookHandler(vex: Vex): Handler {
 
 // ─── helpers ─────────────────────────────────────────────────────────
 
-async function readJson(req: Request): Promise<any> {
+/**
+ * The `{ name, args? }` body of a /query or /mutate call; `{}` when it
+ * is empty or does not parse, so the handler answers "Missing … name".
+ * A body past the ceiling throws the 413 HttpError instead. When
+ * `bodyParser` already read the body, its `rawBody` is parsed rather
+ * than re-reading a consumed stream.
+ */
+async function readRpcBody(ctx: RequestCtx, limits: ReadLimits): Promise<any> {
+  let text: string;
+  if (ctx.req.bodyUsed) {
+    const raw = ctx.state.rawBody;
+    if (typeof raw !== "string") return {};
+    text = raw;
+  } else {
+    text = await readText(ctx.req, limits);
+  }
   try {
-    return await req.json();
+    const parsed = JSON.parse(text);
+    return parsed !== null && typeof parsed === "object" ? parsed : {};
   } catch {
     return {};
   }
