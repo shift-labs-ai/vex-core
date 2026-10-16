@@ -1,4 +1,5 @@
 import { id as generateId } from "../core/id.js";
+import { changesRows, splitStatements } from "../core/sql-text.js";
 import type { TableSchema } from "../core/types.js";
 import {
   buildInsertSql,
@@ -17,8 +18,8 @@ export interface SqliteDriver {
   prepare(sql: string): SqliteStatement;
   exec(sql: string): void;
   /**
-   * The rows the last statement changed itself. Rows its triggers wrote
-   * (the change triggers among them) are not counted.
+   * The rows the last statement changed itself; rows its triggers or
+   * foreign-key actions wrote are not counted.
    */
   changes(): number;
   /**
@@ -31,6 +32,10 @@ export interface SqliteDriver {
 export interface SqliteStatement {
   all(...params: any[]): any[];
   get(...params: any[]): any | null;
+  /**
+   * Runs a write. Answers the rows it changed itself when the driver
+   * knows that for free; anything else means ask `changes()`.
+   */
   run(...params: any[]): unknown;
 }
 
@@ -47,20 +52,6 @@ interface ExistingColumn {
 }
 
 const SQLITE_INDEX_METADATA_TABLE = "__vex_sqlite_indexes";
-
-/**
- * Change tracking, as Android Room's InvalidationTracker does it: every
- * table Vex ensures carries AFTER INSERT/UPDATE/DELETE triggers that
- * flag the table's row here. SQLite itself fires them, so a write is
- * seen however it is made: the query builder, raw SQL, a foreign-key
- * cascade, another trigger. Flags are written in the writing
- * transaction, so they roll back with it; the adapter collects them at
- * commit (`SqliteAdapterState.collectChanges`). A Durable Object refuses
- * TEMP objects, so the table and triggers are ordinary schema objects.
- */
-const CHANGES_TABLE = "__vex_changes";
-const CHANGE_TRIGGER_PREFIX = "__vex_changes_";
-const CHANGE_TRIGGER_EVENTS = ["INSERT", "UPDATE", "DELETE"] as const;
 
 function toSqlType(type: TableSchema["columns"][string]["type"]): string {
   switch (type) {
@@ -148,10 +139,10 @@ function existingColumnSql(col: ExistingColumn): string {
 }
 
 function validateTableName(name: string): void {
-  for (const reserved of [SQLITE_INDEX_METADATA_TABLE, CHANGES_TABLE]) {
-    if (name.toLowerCase() === reserved) {
-      throw new Error(`reserved SQLite metadata table name: ${reserved}`);
-    }
+  if (name.toLowerCase() === SQLITE_INDEX_METADATA_TABLE) {
+    throw new Error(
+      `reserved SQLite metadata table name: ${SQLITE_INDEX_METADATA_TABLE}`,
+    );
   }
   if (name.toLowerCase().startsWith("sqlite_")) {
     throw new Error(`reserved SQLite internal table name: ${quoteIdent(name)}`);
@@ -234,55 +225,7 @@ function renameTableIfNeeded(
   db.prepare(
     `UPDATE ${quoteIdent(SQLITE_INDEX_METADATA_TABLE)} SET "table" = ? WHERE "table" = ?`,
   ).run(name, source);
-  db.prepare(`DELETE FROM ${quoteIdent(CHANGES_TABLE)} WHERE "table" = ?`).run(
-    source,
-  );
   return source;
-}
-
-function changeTriggerSql(
-  name: string,
-  event: (typeof CHANGE_TRIGGER_EVENTS)[number],
-): { trigger: string; sql: string } {
-  const trigger = `${CHANGE_TRIGGER_PREFIX}${name}_${event.toLowerCase()}`;
-  return {
-    trigger,
-    sql: `CREATE TRIGGER ${quoteIdent(trigger)} AFTER ${event} ON ${quoteIdent(name)} BEGIN UPDATE ${quoteIdent(CHANGES_TABLE)} SET "changed" = 1 WHERE "table" = ${sqlLiteral(name)} AND "changed" = 0; END`,
-  };
-}
-
-/**
- * Gives `name` exactly Vex's three change triggers and a row to flag.
- * A trigger whose definition differs (one that followed a renamed
- * table keeps its old name and body) is dropped; one already right is
- * left alone, so starting an unchanged schema writes nothing.
- */
-function ensureChangeTriggers(db: SqliteDriver, name: string): void {
-  db.prepare(
-    `INSERT OR IGNORE INTO ${quoteIdent(CHANGES_TABLE)} ("table") VALUES (?)`,
-  ).run(name);
-  const expected = new Map(
-    CHANGE_TRIGGER_EVENTS.map((event) => {
-      const { trigger, sql } = changeTriggerSql(name, event);
-      return [trigger, sql];
-    }),
-  );
-  const existing = db
-    .prepare(
-      "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? AND substr(name, 1, ?) = ?",
-    )
-    .all(name, CHANGE_TRIGGER_PREFIX.length, CHANGE_TRIGGER_PREFIX) as {
-    name: string;
-    sql: string;
-  }[];
-  for (const trigger of existing) {
-    if (expected.get(trigger.name) === trigger.sql) {
-      expected.delete(trigger.name);
-    } else {
-      db.exec(`DROP TRIGGER ${quoteIdent(trigger.name)}`);
-    }
-  }
-  for (const sql of expected.values()) db.exec(sql);
 }
 
 // Renames columns in place and updates `existing` to match, so the
@@ -563,9 +506,6 @@ export function ensureSqliteTable(
     db.exec(
       'CREATE TABLE IF NOT EXISTS "__vex_sqlite_indexes" ("table" TEXT NOT NULL, "name" TEXT NOT NULL, PRIMARY KEY ("table", "name"))',
     );
-    db.exec(
-      `CREATE TABLE IF NOT EXISTS ${quoteIdent(CHANGES_TABLE)} ("table" TEXT PRIMARY KEY, "changed" INTEGER NOT NULL DEFAULT 0)`,
-    );
     // Renames run first so every later step sees the new names. Until
     // the table is renamed, its explicit indexes count as another
     // table's, so index names are checked after it.
@@ -694,44 +634,110 @@ export function ensureSqliteTable(
         'INSERT OR IGNORE INTO "__vex_sqlite_indexes" ("table", "name") VALUES (?, ?)',
       ).run(name, idxName);
     }
-    // Last, so a rebuild above (which drops the table and its triggers)
-    // is followed by fresh ones.
-    ensureChangeTriggers(db, name);
     return renamedFrom;
   });
+}
+
+/** One instruction of a compiled statement, as `EXPLAIN` lists it. */
+export interface ExplainRow {
+  opcode: string;
+  p1: number;
+  p2: number;
+  p3: number;
+}
+
+/**
+ * How an adapter shows SQLite's compiled form of a statement. Neither
+ * call runs the statement.
+ */
+export interface SqliteIntrospection {
+  /** The program of one statement, as `EXPLAIN` lists it. */
+  explain(statement: string): ExplainRow[];
+  /** The root page of every table and index in the main database. */
+  rootPages(): { rootpage: number; tbl_name: string }[];
+}
+
+// The cursors a program opens on stored tables. `Clear` is DELETE
+// without WHERE (the truncate optimization); its root page is p1.
+const WRITE_OPCODES = new Set(["OpenWrite", "Clear"]);
+const READ_OPCODES = new Set(["OpenRead", "ReopenIdx", "OpenWrite", "Clear"]);
+// A virtual table's reads and writes go through its module, not cursors
+// the program opens: nothing exact can be said.
+const VIRTUAL_OPCODES = new Set(["VOpen", "VUpdate"]);
+const SCHEMA_ROOT_PAGE = 1;
+const ANALYSIS_CACHE_SIZE = 512;
+
+/** What a write statement writes, from its compiled program. */
+export interface WriteAnalysis {
+  /** The tables it writes; null when SQLite cannot say (every table). */
+  tables: string[] | null;
+  /**
+   * No trigger or foreign-key action runs in it, so every row it changes
+   * is its own.
+   */
+  direct: boolean;
+  /** How many statements its text holds. */
+  statements: number;
+}
+
+/** A Map that forgets its oldest entry past `capacity`. */
+class BoundedMap<K, V> extends Map<K, V> {
+  constructor(private readonly capacity: number) {
+    super();
+  }
+  override set(key: K, value: V): this {
+    super.set(key, value);
+    if (this.size > this.capacity) {
+      this.delete(this.keys().next().value as K);
+    }
+    return this;
+  }
 }
 
 /**
  * What a SQLite adapter tracks beside its database: the schema each
  * table was last ensured with, and the tables changed since the engine
- * last asked. A rollback restores both, since it undoes the writes and
- * migrations they describe.
+ * last asked.
+ *
+ * Which tables a statement reads or writes comes from SQLite: its
+ * compiled program, as `EXPLAIN` lists it, opens a cursor on every table
+ * it touches, including those its triggers and foreign-key actions
+ * write. That depends on the statement's text and the schema, never on
+ * its parameters, so each text is compiled once and remembered until
+ * the schema changes. A write marks its tables when it changed any row.
+ *
+ * Each changed table is attributed while every write to it changed
+ * only rows the write names: a query-builder statement no trigger or
+ * foreign-key action runs in. Raw SQL, or a write that runs one, leaves
+ * it unattributed: which of its rows changed is unknown.
+ *
+ * Writes inside a transaction wait in `pending` and join the changed
+ * set at commit, so nothing reports a write that may yet roll back.
  */
 export class SqliteAdapterState {
   readonly schemas = new Map<string, TableSchema>();
-  private readonly changed = new Set<string>();
+  // Table → attributed, for the changes since the engine last asked.
+  private readonly changed = new Map<string, boolean>();
+  // The open transaction's writes; one Map, reused.
+  private readonly pendingTables = new Map<string, boolean>();
+  private pending: Map<string, boolean> | null = null;
+  // While a transaction is open, each schema it replaces, to put back on
+  // rollback.
+  private readonly schemaUndo: [string, TableSchema | undefined][] = [];
+  private readonly writes = new BoundedMap<string, WriteAnalysis>(
+    ANALYSIS_CACHE_SIZE,
+  );
+  private readonly reads = new BoundedMap<string, string[] | null>(
+    ANALYSIS_CACHE_SIZE,
+  );
+  private roots: Map<number, string> | null = null;
+  private dataVersion: number | undefined;
+  private schemaEpoch = 0;
 
-  /**
-   * Moves the tables the change triggers flagged into the changed set,
-   * clearing their flags. Run it where the writes are final: at the end
-   * of the outermost transaction, inside it so the cleared flags commit
-   * with the writes, or after a write made outside any transaction.
-   */
-  collectChanges(db: SqliteDriver): void {
-    if (this.schemas.size === 0) return;
-    // A read, then a clear only when something was flagged: a fraction of
-    // the cost of UPDATE … RETURNING, and no write at all when nothing
-    // changed.
-    const rows = db
-      .prepare(
-        `SELECT "table" FROM ${quoteIdent(CHANGES_TABLE)} WHERE "changed" = 1`,
-      )
-      .all() as { table: string }[];
-    if (rows.length === 0) return;
-    db.prepare(
-      `UPDATE ${quoteIdent(CHANGES_TABLE)} SET "changed" = 0 WHERE "changed" = 1`,
-    ).run();
-    for (const row of rows) this.changed.add(row.table);
+  /** Moves whenever the schema does: an analysis from an older epoch is
+   *  stale. */
+  get epoch(): number {
+    return this.schemaEpoch;
   }
 
   registerSchema(
@@ -739,26 +745,201 @@ export class SqliteAdapterState {
     schema: TableSchema,
     renamedFrom: string | undefined,
   ): void {
+    if (this.pending !== null) {
+      this.schemaUndo.push([name, this.schemas.get(name)]);
+      if (renamedFrom !== undefined) {
+        this.schemaUndo.push([renamedFrom, this.schemas.get(renamedFrom)]);
+      }
+    }
     if (renamedFrom !== undefined) this.schemas.delete(renamedFrom);
     this.schemas.set(name, schema);
+    this.schemaChanged();
   }
 
-  /** The tables changed since the last call. */
-  takeChanged(): string[] {
-    const tables = [...this.changed];
+  /** Forgets every compiled statement: the schema they depend on moved. */
+  schemaChanged(): void {
+    this.schemaEpoch++;
+    this.writes.clear();
+    this.reads.clear();
+    this.roots = null;
+  }
+
+  /**
+   * What `sql` writes. Compiling a statement resets SQLite's
+   * `changes()`, so a caller that counts rows asks before running it.
+   */
+  written(introspection: SqliteIntrospection, sql: string): WriteAnalysis {
+    let analysis = this.writes.get(sql);
+    if (analysis === undefined) {
+      const indirect = { found: false };
+      const tables = this.analyze(introspection, sql, WRITE_OPCODES, indirect);
+      analysis = {
+        tables,
+        direct: tables !== null && !indirect.found,
+        statements: splitStatements(sql).length,
+      };
+      this.writes.set(sql, analysis);
+    }
+    return analysis;
+  }
+
+  /**
+   * Marks `tables` (null: every table) as changed by a write. A write is
+   * `attributed` when it changed only rows it names.
+   */
+  markChanged(tables: string[] | null, attributed: boolean): void {
+    const target = this.pending ?? this.changed;
+    if (tables === null) {
+      for (const table of this.schemas.keys()) target.set(table, false);
+      return;
+    }
+    for (let i = 0; i < tables.length; i++) {
+      const table = tables[i];
+      if (!attributed) target.set(table, false);
+      else if (!target.has(table)) target.set(table, true);
+    }
+  }
+
+  /**
+   * The tables `sql` reads as last analyzed for this schema: null when
+   * SQLite could not say, undefined when not analyzed yet.
+   */
+  cachedTablesRead(sql: string): string[] | null | undefined {
+    return this.reads.get(sql);
+  }
+
+  /** The tables `sql` reads; undefined when SQLite cannot say. */
+  tablesRead(
+    introspection: SqliteIntrospection,
+    sql: string,
+  ): string[] | undefined {
+    let tables = this.reads.get(sql);
+    if (tables === undefined) {
+      tables = this.analyze(introspection, sql, READ_OPCODES);
+      this.reads.set(sql, tables);
+    }
+    return tables ?? undefined;
+  }
+
+  /**
+   * The tables every cursor of `opcodes` in `sql`'s statements opens, or
+   * null when one cannot be named: a statement that does not compile, a
+   * virtual table, or a cursor on another database (TEMP, ATTACH).
+   */
+  private analyze(
+    introspection: SqliteIntrospection,
+    sql: string,
+    opcodes: Set<string>,
+    indirect?: { found: boolean },
+  ): string[] | null {
+    const tables = new Set<string>();
+    for (const statement of splitStatements(sql)) {
+      if (!changesRows(statement)) continue;
+      let program: ExplainRow[];
+      try {
+        program = introspection.explain(statement);
+      } catch {
+        return null;
+      }
+      for (const { opcode, p1, p2, p3 } of program) {
+        if (VIRTUAL_OPCODES.has(opcode)) return null;
+        // A trigger's or foreign-key action's program.
+        if (opcode === "Program" && indirect) indirect.found = true;
+        if (!opcodes.has(opcode)) continue;
+        const [root, database] = opcode === "Clear" ? [p1, p2] : [p2, p3];
+        if (database !== 0) return null;
+        if (root === SCHEMA_ROOT_PAGE) continue;
+        const table = this.rootTable(introspection, root);
+        if (table === undefined) return null;
+        tables.add(table);
+      }
+    }
+    return [...tables];
+  }
+
+  private rootTable(
+    introspection: SqliteIntrospection,
+    root: number,
+  ): string | undefined {
+    const known = this.roots?.get(root);
+    if (known !== undefined) return known;
+    this.roots = new Map(
+      introspection.rootPages().map((row) => [row.rootpage, row.tbl_name]),
+    );
+    return this.roots.get(root);
+  }
+
+  /** Starts the outermost transaction: its writes wait for commit. */
+  begin(): void {
+    this.pendingTables.clear();
+    this.pending = this.pendingTables;
+  }
+
+  /** Commits the outermost transaction: its writes count as changed. */
+  commit(): void {
+    this.pendingTables.forEach((attributed, table) => {
+      this.changed.set(table, attributed && this.changed.get(table) !== false);
+    });
+    this.pendingTables.clear();
+    this.pending = null;
+    this.schemaUndo.length = 0;
+  }
+
+  /**
+   * The tables changed since the last call. `dataVersion`, where other
+   * connections can write, is SQLite's `PRAGMA data_version` on the
+   * adapter's writing connection, which moves when another connection
+   * commits: then what it wrote is unknown, so every table counts,
+   * unattributed, and compiled statements are forgotten in case it
+   * changed the schema.
+   */
+  takeChanged(dataVersion?: number): {
+    tables: string[];
+    unattributed: string[];
+  } {
+    if (
+      dataVersion !== undefined &&
+      this.dataVersion !== undefined &&
+      dataVersion !== this.dataVersion
+    ) {
+      this.schemaChanged();
+      for (const table of this.schemas.keys()) this.changed.set(table, false);
+    }
+    this.dataVersion = dataVersion;
+    const tables: string[] = [];
+    const unattributed: string[] = [];
+    this.changed.forEach((attributed, table) => {
+      tables.push(table);
+      if (!attributed) unattributed.push(table);
+    });
     this.changed.clear();
-    return tables;
+    return { tables, unattributed };
   }
 
-  /** Returns a function that restores the state as it is now. */
+  /**
+   * Returns a function that restores the schemas and the pending writes
+   * as they are now: a rollback undoes the migrations and writes they
+   * describe. Taken before `begin()` (an outermost transaction) it ends
+   * the transaction; taken inside one (a savepoint), it rolls back to
+   * there.
+   */
   snapshot(): () => void {
-    const changed = new Set(this.changed);
-    const schemas = new Map(this.schemas);
+    const undo = this.schemaUndo.length;
+    const pending = this.pending && new Map(this.pending);
     return () => {
-      this.changed.clear();
-      for (const table of changed) this.changed.add(table);
-      this.schemas.clear();
-      for (const [table, schema] of schemas) this.schemas.set(table, schema);
+      if (this.schemaUndo.length > undo) {
+        while (this.schemaUndo.length > undo) {
+          const [table, schema] = this.schemaUndo.pop()!;
+          if (schema === undefined) this.schemas.delete(table);
+          else this.schemas.set(table, schema);
+        }
+        this.schemaChanged();
+      }
+      this.pendingTables.clear();
+      pending?.forEach((attributed, table) => {
+        this.pendingTables.set(table, attributed);
+      });
+      this.pending = pending && this.pendingTables;
     };
   }
 }
@@ -767,14 +948,19 @@ export class SqliteAdapterState {
 // insertRow returns the new row's id; deleteRow the number of rows it
 // deleted.
 
+/** The rows a write changed itself: what its `run()` answered, or
+ *  `changes()`. */
+function ownChanges(db: SqliteDriver, ran: unknown): number {
+  return typeof ran === "number" ? ran : db.changes();
+}
+
 /** Runs a write and answers the rows it changed itself. */
 export function runCounted(
   db: SqliteDriver,
   sql: string,
   params: any[],
 ): number {
-  db.prepare(sql).run(...params);
-  return db.changes();
+  return ownChanges(db, db.prepare(sql).run(...params));
 }
 
 export function insertRow(
@@ -803,7 +989,8 @@ export function updateRow(
 }
 
 export function deleteRow(db: SqliteDriver, table: string, id: string): number {
-  return runCounted(db, `DELETE FROM ${quoteIdent(table)} WHERE _id = ?`, [id]);
+  const sql = `DELETE FROM ${quoteIdent(table)} WHERE _id = ?`;
+  return ownChanges(db, db.prepare(sql).run(id));
 }
 
 /** Updates the row matching `keys` with `data`, or inserts both. */

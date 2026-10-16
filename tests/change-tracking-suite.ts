@@ -2,14 +2,13 @@
  * Change tracking and raw-SQL table sets, run on every SQLite adapter
  * (Bun in memory and on a file, and a Durable Object in workerd).
  *
- * Writes: the adapters' triggers record every table a write changes,
- * however it is made — query builder, raw SQL of any shape, a trigger,
- * a foreign-key cascade — and only once the write is final: at commit,
- * never for a rolled-back transaction.
+ * Writes: every table a write changes is reported, however it is made
+ * — query builder, raw SQL of any shape or of several statements, a
+ * trigger, a foreign-key cascade — and only once the write is final: at
+ * commit, never for a rolled-back transaction.
  *
- * Reads: a raw read depends on, and is refused for, every registered
- * table it names in any spelling, and every table a view it names
- * reads.
+ * Reads: a raw read depends on, and is refused for, exactly the
+ * registered tables it reads, in any spelling, through views of views.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -34,13 +33,6 @@ async function changedBy(
   adapter.getChangedTables();
   await write();
   return adapter.getChangedTables().sort();
-}
-
-async function triggerRows(adapter: StorageAdapter, table: string) {
-  return adapter.rawQuery<{ rowid: number; name: string }>(
-    "SELECT rowid, name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
-    table,
-  );
 }
 
 export function changeTrackingSuite(name: string, create: CreateStorage) {
@@ -92,6 +84,19 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
       ).toEqual(["a"]);
     });
 
+    test("raw SQL of several statements reports each one's tables, and runs once", async () => {
+      const adapter = await adapterWith("a", "b");
+      expect(
+        await changedBy(adapter, () =>
+          adapter.rawExec(
+            "INSERT INTO a (_id, scope, name) VALUES ('1', 's;', 'x'); -- ; not a statement\n INSERT INTO b (_id, scope, name) VALUES ('1', 's', 'y');",
+          ),
+        ),
+      ).toEqual(["a", "b"]);
+      expect(await adapter.query("a").count()).toBe(1);
+      expect(await adapter.query("b").count()).toBe(1);
+    });
+
     test("a write that changes no row, and a read, report nothing", async () => {
       const adapter = await adapterWith("a");
       expect(
@@ -120,7 +125,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
         ),
       ).toEqual(["a"]);
       adapter.getChangedTables();
-      // The change trigger's own write is not one of the statement's rows.
+      // Only the statement's own rows count.
       expect(await adapter.query("a").where("scope", "=", "s").delete()).toBe(
         2,
       );
@@ -147,11 +152,52 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
       ).rejects.toThrow("roll back");
       expect(adapter.getChangedTables()).toEqual([]);
       expect(await adapter.query("a").count()).toBe(1);
-      // The rolled-back flag is gone, not waiting for the next commit.
+      // The rolled-back write is gone, not waiting for the next commit.
       await adapter.transaction(async () => {
         await adapter.insert("b", { scope: "s", name: "z" });
       });
       expect(adapter.getChangedTables()).toEqual(["b"]);
+      // And a write outside a transaction, after a rollback, is reported
+      // at once.
+      await expect(
+        adapter.transaction(async () => {
+          throw new Error("roll back");
+        }),
+      ).rejects.toThrow("roll back");
+      await adapter.insert("a", { scope: "s", name: "w" });
+      expect(adapter.getChangedTables()).toEqual(["a"]);
+    });
+
+    test("a write counts only its own rows, whatever its triggers write", async () => {
+      const adapter = await adapterWith("a", "b");
+      await adapter.rawExec(
+        "CREATE TRIGGER log_a AFTER DELETE ON a BEGIN INSERT INTO b (_id, scope, name) VALUES (OLD._id || '-gone', OLD.scope, OLD.name); END",
+      );
+      await adapter.insert("a", { _id: "1", scope: "s", name: "x" });
+      await adapter.insert("a", { _id: "2", scope: "s", name: "y" });
+      adapter.getChangedTables();
+      expect(await adapter.delete("a", "missing")).toBe(false);
+      expect(await adapter.query("a").where("_id", "=", "1").delete()).toBe(1);
+      expect(adapter.getChangedTables()).toEqual(["a", "b"]);
+      expect(await adapter.delete("a", "2")).toBe(true);
+      expect(await adapter.query("b").count()).toBe(2);
+    });
+
+    test("a trigger created after a statement first ran is seen by it", async () => {
+      const adapter = await adapterWith("a", "b");
+      expect(
+        await changedBy(adapter, () =>
+          adapter.insert("a", { scope: "s", name: "x" }),
+        ),
+      ).toEqual(["a"]);
+      await adapter.rawExec(
+        "CREATE TRIGGER copy_a_later AFTER INSERT ON a BEGIN INSERT INTO b (_id, scope, name) VALUES (NEW._id, NEW.scope, NEW.name); END",
+      );
+      expect(
+        await changedBy(adapter, () =>
+          adapter.insert("a", { scope: "s", name: "y" }),
+        ),
+      ).toEqual(["a", "b"]);
     });
 
     test("a write made by a trigger reports the table it wrote", async () => {
@@ -186,17 +232,15 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
       expect(await adapter.query("children").count()).toBe(0);
     });
 
-    test("a renamed table is tracked under its new name only", async () => {
+    test("a renamed table is tracked under its new name", async () => {
       const adapter = await adapterWith("old_items");
+      await adapter.rawExec(
+        "INSERT INTO old_items (_id, scope, name) VALUES ('0', 's', 'x')",
+      );
       await adapter.ensureTable("items", {
         columns,
         renamedFrom: ["old_items"],
       });
-      expect((await triggerRows(adapter, "items")).map((t) => t.name)).toEqual([
-        "__vex_changes_items_delete",
-        "__vex_changes_items_insert",
-        "__vex_changes_items_update",
-      ]);
       expect(
         await changedBy(adapter, () =>
           adapter.rawExec(
@@ -205,17 +249,8 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
         ),
       ).toEqual(["items"]);
       expect(
-        await adapter.rawQuery(
-          'SELECT "table" FROM __vex_changes ORDER BY "table"',
-        ),
-      ).toEqual([{ table: "items" }]);
-    });
-
-    test("ensuring an unchanged table leaves its triggers as they are", async () => {
-      const adapter = await adapterWith("a");
-      const before = await triggerRows(adapter, "a");
-      await adapter.ensureTable("a", { columns });
-      expect(await triggerRows(adapter, "a")).toEqual(before);
+        await changedBy(adapter, () => adapter.delete("items", "0")),
+      ).toEqual(["items"]);
     });
 
     test("a table rebuilt by a migration is still tracked", async () => {
@@ -224,27 +259,33 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
       await adapter.ensureTable("a", {
         columns: { ...columns, n: { type: "string", optional: true } },
       });
-      expect((await triggerRows(adapter, "a")).length).toBe(3);
       expect(
         await changedBy(adapter, () => adapter.rawExec("UPDATE a SET n = 'x'")),
       ).toEqual(["a"]);
     });
 
-    test("a write to a table Vex does not manage reports nothing and does not fail", async () => {
+    test("a statement keeps being tracked across rebuilds of its table", async () => {
+      const adapter = await adapterWith("a");
+      for (const type of ["string", "number", "string"] as const) {
+        expect(
+          await changedBy(adapter, () =>
+            adapter.insert("a", { scope: "s", name: "x" }),
+          ),
+        ).toEqual(["a"]);
+        await adapter.ensureTable("a", {
+          columns: { ...columns, n: { type, optional: true } },
+        });
+      }
+    });
+
+    test("a write to a table created by raw SQL is reported by its name", async () => {
       const adapter = await adapterWith("a");
       await adapter.rawExec("CREATE TABLE loose (v TEXT)");
       expect(
         await changedBy(adapter, () =>
           adapter.rawExec("INSERT INTO loose VALUES ('x')"),
         ),
-      ).toEqual([]);
-    });
-
-    test("the change table's name is reserved", async () => {
-      const adapter = await create();
-      expect(() => adapter.ensureTable("__vex_changes", { columns })).toThrow(
-        "reserved",
-      );
+      ).toEqual(["loose"]);
     });
   });
 
@@ -264,7 +305,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
         api.registerTable("items", { columns });
         api.registerTable("other", { columns: { v: { type: "string" } } });
         api.registerTable("secrets", {
-          columns: { v: { type: "string" } },
+          columns: { v: { type: "string", index: true } },
           access: { prepare: () => UNRESTRICTED, row: () => true },
         });
         api.registerQuery("scope", {
@@ -322,6 +363,17 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
         api.registerMutation("addOther", {
           args: {},
           handler: (ctx) => ctx.db.table("other").insert({ v: "x" }),
+        });
+        api.registerMutation("addBAndOther", {
+          args: { raw: "boolean" },
+          async handler(ctx, args) {
+            await ctx.db.table("items").insert({ scope: "b", name: "b1" });
+            if (args.raw) {
+              await ctx.db.sql("INSERT INTO other (_id, v) VALUES ('o', 'x')");
+            } else {
+              await ctx.db.table("other").insert({ v: "x" });
+            }
+          },
         });
         api.registerMutation("addBAndTouchA", {
           args: {},
@@ -398,6 +450,33 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
         const c = runs["scope:c"];
         await vex.mutate("ct.add", { scope: "b", name: "b2" });
         expect(runs["scope:c"]).toBe(c);
+      });
+    });
+
+    test("rows a trigger writes are never narrowed away, whichever table fired it", async () => {
+      for (const on of ["other", "items"]) {
+        await withFixture(async ({ vex, runs }) => {
+          await vex.unsafeSql(
+            `CREATE TRIGGER touch_a_from_${on} AFTER INSERT ON ${on} BEGIN UPDATE items SET n = coalesce(n, 0) + 1 WHERE scope = 'a'; END`,
+          );
+          await vex.subscribe("ct.scope", { scope: "a" }, () => {});
+          const before = runs["scope:a"];
+          // Its own rows are scope "b" and an "other" row; the trigger's
+          // are scope "a".
+          await vex.mutate("ct.addBAndOther", { raw: false });
+          expect([on, runs["scope:a"]]).toEqual([on, before + 1]);
+          // A Durable Object test keeps one database across both rounds.
+          await vex.unsafeSql(`DROP TRIGGER touch_a_from_${on}`);
+        });
+      }
+    });
+
+    test("a raw write to one table leaves narrowing on the others", async () => {
+      await withFixture(async ({ vex, runs }) => {
+        await vex.subscribe("ct.scope", { scope: "c" }, () => {});
+        const before = runs["scope:c"];
+        await vex.mutate("ct.addBAndOther", { raw: true });
+        expect(runs["scope:c"]).toBe(before);
       });
     });
 
@@ -522,14 +601,35 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           "SELECT * FROM 'secrets'",
           "SELECT * FROM Secrets",
           "SELECT * FROM leak_2",
+          // Answered from the index alone: no cursor on the table itself.
+          "SELECT v FROM secrets WHERE v > ''",
         ]) {
           await expect(vex.query("ct.raw", { sql })).rejects.toThrow(
             /access-governed table "secrets"/,
           );
         }
-        expect(
-          await vex.query("ct.raw", { sql: "SELECT COUNT(*) AS c FROM items" }),
-        ).toEqual([{ c: 1 }]);
+        // A literal or column spelled like a governed table reads nothing
+        // from it: allowed, the first time and from the cache.
+        for (let i = 0; i < 2; i++) {
+          expect(
+            await vex.query("ct.raw", {
+              sql: "SELECT COUNT(*) AS c FROM items WHERE name <> 'secrets'",
+            }),
+          ).toEqual([{ c: 1 }]);
+        }
+      });
+    });
+
+    test("a raw read of a table created by raw SQL re-runs when it is written", async () => {
+      await withFixture(async ({ vex, runs }) => {
+        await vex.unsafeSql("CREATE TABLE loose (v TEXT)");
+        const sql = "SELECT count(*) AS c FROM loose";
+        await vex.subscribe("ct.raw", { sql }, () => {});
+        const before = runs[`raw:${sql}`];
+        await vex.mutate("ct.addOther", {});
+        expect(runs[`raw:${sql}`]).toBe(before);
+        await vex.mutate("ct.raw", { sql: "INSERT INTO loose VALUES ('x')" });
+        expect(runs[`raw:${sql}`]).toBe(before + 1);
       });
     });
 

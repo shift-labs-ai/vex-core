@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
-  isReadOnlyStatement,
   leadingSqlKeyword,
+  mayChangeSchema,
   sqlAfterLeadingComments,
+  statementKind,
 } from "../core/sql-text.js";
 import type { StorageAdapter } from "../core/storage.js";
 import type { TableSchema } from "../core/types.js";
@@ -11,13 +12,17 @@ import { createQueryBuilder, type DbExec } from "./shared.js";
 import {
   bulkInsertRows,
   deleteRow,
+  type ExplainRow,
   ensureSqliteTable,
   insertRow,
   runCounted,
   SqliteAdapterState,
   type SqliteDriver,
+  type SqliteIntrospection,
+  type SqliteStatement,
   updateRow,
   upsertRow,
+  type WriteAnalysis,
 } from "./sqlite-core.js";
 
 type PreparedStatement = ReturnType<Database["prepare"]>;
@@ -77,7 +82,7 @@ const SQLITE_STATEMENT_CACHE_SIZE = 64;
 function wrapSync(
   writer: SqliteDriver,
   state: SqliteAdapterState,
-  write: <T>(fn: () => T) => Promise<T>,
+  withConnectionLock: <T>(fn: () => Promise<T> | T) => Promise<T>,
   withReadConnection: <T>(
     fn: (connection: SqliteConnection) => T,
   ) => Promise<T>,
@@ -92,7 +97,9 @@ function wrapSync(
       );
     },
     async run(sql, params) {
-      return write(() => ({ changes: runCounted(writer, sql, params) }));
+      return withConnectionLock(() => ({
+        changes: runCounted(writer, sql, params),
+      }));
     },
   };
 }
@@ -157,12 +164,6 @@ function changesConnectionLocalState(sql: string): boolean {
   );
 }
 
-function mayChangeSchema(sql: string): boolean {
-  return /(?:^|;)\s*(?:CREATE|ALTER|DROP|REINDEX|VACUUM|ATTACH|DETACH)\b/i.test(
-    sqlAfterLeadingComments(sql),
-  );
-}
-
 export function sqliteAdapter(
   path: string = ":memory:",
   opts?: SqliteOptions,
@@ -199,9 +200,6 @@ export function sqliteAdapter(
   const readWaiters: Array<Waiter<ReadConnection>> = [];
   let nextReadConnection = 0;
   let writerReadsRequired = false;
-  // True between the writer's BEGIN and its COMMIT or ROLLBACK: a write
-  // then belongs to the transaction, whose commit collects its changes.
-  let transactionOpen = false;
   let closed = false;
 
   function closedError(): Error {
@@ -315,37 +313,176 @@ export function sqliteAdapter(
     }
   }
 
-  // Writes and migrations run on the writer, under the connection lock
-  // or, for ensureTable, synchronously between awaits.
-  const writerDriver: SqliteDriver = {
+  // Shows a statement's compiled program on `connection` without running
+  // it, or caching the EXPLAIN among the connection's hot statements.
+  function introspection(connection: Database): SqliteIntrospection {
+    const all = (sql: string) => {
+      const statement = connection.prepare(sql);
+      try {
+        return statement.all();
+      } finally {
+        statement.finalize();
+      }
+    };
+    return {
+      explain: (statement) => all(`EXPLAIN ${statement}`) as ExplainRow[],
+      rootPages: () =>
+        all(
+          "SELECT rootpage, tbl_name FROM sqlite_master WHERE rootpage > 0",
+        ) as { rootpage: number; tbl_name: string }[],
+    };
+  }
+  const writerIntrospection = introspection(db);
+
+  // Counters read around writes: prepared once, outside the LRU cache of
+  // the connection's SQL. Bun's `run().changes` is the connection's
+  // total-changes delta, which also counts rows triggers and foreign-key
+  // actions wrote; SQLite's `changes()` counts the statement's own rows.
+  const counters = {
+    own: db.prepare("SELECT changes() AS value"),
+    total: db.prepare("SELECT total_changes() AS value"),
+    dataVersion: db.prepare("PRAGMA data_version"),
+  };
+  const ownChanges = () => (counters.own.get() as { value: number }).value;
+  const totalChanges = () => (counters.total.get() as { value: number }).value;
+  // Another connection can only commit to a database with a file, or a
+  // shared-cache memory one; a private memory database has no other.
+  const dataVersion = () =>
+    path === ":memory:" || path === ""
+      ? undefined
+      : (counters.dataVersion.get() as { data_version: number }).data_version;
+
+  // Migrations run on the writer, synchronously between awaits; their
+  // bookkeeping writes are not changes anyone subscribes to.
+  const migrationDriver: SqliteDriver = {
     prepare: (sql) => writer.statements.prepare(sql),
-    // Bun's `run().changes` is the connection's total-changes delta, which
-    // also counts rows triggers wrote; SQLite's `changes()` does not.
-    changes: () =>
-      (
-        writer.statements.prepare("SELECT changes() AS c").get() as {
-          c: number;
-        }
-      ).c,
+    changes: ownChanges,
     exec: (sql) => db.exec(sql),
     atomically: (fn) => db.transaction(fn)(),
   };
-
-  // A write on the writer, under the lock. Its triggers' flags are
-  // collected where it is final: by the open transaction at commit, or
-  // here, after it ran alone. A failed statement may still leave earlier
-  // statements of a multi-statement exec applied, so collect regardless.
-  function write<T>(fn: () => T): Promise<T> {
-    return withConnectionLock(() => {
-      try {
-        return fn();
-      } finally {
-        if (!transactionOpen) state.collectChanges(writerDriver);
+  // Row writes run on the writer under the connection lock. Each prepared
+  // statement gets one tracked form, holding what it writes for the
+  // current schema: a write that changed any row, or any its triggers
+  // wrote, marks those tables.
+  interface TrackedStatement extends SqliteStatement {
+    /** Runs raw SQL that is one statement. */
+    runRaw(...params: any[]): void;
+    /** Runs raw SQL that is a single INSERT, UPDATE, DELETE or REPLACE,
+     *  for its rows. */
+    allWritten(...params: any[]): any[];
+  }
+  const tracked = new WeakMap<PreparedStatement, TrackedStatement>();
+  function trackedStatement(
+    sql: string,
+    statement: PreparedStatement,
+  ): TrackedStatement {
+    let epoch = -1;
+    let analysis: WriteAnalysis = {
+      tables: null,
+      direct: false,
+      statements: 0,
+    };
+    const returnsRows = statement.columnNames.length > 0;
+    // Before running: compiling for analysis resets `changes()`.
+    const analyzed = () => {
+      if (epoch !== state.epoch) {
+        analysis = state.written(writerIntrospection, sql);
+        epoch = state.epoch;
       }
-    });
+      return analysis;
+    };
+    return {
+      all: (...params) => statement.all(...params),
+      get: (...params) => statement.get(...params),
+      run: (...params) => {
+        const { tables, direct } = analyzed();
+        // The connection's total-changes delta: the statement's own rows
+        // when no trigger or foreign-key action ran in it.
+        const { changes } = statement.run(...params);
+        if (changes > 0) state.markChanged(tables, direct);
+        return direct ? changes : undefined;
+      },
+      runRaw: (...params) => {
+        const { tables } = analyzed();
+        if (statement.run(...params).changes > 0) {
+          state.markChanged(tables, false);
+        }
+      },
+      allWritten: (...params) => {
+        const { tables } = analyzed();
+        // Without RETURNING there are no rows to read, and `run()` counts
+        // the changes for free.
+        if (!returnsRows) {
+          if (statement.run(...params).changes > 0) {
+            state.markChanged(tables, false);
+          }
+          return [];
+        }
+        const rows = statement.all(...params);
+        // Its triggers only run for rows it changed itself.
+        if (ownChanges() > 0) state.markChanged(tables, false);
+        return rows;
+      },
+    };
+  }
+  function trackedPrepare(sql: string): TrackedStatement {
+    const statement = writer.statements.prepare(sql);
+    let entry = tracked.get(statement);
+    if (entry === undefined) {
+      entry = trackedStatement(sql, statement);
+      tracked.set(statement, entry);
+    }
+    return entry;
+  }
+  const writerDriver: SqliteDriver = {
+    ...migrationDriver,
+    prepare: trackedPrepare,
+  };
+
+  // Raw SQL on the writer: what it changed comes from the connection's
+  // total changes, since a raw statement may run as several.
+  function rawWrite<T>(sql: string, run: () => T): T {
+    const before = totalChanges();
+    try {
+      return run();
+    } finally {
+      if (mayChangeSchema(sql)) {
+        clearStatementCaches();
+        state.schemaChanged();
+      }
+      if (totalChanges() > before) {
+        state.markChanged(
+          state.written(writerIntrospection, sql).tables,
+          false,
+        );
+      }
+    }
   }
 
-  const exec = wrapSync(writerDriver, state, write, withReadConnection);
+  const exec = wrapSync(
+    writerDriver,
+    state,
+    withConnectionLock,
+    withReadConnection,
+  );
+  // The baseline other connections' commits are measured from.
+  state.takeChanged(dataVersion());
+
+  // Compiles a read on the connection it would run on, for its tables.
+  async function analyzeRead(sql: string): Promise<string[] | undefined> {
+    if (readsUseWriter()) {
+      return withConnectionLock(() =>
+        state.tablesRead(writerIntrospection, sql),
+      );
+    }
+    const connection = await acquireReadConnection();
+    try {
+      if (closed) throw closedError();
+      return state.tablesRead(introspection(connection.db), sql);
+    } finally {
+      releaseReadConnection(connection);
+    }
+  }
 
   return {
     name: "sqlite",
@@ -355,7 +492,7 @@ export function sqliteAdapter(
         state.registerSchema(
           name,
           schema,
-          ensureSqliteTable(writerDriver, name, schema),
+          ensureSqliteTable(migrationDriver, name, schema),
         );
       } finally {
         // Bun caches each statement's column list at prepare time.
@@ -364,7 +501,7 @@ export function sqliteAdapter(
     },
 
     async insert(table: string, row: Record<string, any>): Promise<string> {
-      return write(() => insertRow(writerDriver, table, row));
+      return withConnectionLock(() => insertRow(writerDriver, table, row));
     },
 
     async upsert(
@@ -372,7 +509,9 @@ export function sqliteAdapter(
       keys: Record<string, any>,
       data: Record<string, any>,
     ): Promise<void> {
-      await write(() => upsertRow(writerDriver, table, keys, data));
+      await withConnectionLock(() =>
+        upsertRow(writerDriver, table, keys, data),
+      );
     },
 
     async update(
@@ -380,11 +519,11 @@ export function sqliteAdapter(
       id: string,
       data: Record<string, any>,
     ): Promise<void> {
-      await write(() => updateRow(writerDriver, table, id, data));
+      await withConnectionLock(() => updateRow(writerDriver, table, id, data));
     },
 
     async delete(table: string, id: string): Promise<boolean> {
-      return write(() => deleteRow(writerDriver, table, id) > 0);
+      return withConnectionLock(() => deleteRow(writerDriver, table, id) > 0);
     },
 
     query(table: string) {
@@ -404,20 +543,17 @@ export function sqliteAdapter(
       const context = { active: true };
       const restore = state.snapshot();
       db.exec("BEGIN");
-      transactionOpen = true;
+      state.begin();
       try {
         const result = await transactionContext.run(context, () => fn());
-        // Inside the transaction, so the cleared flags commit with the
-        // writes that set them.
-        state.collectChanges(writerDriver);
         db.exec("COMMIT");
+        state.commit();
         return result;
       } catch (e) {
         db.exec("ROLLBACK");
         restore();
         throw e;
       } finally {
-        transactionOpen = false;
         context.active = false;
         releaseWriteLock();
       }
@@ -430,10 +566,11 @@ export function sqliteAdapter(
       // A WITH statement can terminate in SELECT or in DML. Bun does not
       // expose sqlite3_stmt_readonly(), so a readonly pool connection
       // classifies it: its readonly failure retries as a write. Where reads
-      // would run on the writer anyway, it is a write from the start, so
-      // its changes are collected.
-      const ambiguous = leadingSqlKeyword(sql) === "WITH";
-      if (isReadOnlyStatement(sql) || (ambiguous && !readsUseWriter())) {
+      // would run on the writer anyway, it runs as a write from the start,
+      // so what it changes is tracked.
+      const kind = statementKind(sql);
+      const ambiguous = kind === "with";
+      if (kind === "read" || (ambiguous && !readsUseWriter())) {
         try {
           return await withReadConnection(
             (connection) =>
@@ -443,28 +580,43 @@ export function sqliteAdapter(
           if (!ambiguous || !isReadonlyError(error)) throw error;
         }
       }
-      return write(() => {
-        const rows = writer.statements.prepare(sql).all(...params) as T[];
+      return withConnectionLock(() => {
         if (changesConnectionLocalState(sql)) writerReadsRequired = true;
-        if (mayChangeSchema(sql)) clearStatementCaches();
-        return rows;
+        // A prepared statement runs alone, so a row write here is one.
+        if (kind === "write") {
+          return trackedPrepare(sql).allWritten(...params) as T[];
+        }
+        return rawWrite(
+          sql,
+          () => writer.statements.prepare(sql).all(...params) as T[],
+        );
       });
     },
 
     async rawExec(sql: string, ...params: any[]): Promise<void> {
-      await write(() => {
-        if (params.length > 0) {
-          writer.statements.prepare(sql).run(...params);
-        } else {
-          db.exec(sql);
-        }
+      await withConnectionLock(() => {
         if (
           leadingSqlKeyword(sql) === "PRAGMA" ||
           changesConnectionLocalState(sql)
         ) {
           writerReadsRequired = true;
         }
-        if (mayChangeSchema(sql)) clearStatementCaches();
+        // Bound, it runs as one prepared statement; unbound, as one when it
+        // is a single row write.
+        if (
+          params.length > 0
+            ? !mayChangeSchema(sql)
+            : statementKind(sql) === "write" &&
+              state.written(writerIntrospection, sql).statements === 1
+        ) {
+          trackedPrepare(sql).runRaw(...params);
+        } else {
+          rawWrite(sql, () =>
+            params.length > 0
+              ? writer.statements.prepare(sql).run(...params)
+              : db.exec(sql),
+          );
+        }
       });
     },
 
@@ -472,11 +624,21 @@ export function sqliteAdapter(
       table: string,
       rows: Record<string, any>[],
     ): Promise<void> {
-      await write(() => bulkInsertRows(writerDriver, table, rows));
+      await withConnectionLock(() => bulkInsertRows(writerDriver, table, rows));
     },
 
     getChangedTables(): string[] {
-      return state.takeChanged();
+      return state.takeChanged(dataVersion()).tables;
+    },
+
+    takeChanges() {
+      return state.takeChanged(dataVersion());
+    },
+
+    tablesRead(sql: string) {
+      const cached = state.cachedTablesRead(sql);
+      if (cached !== undefined) return cached ?? undefined;
+      return analyzeRead(sql);
     },
 
     getSchema(table: string) {
@@ -488,6 +650,7 @@ export function sqliteAdapter(
       closed = true;
       rejectQueuedWork();
       writer.statements.clear();
+      for (const counter of Object.values(counters)) counter.finalize();
       for (const connection of readConnections) {
         connection.statements.clear();
         connection.db.close();

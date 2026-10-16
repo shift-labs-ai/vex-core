@@ -1,64 +1,273 @@
 /**
- * What can be said about a raw SQL statement from its text alone, and
- * only what can be said soundly.
+ * What can be said about raw SQL from its text alone.
  *
- * Which tables a statement *writes* is never read from its text: the
- * adapters' triggers record that exactly (see `sqlite-core.ts`). Which
- * tables it *reads* has no exact source here — neither `bun:sqlite` nor
- * a Durable Object's SQL API exposes SQLite's authorizer — so
- * `tablesRead` over-approximates: every known table the statement
- * names, through any view it names. A name in a string literal or a
- * column of the same name counts too; a table it reads is never left
- * out.
+ * Which tables a statement reads or writes is not decided here: the
+ * SQLite adapters ask SQLite, from the statement's compiled program
+ * (`sqlite-core.ts`). This module splits text into statements and
+ * classifies them, and holds `tablesRead`, the sound fallback for an
+ * adapter that cannot compile: every known table a statement names,
+ * through any view it names. A name in a string literal or a column of
+ * the same name counts too; a table it reads is never left out.
  */
+
+/** Where `sql`'s first token starts, past whitespace and comments; -1
+ *  when nothing follows them. */
+function firstTokenOffset(sql: string): number {
+  let offset = 0;
+  while (offset < sql.length) {
+    const c = sql.charCodeAt(offset);
+    // SQLite's whitespace: space, \t, \n, \f, \r.
+    if (c === 32 || c === 9 || c === 10 || c === 12 || c === 13) {
+      offset++;
+    } else if (c === 45 && sql.charCodeAt(offset + 1) === 45) {
+      const newline = sql.indexOf("\n", offset + 2);
+      if (newline === -1) return -1;
+      offset = newline + 1;
+    } else if (c === 47 && sql.charCodeAt(offset + 1) === 42) {
+      const end = sql.indexOf("*/", offset + 2);
+      if (end === -1) return -1;
+      offset = end + 2;
+    } else {
+      return offset;
+    }
+  }
+  return -1;
+}
 
 /** `sql` from its first token, past leading whitespace and comments. */
 export function sqlAfterLeadingComments(sql: string): string {
-  let offset = 0;
-  while (offset < sql.length) {
-    while (/\s/.test(sql[offset] ?? "")) offset++;
-    if (sql.startsWith("--", offset)) {
-      const newline = sql.indexOf("\n", offset + 2);
-      if (newline === -1) return "";
-      offset = newline + 1;
-      continue;
-    }
-    if (sql.startsWith("/*", offset)) {
-      const end = sql.indexOf("*/", offset + 2);
-      if (end === -1) return "";
-      offset = end + 2;
-      continue;
-    }
-    break;
-  }
-  return sql.slice(offset);
+  const offset = firstTokenOffset(sql);
+  return offset === -1 ? "" : sql.slice(offset);
 }
 
 /** The statement's first keyword, upper-cased; "" when there is none. */
 export function leadingSqlKeyword(sql: string): string {
-  return (
-    sqlAfterLeadingComments(sql)
-      .match(/^[a-z]+/i)?.[0]
-      .toUpperCase() ?? ""
-  );
+  const start = firstTokenOffset(sql);
+  if (start === -1) return "";
+  let end = start;
+  while (end < sql.length) {
+    const letter = sql.charCodeAt(end) | 32;
+    if (letter < 97 || letter > 122) break;
+    end++;
+  }
+  return sql.slice(start, end).toUpperCase();
 }
 
 /**
- * True when the statement cannot write: it starts with SELECT, VALUES
- * or EXPLAIN. A WITH statement can end in INSERT, UPDATE or DELETE, so
- * it is not one.
+ * What a statement is, from its first keyword: a `read` (SELECT, VALUES,
+ * EXPLAIN) cannot write; a `write` (INSERT, UPDATE, DELETE, REPLACE)
+ * changes rows and always sets SQLite's `changes()`; `with` may end in
+ * either; anything else is `other` (schema, PRAGMA, transaction
+ * control).
  */
-export function isReadOnlyStatement(sql: string): boolean {
-  return ["SELECT", "VALUES", "EXPLAIN"].includes(leadingSqlKeyword(sql));
+export type StatementKind = "read" | "write" | "with" | "other";
+
+export function statementKind(sql: string): StatementKind {
+  switch (leadingSqlKeyword(sql)) {
+    case "SELECT":
+    case "VALUES":
+    case "EXPLAIN":
+      return "read";
+    case "INSERT":
+    case "UPDATE":
+    case "DELETE":
+    case "REPLACE":
+      return "write";
+    case "WITH":
+      return "with";
+    default:
+      return "other";
+  }
 }
+
+/** True when some statement in `sql` may change the schema. */
+export function mayChangeSchema(sql: string): boolean {
+  return /(?:^|;)\s*(?:CREATE|ALTER|DROP|REINDEX|VACUUM|ATTACH|DETACH)\b/i.test(
+    sqlAfterLeadingComments(sql),
+  );
+}
+
+// ─── tokens ──────────────────────────────────────────────────────────
+// Enough of SQLite's tokenizer to know where strings, quoted
+// identifiers, comments and bound parameters are.
+
+type Lexeme =
+  | { kind: "semi" | "space" | "other"; start: number; end: number }
+  | { kind: "word"; start: number; end: number }
+  | { kind: "parameter"; start: number; end: number };
+
+const IDENTIFIER_START = /[\p{L}_]/u;
+const IDENTIFIER_CHAR = /[\p{L}\p{N}_$]/u;
+
+function* lex(sql: string): Generator<Lexeme> {
+  let i = 0;
+  while (i < sql.length) {
+    const start = i;
+    const c = sql[i];
+    if (c === ";") {
+      i++;
+      yield { kind: "semi", start, end: i };
+    } else if (/\s/.test(c)) {
+      i++;
+      yield { kind: "space", start, end: i };
+    } else if (c === "-" && sql[i + 1] === "-") {
+      const newline = sql.indexOf("\n", i);
+      i = newline === -1 ? sql.length : newline + 1;
+      yield { kind: "space", start, end: i };
+    } else if (c === "/" && sql[i + 1] === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      i = end === -1 ? sql.length : end + 2;
+      yield { kind: "space", start, end: i };
+    } else if (c === "'" || c === '"' || c === "`" || c === "[") {
+      const end = sql.indexOf(c === "[" ? "]" : c, i + 1);
+      i = end === -1 ? sql.length : end + 1;
+      yield { kind: "other", start, end: i };
+    } else if (c === "?") {
+      i++;
+      while (/[0-9]/.test(sql[i] ?? "")) i++;
+      yield { kind: "parameter", start, end: i };
+    } else if (
+      (c === ":" || c === "@" || c === "$") &&
+      IDENTIFIER_CHAR.test(sql[i + 1] ?? "")
+    ) {
+      i++;
+      while (i < sql.length && IDENTIFIER_CHAR.test(sql[i])) i++;
+      yield { kind: "parameter", start, end: i };
+    } else if (IDENTIFIER_START.test(c)) {
+      i++;
+      while (i < sql.length && IDENTIFIER_CHAR.test(sql[i])) i++;
+      yield { kind: "word", start, end: i };
+    } else {
+      i++;
+      yield { kind: "other", start, end: i };
+    }
+  }
+}
+
+/**
+ * How many values a statement binds, numbered as SQLite numbers them: a
+ * bare `?` takes the next number, `?NNN` its own, and a named parameter
+ * one number for all its uses.
+ */
+export function parameterCount(statement: string): number {
+  let largest = 0;
+  const named = new Set<string>();
+  for (const lexeme of lex(statement)) {
+    if (lexeme.kind !== "parameter") continue;
+    const text = statement.slice(lexeme.start, lexeme.end);
+    if (text === "?") largest++;
+    else if (text[0] === "?")
+      largest = Math.max(largest, Number(text.slice(1)));
+    else if (!named.has(text)) {
+      named.add(text);
+      largest++;
+    }
+  }
+  return largest;
+}
+
+// ─── statements ──────────────────────────────────────────────────────
+// SQLite's own sqlite3_complete() state machine, which decides where a
+// statement ends: at a semicolon outside strings, quoted identifiers and
+// comments, and, in CREATE TRIGGER, only at the `END;` closing its body.
+
+enum Token {
+  Semi,
+  Space,
+  Other,
+  Explain,
+  Create,
+  Temp,
+  Trigger,
+  End,
+}
+
+const START = 1;
+
+// [state][token] → next state. States: 0 leading space, 1 start,
+// 2 normal, 3 EXPLAIN, 4 CREATE, 5 in a trigger, 6 after a semicolon in
+// a trigger, 7 after END in a trigger.
+const TRANSITIONS: number[][] = [
+  [1, 0, 2, 3, 4, 2, 2, 2],
+  [1, 1, 2, 3, 4, 2, 2, 2],
+  [1, 2, 2, 2, 2, 2, 2, 2],
+  [1, 3, 3, 2, 4, 2, 2, 2],
+  [1, 4, 2, 2, 2, 4, 5, 2],
+  [6, 5, 5, 5, 5, 5, 5, 5],
+  [6, 6, 5, 5, 5, 5, 5, 7],
+  [1, 7, 5, 5, 5, 5, 5, 5],
+];
+
+const KEYWORDS: Record<string, Token> = {
+  EXPLAIN: Token.Explain,
+  CREATE: Token.Create,
+  TEMP: Token.Temp,
+  TEMPORARY: Token.Temp,
+  TRIGGER: Token.Trigger,
+  END: Token.End,
+};
+
+/** The statements in `sql`, each with its terminating semicolon. */
+export function splitStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let state = 0;
+  let start = 0;
+  let content = false;
+  for (const lexeme of lex(sql)) {
+    const token =
+      lexeme.kind === "semi"
+        ? Token.Semi
+        : lexeme.kind === "space"
+          ? Token.Space
+          : lexeme.kind === "word"
+            ? (KEYWORDS[sql.slice(lexeme.start, lexeme.end).toUpperCase()] ??
+              Token.Other)
+            : Token.Other;
+    if (token !== Token.Space && token !== Token.Semi) content = true;
+    state = TRANSITIONS[state][token];
+    if (token === Token.Semi && state === START) {
+      if (content) statements.push(sql.slice(start, lexeme.end).trim());
+      start = lexeme.end;
+      content = false;
+    }
+  }
+  if (content) statements.push(sql.slice(start).trim());
+  return statements;
+}
+
+/**
+ * True when the statement can change rows: not schema, PRAGMA or
+ * transaction control.
+ */
+export function changesRows(statement: string): boolean {
+  return !NON_ROW_STATEMENTS.has(leadingSqlKeyword(statement));
+}
+
+const NON_ROW_STATEMENTS = new Set([
+  "CREATE",
+  "ALTER",
+  "DROP",
+  "PRAGMA",
+  "BEGIN",
+  "COMMIT",
+  "END",
+  "ROLLBACK",
+  "SAVEPOINT",
+  "RELEASE",
+  "VACUUM",
+  "REINDEX",
+  "ANALYZE",
+  "ATTACH",
+  "DETACH",
+]);
+
+// ─── the text fallback ───────────────────────────────────────────────
 
 /** A view: its name and the `CREATE VIEW` statement that defines it. */
 export interface ViewDefinition {
   name: string;
   sql: string;
 }
-
-const IDENTIFIER_CHAR = /[\p{L}\p{N}_$]/u;
 
 /** True when `name` occurs in `text` as a whole identifier (both
  *  lower-cased by the caller). */
