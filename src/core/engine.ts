@@ -151,7 +151,12 @@ export class Vex {
   private jobHandlers: Map<string, JobDef> = new Map();
   private jobIntervalMs: Map<string, number> = new Map();
   private runningJobs: Map<string, Promise<JobRunResult>> = new Map();
+  // Each job's registration, removal and enabling, in call order per
+  // name: the last call for a name decides its row and its timer.
+  private jobChanges: Map<string, Promise<void>> = new Map();
   private jobScheduler: "timers" | "external" = "timers";
+  // Set by close(): a closed engine accepts no job or subscription.
+  private closing: Promise<void> | null = null;
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
   private appId: string = "unknown";
@@ -267,6 +272,32 @@ export class Vex {
     }
   }
 
+  private assertOpen(): void {
+    if (this.closing) throw new Error("Vex engine is closed");
+  }
+
+  /**
+   * Runs `change` after every earlier change to job `name` has settled.
+   * A change awaits storage before it arms a timer; one at a time, in
+   * call order, a later call never lands inside an earlier one's awaits,
+   * so the last call decides the job's row and its timer.
+   */
+  private changeJob(name: string, change: () => Promise<void>): Promise<void> {
+    const previous = this.jobChanges.get(name) ?? Promise.resolve();
+    const result = previous.then(change);
+    const settled = result.catch(() => {});
+    this.jobChanges.set(name, settled);
+    settled.then(() => {
+      if (this.jobChanges.get(name) === settled) this.jobChanges.delete(name);
+    });
+    return result;
+  }
+
+  /** True while `job` is the one registered as `name` on an open engine. */
+  private isCurrentJob(name: string, job: JobDef): boolean {
+    return !this.closing && this.jobHandlers.get(name) === job;
+  }
+
   // Runs the job at `firstRun`, then every `ms`. Under an external
   // scheduler the host runs due jobs instead.
   private startJobTimer(
@@ -297,13 +328,25 @@ export class Vex {
   }
 
   async addJob(name: string, job: JobDef, plugin = "_dynamic") {
+    this.assertOpen();
     const ms = parseSchedule(job.schedule);
     if (ms <= 0) throw new Error(`Invalid schedule: ${job.schedule}`);
 
     this.stopJobTimer(name);
     this.jobHandlers.set(name, job);
     this.jobIntervalMs.set(name, ms);
+    return this.changeJob(name, () => this.storeJob(name, job, ms, plugin));
+  }
 
+  // Writes the job's row and arms its timer, unless a later call for
+  // the name, or close(), has taken over.
+  private async storeJob(
+    name: string,
+    job: JobDef,
+    ms: number,
+    plugin: string,
+  ): Promise<void> {
+    if (!this.isCurrentJob(name, job)) return;
     const existing = await this.storage
       .rawQuery<any>("SELECT _id, nextRun FROM _jobs WHERE name = ?", name)
       .then((r) => r[0]);
@@ -326,40 +369,53 @@ export class Vex {
     if (existing) await this.storage.update("_jobs", existing._id, row);
     else await this.storage.insert("_jobs", { name, ...row, runs: 0 });
 
-    if (nextRun !== null) this.startJobTimer(name, job, ms, nextRun);
+    if (nextRun !== null && this.isCurrentJob(name, job)) {
+      this.startJobTimer(name, job, ms, nextRun);
+    }
   }
 
   async removeJob(name: string) {
+    this.assertOpen();
     this.stopJobTimer(name);
     this.jobHandlers.delete(name);
     this.jobIntervalMs.delete(name);
-    const row = await this.storage
-      .rawQuery<any>("SELECT _id FROM _jobs WHERE name = ?", name)
-      .then((r) => r[0]);
-    if (row) await this.storage.delete("_jobs", row._id);
+    return this.changeJob(name, async () => {
+      // A later addJob for the name writes its own row.
+      if (this.jobHandlers.has(name)) return;
+      const row = await this.storage
+        .rawQuery<any>("SELECT _id FROM _jobs WHERE name = ?", name)
+        .then((r) => r[0]);
+      if (row) await this.storage.delete("_jobs", row._id);
+    });
   }
 
   async setJobEnabled(name: string, enabled: boolean) {
+    this.assertOpen();
     const handler = this.jobHandlers.get(name);
     if (!handler) throw new Error(`Job not found: ${name}`);
     const ms = this.jobIntervalMs.get(name) ?? 0;
 
-    const row = await this.storage
-      .rawQuery<any>("SELECT _id FROM _jobs WHERE name = ?", name)
-      .then((r) => r[0]);
-    if (!row) throw new Error(`Job not found in DB: ${name}`);
+    return this.changeJob(name, async () => {
+      if (!this.isCurrentJob(name, handler)) return;
+      const row = await this.storage
+        .rawQuery<any>("SELECT _id FROM _jobs WHERE name = ?", name)
+        .then((r) => r[0]);
+      if (!row) throw new Error(`Job not found in DB: ${name}`);
 
-    if (enabled && ms > 0) {
-      const nextRun = Date.now() + ms;
-      this.startJobTimer(name, handler, ms, nextRun);
-      await this.storage.update("_jobs", row._id, { enabled: 1, nextRun });
-    } else {
-      this.stopJobTimer(name);
-      await this.storage.update("_jobs", row._id, {
-        enabled: 0,
-        nextRun: null,
-      });
-    }
+      if (enabled && ms > 0) {
+        const nextRun = Date.now() + ms;
+        await this.storage.update("_jobs", row._id, { enabled: 1, nextRun });
+        if (this.isCurrentJob(name, handler)) {
+          this.startJobTimer(name, handler, ms, nextRun);
+        }
+      } else {
+        this.stopJobTimer(name);
+        await this.storage.update("_jobs", row._id, {
+          enabled: 0,
+          nextRun: null,
+        });
+      }
+    });
   }
 
   // Jobs are single-flight per name: while a run (including retries and
@@ -1118,6 +1174,7 @@ export class Vex {
     callback: SubscriptionCallback,
     callCtx?: CallContext,
   ): Promise<() => void> {
+    this.assertOpen();
     const { user } = callCtx ? normalizeCallContext(callCtx) : {};
     const subId = `sub_${++this.subIdCounter}`;
     return this.trace("subscribe", name, null, async (_ectx, meta) => {
@@ -1377,7 +1434,19 @@ export class Vex {
     });
   }
 
-  async close() {
+  /**
+   * Closes the engine: from the call on, it refuses jobs and
+   * subscriptions. Job changes in flight finish without arming a timer,
+   * running jobs settle, and then storage closes. Calling it again
+   * returns the same promise.
+   */
+  close(): Promise<void> {
+    this.closing ??= this.shutDown();
+    return this.closing;
+  }
+
+  private async shutDown(): Promise<void> {
+    await Promise.allSettled([...this.jobChanges.values()]);
     for (const timer of this.cronTimers.values()) clearTimeout(timer);
     this.cronTimers.clear();
     await Promise.allSettled([...this.runningJobs.values()]);
