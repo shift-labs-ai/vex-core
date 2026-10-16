@@ -17,6 +17,11 @@ export interface SqliteDriver {
   prepare(sql: string): SqliteStatement;
   exec(sql: string): void;
   /**
+   * The rows the last statement changed itself. Rows its triggers wrote
+   * (the change triggers among them) are not counted.
+   */
+  changes(): number;
+  /**
    * Runs `fn` atomically: its writes commit together or roll back when
    * it throws. Inside an open transaction this nests as a savepoint.
    */
@@ -26,7 +31,7 @@ export interface SqliteDriver {
 export interface SqliteStatement {
   all(...params: any[]): any[];
   get(...params: any[]): any | null;
-  run(...params: any[]): { changes: number };
+  run(...params: any[]): unknown;
 }
 
 interface ExpectedIndex {
@@ -42,6 +47,20 @@ interface ExistingColumn {
 }
 
 const SQLITE_INDEX_METADATA_TABLE = "__vex_sqlite_indexes";
+
+/**
+ * Change tracking, as Android Room's InvalidationTracker does it: every
+ * table Vex ensures carries AFTER INSERT/UPDATE/DELETE triggers that
+ * flag the table's row here. SQLite itself fires them, so a write is
+ * seen however it is made: the query builder, raw SQL, a foreign-key
+ * cascade, another trigger. Flags are written in the writing
+ * transaction, so they roll back with it; the adapter collects them at
+ * commit (`SqliteAdapterState.collectChanges`). A Durable Object refuses
+ * TEMP objects, so the table and triggers are ordinary schema objects.
+ */
+const CHANGES_TABLE = "__vex_changes";
+const CHANGE_TRIGGER_PREFIX = "__vex_changes_";
+const CHANGE_TRIGGER_EVENTS = ["INSERT", "UPDATE", "DELETE"] as const;
 
 function toSqlType(type: TableSchema["columns"][string]["type"]): string {
   switch (type) {
@@ -129,10 +148,10 @@ function existingColumnSql(col: ExistingColumn): string {
 }
 
 function validateTableName(name: string): void {
-  if (name.toLowerCase() === SQLITE_INDEX_METADATA_TABLE) {
-    throw new Error(
-      `reserved SQLite metadata table name: ${SQLITE_INDEX_METADATA_TABLE}`,
-    );
+  for (const reserved of [SQLITE_INDEX_METADATA_TABLE, CHANGES_TABLE]) {
+    if (name.toLowerCase() === reserved) {
+      throw new Error(`reserved SQLite metadata table name: ${reserved}`);
+    }
   }
   if (name.toLowerCase().startsWith("sqlite_")) {
     throw new Error(`reserved SQLite internal table name: ${quoteIdent(name)}`);
@@ -215,7 +234,55 @@ function renameTableIfNeeded(
   db.prepare(
     `UPDATE ${quoteIdent(SQLITE_INDEX_METADATA_TABLE)} SET "table" = ? WHERE "table" = ?`,
   ).run(name, source);
+  db.prepare(`DELETE FROM ${quoteIdent(CHANGES_TABLE)} WHERE "table" = ?`).run(
+    source,
+  );
   return source;
+}
+
+function changeTriggerSql(
+  name: string,
+  event: (typeof CHANGE_TRIGGER_EVENTS)[number],
+): { trigger: string; sql: string } {
+  const trigger = `${CHANGE_TRIGGER_PREFIX}${name}_${event.toLowerCase()}`;
+  return {
+    trigger,
+    sql: `CREATE TRIGGER ${quoteIdent(trigger)} AFTER ${event} ON ${quoteIdent(name)} BEGIN UPDATE ${quoteIdent(CHANGES_TABLE)} SET "changed" = 1 WHERE "table" = ${sqlLiteral(name)} AND "changed" = 0; END`,
+  };
+}
+
+/**
+ * Gives `name` exactly Vex's three change triggers and a row to flag.
+ * A trigger whose definition differs (one that followed a renamed
+ * table keeps its old name and body) is dropped; one already right is
+ * left alone, so starting an unchanged schema writes nothing.
+ */
+function ensureChangeTriggers(db: SqliteDriver, name: string): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO ${quoteIdent(CHANGES_TABLE)} ("table") VALUES (?)`,
+  ).run(name);
+  const expected = new Map(
+    CHANGE_TRIGGER_EVENTS.map((event) => {
+      const { trigger, sql } = changeTriggerSql(name, event);
+      return [trigger, sql];
+    }),
+  );
+  const existing = db
+    .prepare(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? AND substr(name, 1, ?) = ?",
+    )
+    .all(name, CHANGE_TRIGGER_PREFIX.length, CHANGE_TRIGGER_PREFIX) as {
+    name: string;
+    sql: string;
+  }[];
+  for (const trigger of existing) {
+    if (expected.get(trigger.name) === trigger.sql) {
+      expected.delete(trigger.name);
+    } else {
+      db.exec(`DROP TRIGGER ${quoteIdent(trigger.name)}`);
+    }
+  }
+  for (const sql of expected.values()) db.exec(sql);
 }
 
 // Renames columns in place and updates `existing` to match, so the
@@ -496,6 +563,9 @@ export function ensureSqliteTable(
     db.exec(
       'CREATE TABLE IF NOT EXISTS "__vex_sqlite_indexes" ("table" TEXT NOT NULL, "name" TEXT NOT NULL, PRIMARY KEY ("table", "name"))',
     );
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS ${quoteIdent(CHANGES_TABLE)} ("table" TEXT PRIMARY KEY, "changed" INTEGER NOT NULL DEFAULT 0)`,
+    );
     // Renames run first so every later step sees the new names. Until
     // the table is renamed, its explicit indexes count as another
     // table's, so index names are checked after it.
@@ -624,6 +694,9 @@ export function ensureSqliteTable(
         'INSERT OR IGNORE INTO "__vex_sqlite_indexes" ("table", "name") VALUES (?, ?)',
       ).run(name, idxName);
     }
+    // Last, so a rebuild above (which drops the table and its triggers)
+    // is followed by fresh ones.
+    ensureChangeTriggers(db, name);
     return renamedFrom;
   });
 }
@@ -638,9 +711,28 @@ export class SqliteAdapterState {
   readonly schemas = new Map<string, TableSchema>();
   private readonly changed = new Set<string>();
 
-  readonly markChanged = (table: string, rows: number): void => {
-    if (rows > 0) this.changed.add(table);
-  };
+  /**
+   * Moves the tables the change triggers flagged into the changed set,
+   * clearing their flags. Run it where the writes are final: at the end
+   * of the outermost transaction, inside it so the cleared flags commit
+   * with the writes, or after a write made outside any transaction.
+   */
+  collectChanges(db: SqliteDriver): void {
+    if (this.schemas.size === 0) return;
+    // A read, then a clear only when something was flagged: a fraction of
+    // the cost of UPDATE … RETURNING, and no write at all when nothing
+    // changed.
+    const rows = db
+      .prepare(
+        `SELECT "table" FROM ${quoteIdent(CHANGES_TABLE)} WHERE "changed" = 1`,
+      )
+      .all() as { table: string }[];
+    if (rows.length === 0) return;
+    db.prepare(
+      `UPDATE ${quoteIdent(CHANGES_TABLE)} SET "changed" = 0 WHERE "changed" = 1`,
+    ).run();
+    for (const row of rows) this.changed.add(row.table);
+  }
 
   registerSchema(
     name: string,
@@ -672,8 +764,8 @@ export class SqliteAdapterState {
 }
 
 // ─── writes ──────────────────────────────────────────────────────────
-// insertRow returns the new row's id; the others return the number of
-// rows they changed, for change tracking.
+// insertRow returns the new row's id; deleteRow the number of rows it
+// deleted.
 
 export function insertRow(
   db: SqliteDriver,
@@ -694,15 +786,15 @@ export function updateRow(
   table: string,
   id: string,
   data: Record<string, any>,
-): number {
-  if (Object.keys(data).length === 0) return 0;
+): void {
+  if (Object.keys(data).length === 0) return;
   const { sql, values } = buildUpdateSql(table, data);
-  return db.prepare(sql).run(...values, id).changes;
+  db.prepare(sql).run(...values, id);
 }
 
 export function deleteRow(db: SqliteDriver, table: string, id: string): number {
-  return db.prepare(`DELETE FROM ${quoteIdent(table)} WHERE _id = ?`).run(id)
-    .changes;
+  db.prepare(`DELETE FROM ${quoteIdent(table)} WHERE _id = ?`).run(id);
+  return db.changes();
 }
 
 /** Updates the row matching `keys` with `data`, or inserts both. */
@@ -711,7 +803,7 @@ export function upsertRow(
   table: string,
   keys: Record<string, any>,
   data: Record<string, any>,
-): number {
+): void {
   const { sql: where, params } = buildWhereClause(
     Object.entries(keys).map(([column, value]) => ({
       column,
@@ -722,9 +814,8 @@ export function upsertRow(
   const row = db
     .prepare(`SELECT _id FROM ${quoteIdent(table)} ${where} LIMIT 1`)
     .get(...params) as { _id: string } | null;
-  if (row) return updateRow(db, table, row._id, data);
-  insertRow(db, table, { ...keys, ...data });
-  return 1;
+  if (row) updateRow(db, table, row._id, data);
+  else insertRow(db, table, { ...keys, ...data });
 }
 
 /** Inserts `rows` atomically, over the union of their columns. */
@@ -732,8 +823,8 @@ export function bulkInsertRows(
   db: SqliteDriver,
   table: string,
   rows: Record<string, any>[],
-): number {
-  if (rows.length === 0) return 0;
+): void {
+  if (rows.length === 0) return;
   const keys = [
     "_id",
     ...new Set(
@@ -750,5 +841,4 @@ export function bulkInsertRows(
       statement.run(...keys.map((k) => serializeValue(data[k])));
     }
   });
-  return rows.length;
 }

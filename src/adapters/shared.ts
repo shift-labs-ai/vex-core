@@ -102,9 +102,9 @@ export function buildWhereClause(filters: Filter[]): {
 
 export interface DbExec {
   all(sql: string, params: any[]): Promise<any[]>;
+  /** A write; the adapter records which tables it changed. */
   run(sql: string, params: any[]): Promise<{ changes: number }>;
   schemas: Map<string, TableSchema>;
-  markChanged?: (table: string, changes: number) => void;
 }
 
 export function createQueryBuilder(exec: DbExec, table: string): QueryBuilder {
@@ -235,7 +235,6 @@ export function createQueryBuilder(exec: DbExec, table: string): QueryBuilder {
         `DELETE FROM ${quoteIdent(table)} ${where}`,
         params,
       );
-      exec.markChanged?.(table, result.changes);
       return result.changes;
     },
   };

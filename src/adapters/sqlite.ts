@@ -1,5 +1,10 @@
 import { Database } from "bun:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  isReadOnlyStatement,
+  leadingSqlKeyword,
+  sqlAfterLeadingComments,
+} from "../core/sql-text.js";
 import type { StorageAdapter } from "../core/storage.js";
 import type { TableSchema } from "../core/types.js";
 import { createQueryBuilder, type DbExec } from "./shared.js";
@@ -68,17 +73,28 @@ interface Waiter<T> {
 const SQLITE_READ_POOL_SIZE = 4;
 const SQLITE_STATEMENT_CACHE_SIZE = 64;
 
+/**
+ * The rows `connection`'s last statement changed itself. Bun's
+ * `run().changes` is the connection's total-changes delta, which also
+ * counts rows the change triggers wrote; SQLite's `changes()` does not.
+ */
+function changes(connection: SqliteConnection): number {
+  const row = connection.statements
+    .prepare("SELECT changes() AS changes")
+    .get() as { changes: number };
+  return row.changes;
+}
+
 function wrapSync(
   writer: SqliteConnection,
   state: SqliteAdapterState,
-  withConnectionLock: <T>(fn: () => Promise<T> | T) => Promise<T>,
+  write: <T>(fn: () => T) => Promise<T>,
   withReadConnection: <T>(
     fn: (connection: SqliteConnection) => T,
   ) => Promise<T>,
 ): DbExec {
   return {
     schemas: state.schemas,
-    markChanged: state.markChanged,
     async all(sql, params) {
       return withReadConnection((connection) =>
         params.length > 0
@@ -87,11 +103,9 @@ function wrapSync(
       );
     },
     async run(sql, params) {
-      return withConnectionLock(() => {
-        const statement = writer.statements.prepare(sql);
-        const result =
-          params.length > 0 ? statement.run(...params) : statement.run();
-        return { changes: result.changes };
+      return write(() => {
+        writer.statements.prepare(sql).run(...params);
+        return { changes: changes(writer) };
       });
     },
   };
@@ -136,41 +150,6 @@ function openReadConnections(
     for (const connection of connections) connection.db.close();
     throw error;
   }
-}
-
-function sqlAfterLeadingComments(sql: string): string {
-  let offset = 0;
-  while (offset < sql.length) {
-    while (/\s/.test(sql[offset] ?? "")) offset++;
-    if (sql.startsWith("--", offset)) {
-      const newline = sql.indexOf("\n", offset + 2);
-      if (newline === -1) return "";
-      offset = newline + 1;
-      continue;
-    }
-    if (sql.startsWith("/*", offset)) {
-      const end = sql.indexOf("*/", offset + 2);
-      if (end === -1) return "";
-      offset = end + 2;
-      continue;
-    }
-    break;
-  }
-  return sql.slice(offset);
-}
-
-function leadingSqlKeyword(sql: string): string {
-  return (
-    sqlAfterLeadingComments(sql)
-      .match(/^[a-z]+/i)?.[0]
-      .toUpperCase() ?? ""
-  );
-}
-
-function isPooledRawRead(sql: string): boolean {
-  return ["EXPLAIN", "SELECT", "VALUES", "WITH"].includes(
-    leadingSqlKeyword(sql),
-  );
 }
 
 function isReadonlyError(error: unknown): boolean {
@@ -234,6 +213,9 @@ export function sqliteAdapter(
   const readWaiters: Array<Waiter<ReadConnection>> = [];
   let nextReadConnection = 0;
   let writerReadsRequired = false;
+  // True between the writer's BEGIN and its COMMIT or ROLLBACK: a write
+  // then belongs to the transaction, whose commit collects its changes.
+  let transactionOpen = false;
   let closed = false;
 
   function closedError(): Error {
@@ -321,17 +303,22 @@ export function sqliteAdapter(
     }
   }
 
+  // Transaction-owned reads must use the write handle to see uncommitted
+  // changes. Connection-local state (TEMP tables, ATTACH, PRAGMAs) also pins
+  // reads to that handle. In-memory databases have no shareable backing file.
+  function readsUseWriter(): boolean {
+    return (
+      transactionContext.getStore()?.active === true ||
+      writerReadsRequired ||
+      readConnections.length === 0
+    );
+  }
+
   async function withReadConnection<T>(
     fn: (connection: SqliteConnection) => T,
   ): Promise<T> {
     if (closed) throw closedError();
-    const owner = transactionContext.getStore();
-    // Transaction-owned reads must use the write handle to see uncommitted
-    // changes. Connection-local state (TEMP tables, ATTACH, PRAGMAs) also pins
-    // reads to that handle. In-memory databases have no shareable backing file.
-    if (owner?.active || writerReadsRequired || readConnections.length === 0) {
-      return withConnectionLock(() => fn(writer));
-    }
+    if (readsUseWriter()) return withConnectionLock(() => fn(writer));
 
     const connection = await acquireReadConnection();
     try {
@@ -346,12 +333,26 @@ export function sqliteAdapter(
   // or, for ensureTable, synchronously between awaits.
   const writerDriver: SqliteDriver = {
     prepare: (sql) => writer.statements.prepare(sql),
+    changes: () => changes(writer),
     exec: (sql) => db.exec(sql),
     atomically: (fn) => db.transaction(fn)(),
   };
 
-  const { markChanged } = state;
-  const exec = wrapSync(writer, state, withConnectionLock, withReadConnection);
+  // A write on the writer, under the lock. Its triggers' flags are
+  // collected where it is final: by the open transaction at commit, or
+  // here, after it ran alone. A failed statement may still leave earlier
+  // statements of a multi-statement exec applied, so collect regardless.
+  function write<T>(fn: () => T): Promise<T> {
+    return withConnectionLock(() => {
+      try {
+        return fn();
+      } finally {
+        if (!transactionOpen) state.collectChanges(writerDriver);
+      }
+    });
+  }
+
+  const exec = wrapSync(writer, state, write, withReadConnection);
 
   return {
     name: "sqlite",
@@ -370,11 +371,7 @@ export function sqliteAdapter(
     },
 
     async insert(table: string, row: Record<string, any>): Promise<string> {
-      return withConnectionLock(() => {
-        const id = insertRow(writerDriver, table, row);
-        markChanged(table, 1);
-        return id;
-      });
+      return write(() => insertRow(writerDriver, table, row));
     },
 
     async upsert(
@@ -382,9 +379,7 @@ export function sqliteAdapter(
       keys: Record<string, any>,
       data: Record<string, any>,
     ): Promise<void> {
-      await withConnectionLock(() =>
-        markChanged(table, upsertRow(writerDriver, table, keys, data)),
-      );
+      await write(() => upsertRow(writerDriver, table, keys, data));
     },
 
     async update(
@@ -392,17 +387,11 @@ export function sqliteAdapter(
       id: string,
       data: Record<string, any>,
     ): Promise<void> {
-      await withConnectionLock(() =>
-        markChanged(table, updateRow(writerDriver, table, id, data)),
-      );
+      await write(() => updateRow(writerDriver, table, id, data));
     },
 
     async delete(table: string, id: string): Promise<boolean> {
-      return withConnectionLock(() => {
-        const changes = deleteRow(writerDriver, table, id);
-        markChanged(table, changes);
-        return changes > 0;
-      });
+      return write(() => deleteRow(writerDriver, table, id) > 0);
     },
 
     query(table: string) {
@@ -422,8 +411,12 @@ export function sqliteAdapter(
       const context = { active: true };
       const restore = state.snapshot();
       db.exec("BEGIN");
+      transactionOpen = true;
       try {
         const result = await transactionContext.run(context, () => fn());
+        // Inside the transaction, so the cleared flags commit with the
+        // writes that set them.
+        state.collectChanges(writerDriver);
         db.exec("COMMIT");
         return result;
       } catch (e) {
@@ -431,6 +424,7 @@ export function sqliteAdapter(
         restore();
         throw e;
       } finally {
+        transactionOpen = false;
         context.active = false;
         releaseWriteLock();
       }
@@ -440,22 +434,23 @@ export function sqliteAdapter(
       sql: string,
       ...params: any[]
     ): Promise<T[]> {
-      if (isPooledRawRead(sql)) {
+      // A WITH statement can terminate in SELECT or in DML. Bun does not
+      // expose sqlite3_stmt_readonly(), so a readonly pool connection
+      // classifies it: its readonly failure retries as a write. Where reads
+      // would run on the writer anyway, it is a write from the start, so
+      // its changes are collected.
+      const ambiguous = leadingSqlKeyword(sql) === "WITH";
+      if (isReadOnlyStatement(sql) || (ambiguous && !readsUseWriter())) {
         try {
           return await withReadConnection(
             (connection) =>
               connection.statements.prepare(sql).all(...params) as T[],
           );
         } catch (error: unknown) {
-          // A WITH statement can terminate in SELECT or in DML. Bun does not
-          // expose sqlite3_stmt_readonly(), so let SQLite classify that one
-          // ambiguous form and retry only its readonly failure on the writer.
-          if (leadingSqlKeyword(sql) !== "WITH" || !isReadonlyError(error)) {
-            throw error;
-          }
+          if (!ambiguous || !isReadonlyError(error)) throw error;
         }
       }
-      return withConnectionLock(() => {
+      return write(() => {
         const rows = writer.statements.prepare(sql).all(...params) as T[];
         if (changesConnectionLocalState(sql)) writerReadsRequired = true;
         if (mayChangeSchema(sql)) clearStatementCaches();
@@ -464,7 +459,7 @@ export function sqliteAdapter(
     },
 
     async rawExec(sql: string, ...params: any[]): Promise<void> {
-      await withConnectionLock(() => {
+      await write(() => {
         if (params.length > 0) {
           writer.statements.prepare(sql).run(...params);
         } else {
@@ -484,9 +479,7 @@ export function sqliteAdapter(
       table: string,
       rows: Record<string, any>[],
     ): Promise<void> {
-      await withConnectionLock(() =>
-        markChanged(table, bulkInsertRows(writerDriver, table, rows)),
-      );
+      await write(() => bulkInsertRows(writerDriver, table, rows));
     },
 
     getChangedTables(): string[] {

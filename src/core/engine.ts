@@ -4,6 +4,11 @@ import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
 import { INTERNAL_TABLES } from "./internal.js";
 import { hashResult, utf8ByteLength } from "./result-measure.js";
+import {
+  isReadOnlyStatement,
+  tablesRead,
+  type ViewDefinition,
+} from "./sql-text.js";
 import type { StorageAdapter } from "./storage.js";
 import {
   describeQueryDependencies,
@@ -84,6 +89,13 @@ function subscriptionGroupKey(subscription: Subscription): string {
 function subscriptionUserKey(user: VexUser | null | undefined): string {
   return JSON.stringify(user ? [user.id, user.name, user.isAdmin] : null);
 }
+
+/**
+ * A raw write in a mutation. The adapter knows which tables it changed,
+ * not which rows, so every changed table counts as written without
+ * values: no subscription over one is skipped by equality narrowing.
+ */
+const UNATTRIBUTED_WRITE: WriteDependency = { table: "*", raw: true };
 
 function groupWritesByTable(
   writes: WriteDependency[] | undefined,
@@ -573,17 +585,15 @@ export class Vex {
             resolvePrepared(name, policy),
           );
         },
-        sql<T = Record<string, any>>(
+        async sql<T = Record<string, any>>(
           sql: string,
           ...params: any[]
         ): Promise<T[]> {
-          const tables = self.extractTables(sql);
+          const tables = await self.rawReadTables(sql);
           const governed = tables.filter((table) =>
             self.accessPolicies.has(table),
           );
-          if (governed.length > 0) {
-            return Promise.reject(governedRawSqlError(governed));
-          }
+          if (governed.length > 0) throw governedRawSqlError(governed);
           if (touchedTables || dependencies) {
             for (const table of tables) {
               touchedTables?.add(table);
@@ -687,11 +697,16 @@ export class Vex {
     return tracked;
   }
 
-  private extractTables(sql: string): string[] {
-    const tables = new Set<string>();
-    const re = /\b(?:from|join)\s+["`]?([a-zA-Z_][\w]*)["`]?/gi;
-    for (const match of sql.matchAll(re)) tables.add(match[1]);
-    return [...tables];
+  /**
+   * The registered tables a raw statement may read: each one it names,
+   * and each one a view it names reads (sql-text.ts). Views are read
+   * from the schema every time, so one created by anyone counts.
+   */
+  private async rawReadTables(sql: string): Promise<string[]> {
+    const views = await this.storage.rawQuery<ViewDefinition>(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'view'",
+    );
+    return tablesRead(sql, this.tables, views);
   }
 
   private buildMutationContext(
@@ -705,8 +720,14 @@ export class Vex {
           sql: string,
           ...params: any[]
         ): Promise<T[]> {
-          for (const table of self.extractTables(sql))
-            writes?.push({ table, raw: true });
+          // Which tables it changed, the adapter's triggers record. Which
+          // rows, nothing does: an unattributed write keeps equality-filter
+          // narrowing from skipping a subscription it may have hit.
+          if (
+            !isReadOnlyStatement(sql) &&
+            !writes?.includes(UNATTRIBUTED_WRITE)
+          )
+            writes?.push(UNATTRIBUTED_WRITE);
           return self.storage.rawQuery<T>(sql, ...params);
         },
         table(name: string): MutationTable {
@@ -854,7 +875,7 @@ export class Vex {
     for (const dep of dependencies) {
       if (dep.table === "*" && dep.raw) return true;
       if (!changedSet.has(dep.table)) continue;
-      if (dep.raw) return true;
+      if (dep.raw || writesByTable?.has(UNATTRIBUTED_WRITE.table)) return true;
       const tableWrites = writesByTable?.get(dep.table) ?? [];
       if (
         tableWrites.length === 0 ||

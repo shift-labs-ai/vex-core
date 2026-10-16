@@ -20,6 +20,7 @@
  * PRAGMAs; `rawQuery`/`rawExec` surface those refusals as errors.
  */
 
+import { isReadOnlyStatement } from "../core/sql-text.js";
 import type { StorageAdapter } from "../core/storage.js";
 import type { TableSchema } from "../core/types.js";
 import { createQueryBuilder, type DbExec } from "./shared.js";
@@ -52,19 +53,15 @@ export function durableObjectAdapter(
   const { sql } = storage;
   const run = (query: string, params: any[]): any[] =>
     sql.exec(query, ...params).toArray();
-  // `cursor.rowsWritten` also counts index rows, so changes come from
-  // SQLite itself.
-  const changes = (): number => run("SELECT changes() AS c", [])[0].c;
-
   const driver: SqliteDriver = {
     prepare: (query) => ({
       all: (...params) => run(query, params),
       get: (...params) => run(query, params)[0] ?? null,
-      run: (...params) => {
-        run(query, params);
-        return { changes: changes() };
-      },
+      run: (...params) => run(query, params),
     }),
+    // `cursor.rowsWritten` also counts index rows and trigger writes, so
+    // changes come from SQLite itself.
+    changes: () => run("SELECT changes() AS c", [])[0].c,
     exec: (query) => {
       run(query, []);
     },
@@ -72,17 +69,34 @@ export function durableObjectAdapter(
   };
 
   const state = new SqliteAdapterState();
-  const { markChanged } = state;
+  // Open transactions, outermost first; inner ones are savepoints. Only
+  // the outermost collects the change triggers' flags, at its end.
+  let transactionDepth = 0;
+
+  // A write. Inside a transaction its flags wait for that transaction's
+  // commit; alone, they are final once it ran, so collect them now. A
+  // failed statement may still leave earlier statements of a
+  // multi-statement exec applied, so collect regardless.
+  function write<T>(fn: () => T): T {
+    open();
+    try {
+      return fn();
+    } finally {
+      if (transactionDepth === 0) state.collectChanges(driver);
+    }
+  }
+
   const exec: DbExec = {
     schemas: state.schemas,
-    markChanged,
     async all(query, params) {
       open();
       return driver.prepare(query).all(...params);
     },
     async run(query, params) {
-      open();
-      return driver.prepare(query).run(...params);
+      return write(() => {
+        driver.prepare(query).run(...params);
+        return { changes: driver.changes() };
+      });
     },
   };
 
@@ -106,27 +120,19 @@ export function durableObjectAdapter(
     },
 
     async insert(table, row) {
-      open();
-      const id = insertRow(driver, table, row);
-      markChanged(table, 1);
-      return id;
+      return write(() => insertRow(driver, table, row));
     },
 
     async upsert(table, keys, data) {
-      open();
-      markChanged(table, upsertRow(driver, table, keys, data));
+      write(() => upsertRow(driver, table, keys, data));
     },
 
     async update(table, id, data) {
-      open();
-      markChanged(table, updateRow(driver, table, id, data));
+      write(() => updateRow(driver, table, id, data));
     },
 
     async delete(table, id) {
-      open();
-      const count = deleteRow(driver, table, id);
-      markChanged(table, count);
-      return count > 0;
+      return write(() => deleteRow(driver, table, id) > 0);
     },
 
     query(table) {
@@ -140,11 +146,18 @@ export function durableObjectAdapter(
         // another one to commit first, and the next may start as soon
         // as this one settles.
         const restore = state.snapshot();
+        transactionDepth++;
         try {
-          return await fn();
+          const result = await fn();
+          // Inside the outermost transaction, so the cleared flags
+          // commit with the writes that set them.
+          if (transactionDepth === 1) state.collectChanges(driver);
+          return result;
         } catch (error) {
           restore();
           throw error;
+        } finally {
+          transactionDepth--;
         }
       });
     },
@@ -153,18 +166,19 @@ export function durableObjectAdapter(
       query: string,
       ...params: any[]
     ): Promise<T[]> {
-      open();
-      return run(query, params) as T[];
+      if (isReadOnlyStatement(query)) {
+        open();
+        return run(query, params) as T[];
+      }
+      return write(() => run(query, params) as T[]);
     },
 
     async rawExec(query: string, ...params: any[]): Promise<void> {
-      open();
-      run(query, params);
+      write(() => run(query, params));
     },
 
     async bulkInsert(table, rows) {
-      open();
-      markChanged(table, bulkInsertRows(driver, table, rows));
+      write(() => bulkInsertRows(driver, table, rows));
     },
 
     getChangedTables() {

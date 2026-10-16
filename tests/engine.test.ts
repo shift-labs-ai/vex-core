@@ -1297,8 +1297,14 @@ describe("trace metadata", () => {
     expect(metadata("mutation", "safe.delete").writes).toEqual([
       { table: "documents" },
     ]);
+    // A raw write names no table of its own; the tables it changed are
+    // the triggers' record, on the invalidation that follows it.
     expect(metadata("mutation", "safe.rawDelete").writes).toEqual([
-      { table: "documents", raw: true },
+      { table: "*", raw: true },
+    ]);
+    const invalidations = spans.filter((span) => span.type === "invalidation");
+    expect(JSON.parse(invalidations.at(-1).meta).changedTables).toEqual([
+      "documents",
     ]);
     const serializedMetadata = spans.map((span) => span.meta).join("\n");
     expect(serializedMetadata).not.toContain(secretWorkspace);

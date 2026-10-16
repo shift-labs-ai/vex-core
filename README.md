@@ -157,7 +157,17 @@ api.registerQuery("export", {
 });
 ```
 
-Reactive metadata is recorded on spans: `resultRows`, `resultBytes`, `reactive`, `budget`, and `budgetExceeded`. Query-builder reads record dependency descriptors for table, filters, selected columns, ordering, and limits. Raw SQL is tracked conservatively by parsed `FROM`/`JOIN` tables; external API work and unbounded exports should stay outside reactive queries or be marked `reactive: false`.
+Reactive metadata is recorded on spans: `resultRows`, `resultBytes`, `reactive`, `budget`, and `budgetExceeded`. Query-builder reads record dependency descriptors for table, filters, selected columns, ordering, and limits. External API work and unbounded exports should stay outside reactive queries or be marked `reactive: false`.
+
+### Change tracking and raw SQL
+
+SQLite itself reports which tables a write changed. Every table Vex ensures carries `AFTER INSERT/UPDATE/DELETE` triggers (the technique Android Room's `InvalidationTracker` uses), and they flag the table in `__vex_changes`. A write is seen however it is made: the query builder, `ctx.db.sql` of any shape (`INSERT`, `UPDATE … FROM`, `REPLACE`, upserts, `WITH … DELETE`), a trigger, or a foreign-key cascade. The flags are written in the writing transaction, so a rolled-back mutation invalidates nothing. A Durable Object refuses TEMP objects, so the table and triggers are ordinary schema objects; `ensureTable` keeps them current, including across `renamedFrom` and table rebuilds.
+
+- **Raw writes:** a mutation that runs raw write SQL re-runs every subscription over a table it changed. Equality-filter narrowing applies only to query-builder writes, whose rows are known.
+- **Raw reads:** neither `bun:sqlite` nor the Durable Object SQL API exposes SQLite's authorizer, so a raw read's tables are over-approximated, never guessed short. It depends on every registered table it names, in any spelling or quoting (`FROM a, b`, `main.t`, `"t"`, `[t]`, `'t'`, any case), and on every table read by a view it names, through views of views. A raw read that names no registered table re-runs after any write.
+- **Access policies:** raw SQL in a query context is refused if that set includes a governed table. A column or string literal spelled like a governed table also counts, so read such queries through `ctx.db.table()`.
+- **Not tracked:** tables created by raw SQL rather than registered.
+- **Costs:** every written row also runs its change trigger, which updates one row only the first time a table changes in a transaction. A `DELETE` without `WHERE` deletes row by row instead of truncating. On a Durable Object, each table a transaction changes adds two row writes (flag and clear).
 
 ## Query builder
 
