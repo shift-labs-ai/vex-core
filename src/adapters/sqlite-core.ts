@@ -1,5 +1,6 @@
 import { id as generateId } from "../core/id.js";
 import { changesRows, splitStatements } from "../core/sql-text.js";
+import { ANY_TABLE, type Changes } from "../core/storage.js";
 import type { TableSchema } from "../core/types.js";
 import {
   buildInsertSql,
@@ -669,7 +670,7 @@ const ANALYSIS_CACHE_SIZE = 512;
 
 /** What a write statement writes, from its compiled program. */
 export interface WriteAnalysis {
-  /** The tables it writes; null when SQLite cannot say (every table). */
+  /** The tables it writes; null when SQLite cannot say (any table). */
   tables: string[] | null;
   /**
    * No trigger or foreign-key action runs in it, so every row it changes
@@ -771,12 +772,18 @@ export class SqliteAdapterState {
   written(introspection: SqliteIntrospection, sql: string): WriteAnalysis {
     let analysis = this.writes.get(sql);
     if (analysis === undefined) {
+      const statements = splitStatements(sql);
       const indirect = { found: false };
-      const tables = this.analyze(introspection, sql, WRITE_OPCODES, indirect);
+      const tables = this.analyze(
+        introspection,
+        statements,
+        WRITE_OPCODES,
+        indirect,
+      );
       analysis = {
         tables,
         direct: tables !== null && !indirect.found,
-        statements: splitStatements(sql).length,
+        statements: statements.length,
       };
       this.writes.set(sql, analysis);
     }
@@ -784,13 +791,13 @@ export class SqliteAdapterState {
   }
 
   /**
-   * Marks `tables` (null: every table) as changed by a write. A write is
+   * Marks `tables` (null: any table) as changed by a write. A write is
    * `attributed` when it changed only rows it names.
    */
   markChanged(tables: string[] | null, attributed: boolean): void {
     const target = this.pending ?? this.changed;
     if (tables === null) {
-      for (const table of this.schemas.keys()) target.set(table, false);
+      target.set(ANY_TABLE, false);
       return;
     }
     for (let i = 0; i < tables.length; i++) {
@@ -815,25 +822,25 @@ export class SqliteAdapterState {
   ): string[] | undefined {
     let tables = this.reads.get(sql);
     if (tables === undefined) {
-      tables = this.analyze(introspection, sql, READ_OPCODES);
+      tables = this.analyze(introspection, splitStatements(sql), READ_OPCODES);
       this.reads.set(sql, tables);
     }
     return tables ?? undefined;
   }
 
   /**
-   * The tables every cursor of `opcodes` in `sql`'s statements opens, or
-   * null when one cannot be named: a statement that does not compile, a
+   * The tables every cursor of `opcodes` in `statements` opens, or null
+   * when one cannot be named: a statement that does not compile, a
    * virtual table, or a cursor on another database (TEMP, ATTACH).
    */
   private analyze(
     introspection: SqliteIntrospection,
-    sql: string,
+    statements: string[],
     opcodes: Set<string>,
     indirect?: { found: boolean },
   ): string[] | null {
     const tables = new Set<string>();
-    for (const statement of splitStatements(sql)) {
+    for (const statement of statements) {
       if (!changesRows(statement)) continue;
       let program: ExplainRow[];
       try {
@@ -886,24 +893,20 @@ export class SqliteAdapterState {
   }
 
   /**
-   * The tables changed since the last call. `dataVersion`, where other
+   * What changed since the last call. `dataVersion`, where other
    * connections can write, is SQLite's `PRAGMA data_version` on the
    * adapter's writing connection, which moves when another connection
-   * commits: then what it wrote is unknown, so every table counts,
-   * unattributed, and compiled statements are forgotten in case it
-   * changed the schema.
+   * commits: then what it wrote is unknown, so any table counts, and
+   * compiled statements are forgotten in case it changed the schema.
    */
-  takeChanged(dataVersion?: number): {
-    tables: string[];
-    unattributed: string[];
-  } {
+  takeChanges(dataVersion?: number): Changes {
     if (
       dataVersion !== undefined &&
       this.dataVersion !== undefined &&
       dataVersion !== this.dataVersion
     ) {
       this.schemaChanged();
-      for (const table of this.schemas.keys()) this.changed.set(table, false);
+      this.changed.set(ANY_TABLE, false);
     }
     this.dataVersion = dataVersion;
     const tables: string[] = [];

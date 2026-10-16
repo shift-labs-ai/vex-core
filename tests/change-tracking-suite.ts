@@ -15,7 +15,7 @@ import { describe, expect, test } from "bun:test";
 import { UNRESTRICTED } from "../src/core/access.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
-import type { StorageAdapter } from "../src/core/storage.js";
+import { ANY_TABLE, type StorageAdapter } from "../src/core/storage.js";
 
 type CreateStorage = () => Promise<StorageAdapter> | StorageAdapter;
 
@@ -30,9 +30,9 @@ async function changedBy(
   adapter: StorageAdapter,
   write: () => Promise<unknown>,
 ): Promise<string[]> {
-  adapter.getChangedTables();
+  adapter.takeChanges().tables;
   await write();
-  return adapter.getChangedTables().sort();
+  return adapter.takeChanges().tables.sort();
 }
 
 export function changeTrackingSuite(name: string, create: CreateStorage) {
@@ -124,25 +124,25 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           ]),
         ),
       ).toEqual(["a"]);
-      adapter.getChangedTables();
+      adapter.takeChanges().tables;
       // Only the statement's own rows count.
       expect(await adapter.query("a").where("scope", "=", "s").delete()).toBe(
         2,
       );
-      expect(adapter.getChangedTables()).toEqual(["a"]);
+      expect(adapter.takeChanges().tables).toEqual(["a"]);
     });
 
     test("writes in a transaction are reported at commit; a rolled-back one reports nothing", async () => {
       const adapter = await adapterWith("a", "b");
-      adapter.getChangedTables();
+      adapter.takeChanges().tables;
       await adapter.transaction(async () => {
         await adapter.insert("a", { scope: "s", name: "x" });
         await adapter.rawExec(
           "INSERT INTO b (_id, scope, name) VALUES ('1', 's', 'y')",
         );
-        expect(adapter.getChangedTables()).toEqual([]);
+        expect(adapter.takeChanges().tables).toEqual([]);
       });
-      expect(adapter.getChangedTables().sort()).toEqual(["a", "b"]);
+      expect(adapter.takeChanges().tables.sort()).toEqual(["a", "b"]);
 
       await expect(
         adapter.transaction(async () => {
@@ -150,13 +150,13 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           throw new Error("roll back");
         }),
       ).rejects.toThrow("roll back");
-      expect(adapter.getChangedTables()).toEqual([]);
+      expect(adapter.takeChanges().tables).toEqual([]);
       expect(await adapter.query("a").count()).toBe(1);
       // The rolled-back write is gone, not waiting for the next commit.
       await adapter.transaction(async () => {
         await adapter.insert("b", { scope: "s", name: "z" });
       });
-      expect(adapter.getChangedTables()).toEqual(["b"]);
+      expect(adapter.takeChanges().tables).toEqual(["b"]);
       // And a write outside a transaction, after a rollback, is reported
       // at once.
       await expect(
@@ -165,7 +165,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
         }),
       ).rejects.toThrow("roll back");
       await adapter.insert("a", { scope: "s", name: "w" });
-      expect(adapter.getChangedTables()).toEqual(["a"]);
+      expect(adapter.takeChanges().tables).toEqual(["a"]);
     });
 
     test("a write counts only its own rows, whatever its triggers write", async () => {
@@ -175,10 +175,10 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
       );
       await adapter.insert("a", { _id: "1", scope: "s", name: "x" });
       await adapter.insert("a", { _id: "2", scope: "s", name: "y" });
-      adapter.getChangedTables();
+      adapter.takeChanges().tables;
       expect(await adapter.delete("a", "missing")).toBe(false);
       expect(await adapter.query("a").where("_id", "=", "1").delete()).toBe(1);
-      expect(adapter.getChangedTables()).toEqual(["a", "b"]);
+      expect(adapter.takeChanges().tables).toEqual(["a", "b"]);
       expect(await adapter.delete("a", "2")).toBe(true);
       expect(await adapter.query("b").count()).toBe(2);
     });
@@ -276,6 +276,17 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           columns: { ...columns, n: { type, optional: true } },
         });
       }
+    });
+
+    test("a write SQLite cannot attribute to tables changes any table", async () => {
+      const adapter = await adapterWith("a");
+      await adapter.rawExec("CREATE VIRTUAL TABLE notes USING fts5(body)");
+      adapter.takeChanges();
+      await adapter.rawExec("INSERT INTO notes (body) VALUES ('x')");
+      expect(adapter.takeChanges()).toEqual({
+        tables: [ANY_TABLE],
+        unattributed: [ANY_TABLE],
+      });
     });
 
     test("a write to a table created by raw SQL is reported by its name", async () => {

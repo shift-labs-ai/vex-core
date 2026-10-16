@@ -466,7 +466,7 @@ export function sqliteAdapter(
     withReadConnection,
   );
   // The baseline other connections' commits are measured from.
-  state.takeChanged(dataVersion());
+  state.takeChanges(dataVersion());
 
   // Compiles a read on the connection it would run on, for its tables.
   async function analyzeRead(sql: string): Promise<string[] | undefined> {
@@ -627,12 +627,8 @@ export function sqliteAdapter(
       await withConnectionLock(() => bulkInsertRows(writerDriver, table, rows));
     },
 
-    getChangedTables(): string[] {
-      return state.takeChanged(dataVersion()).tables;
-    },
-
     takeChanges() {
-      return state.takeChanged(dataVersion());
+      return state.takeChanges(dataVersion());
     },
 
     tablesRead(sql: string) {

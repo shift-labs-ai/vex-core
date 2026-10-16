@@ -1,5 +1,25 @@
 import type { QueryBuilder, TableSchema } from "./types.js";
 
+/**
+ * A table name that stands for any table: a raw read that reads no table
+ * depends on it, and a change to it (a write SQLite cannot attribute to
+ * tables, or one by another connection) affects every subscription.
+ */
+export const ANY_TABLE = "*";
+
+/** What changed since the engine last asked. */
+export interface Changes {
+  /** The tables changed; `ANY_TABLE` among them when any may have. */
+  tables: string[];
+  /**
+   * Of those, the ones some write changed beyond the rows it names (raw
+   * SQL, a trigger, a foreign-key action): invalidation cannot narrow a
+   * subscription over one by its filters. An adapter that cannot tell
+   * lists them all.
+   */
+  unattributed: string[];
+}
+
 export interface StorageAdapter {
   readonly name: string;
   ensureTable(name: string, schema: TableSchema): Promise<void> | void;
@@ -19,14 +39,8 @@ export interface StorageAdapter {
   ): Promise<T[]>;
   rawExec(sql: string, ...params: any[]): Promise<void>;
   bulkInsert(table: string, rows: Record<string, any>[]): Promise<void>;
-  getChangedTables(): string[];
-  /**
-   * Like `getChangedTables`, and also which of those tables some write
-   * changed beyond the rows it names (raw SQL, a trigger, a foreign-key
-   * action): invalidation cannot narrow a subscription over one by its
-   * filters. Without it, every raw write counts as one, for every table.
-   */
-  takeChanges?(): { tables: string[]; unattributed: string[] };
+  /** What changed since the last call; committed writes only. */
+  takeChanges(): Changes;
   /**
    * The tables a raw statement reads, exactly, from how the database
    * would run it; undefined when the adapter cannot tell. Without it the

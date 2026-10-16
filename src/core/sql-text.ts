@@ -10,28 +10,34 @@
  * the same name counts too; a table it reads is never left out.
  */
 
-/** Where `sql`'s first token starts, past whitespace and comments; -1
- *  when nothing follows them. */
-function firstTokenOffset(sql: string): number {
-  let offset = 0;
+/**
+ * Where the run of whitespace and comments starting at `offset` ends:
+ * `offset` itself when there is none, `sql.length` when it runs to the
+ * end (an unterminated comment included). Whitespace is SQLite's: space,
+ * \t, \n, \f, \r.
+ */
+function spaceEnd(sql: string, offset: number): number {
   while (offset < sql.length) {
     const c = sql.charCodeAt(offset);
-    // SQLite's whitespace: space, \t, \n, \f, \r.
     if (c === 32 || c === 9 || c === 10 || c === 12 || c === 13) {
       offset++;
     } else if (c === 45 && sql.charCodeAt(offset + 1) === 45) {
       const newline = sql.indexOf("\n", offset + 2);
-      if (newline === -1) return -1;
-      offset = newline + 1;
+      offset = newline === -1 ? sql.length : newline + 1;
     } else if (c === 47 && sql.charCodeAt(offset + 1) === 42) {
       const end = sql.indexOf("*/", offset + 2);
-      if (end === -1) return -1;
-      offset = end + 2;
+      offset = end === -1 ? sql.length : end + 2;
     } else {
-      return offset;
+      break;
     }
   }
-  return -1;
+  return offset;
+}
+
+/** Where `sql`'s first token starts; -1 when it has none. */
+function firstTokenOffset(sql: string): number {
+  const offset = spaceEnd(sql, 0);
+  return offset < sql.length ? offset : -1;
 }
 
 /** `sql` from its first token, past leading whitespace and comments. */
@@ -91,10 +97,11 @@ export function mayChangeSchema(sql: string): boolean {
 // Enough of SQLite's tokenizer to know where strings, quoted
 // identifiers, comments and bound parameters are.
 
-type Lexeme =
-  | { kind: "semi" | "space" | "other"; start: number; end: number }
-  | { kind: "word"; start: number; end: number }
-  | { kind: "parameter"; start: number; end: number };
+interface Lexeme {
+  kind: "semi" | "space" | "word" | "parameter" | "other";
+  start: number;
+  end: number;
+}
 
 const IDENTIFIER_START = /[\p{L}_]/u;
 const IDENTIFIER_CHAR = /[\p{L}\p{N}_$]/u;
@@ -104,20 +111,13 @@ function* lex(sql: string): Generator<Lexeme> {
   while (i < sql.length) {
     const start = i;
     const c = sql[i];
-    if (c === ";") {
+    const space = spaceEnd(sql, i);
+    if (space > i) {
+      i = space;
+      yield { kind: "space", start, end: i };
+    } else if (c === ";") {
       i++;
       yield { kind: "semi", start, end: i };
-    } else if (/\s/.test(c)) {
-      i++;
-      yield { kind: "space", start, end: i };
-    } else if (c === "-" && sql[i + 1] === "-") {
-      const newline = sql.indexOf("\n", i);
-      i = newline === -1 ? sql.length : newline + 1;
-      yield { kind: "space", start, end: i };
-    } else if (c === "/" && sql[i + 1] === "*") {
-      const end = sql.indexOf("*/", i + 2);
-      i = end === -1 ? sql.length : end + 2;
-      yield { kind: "space", start, end: i };
     } else if (c === "'" || c === '"' || c === "`" || c === "[") {
       const end = sql.indexOf(c === "[" ? "]" : c, i + 1);
       i = end === -1 ? sql.length : end + 1;
@@ -207,7 +207,7 @@ const KEYWORDS: Record<string, Token> = {
   END: Token.End,
 };
 
-/** The statements in `sql`, each with its terminating semicolon. */
+/** The statements in `sql`, without the semicolons that end them. */
 export function splitStatements(sql: string): string[] {
   const statements: string[] = [];
   let state = 0;
@@ -226,7 +226,7 @@ export function splitStatements(sql: string): string[] {
     if (token !== Token.Space && token !== Token.Semi) content = true;
     state = TRANSITIONS[state][token];
     if (token === Token.Semi && state === START) {
-      if (content) statements.push(sql.slice(start, lexeme.end).trim());
+      if (content) statements.push(sql.slice(start, lexeme.start).trim());
       start = lexeme.end;
       content = false;
     }

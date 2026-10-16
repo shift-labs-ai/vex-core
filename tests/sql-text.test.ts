@@ -85,8 +85,8 @@ describe("splitStatements", () => {
         "INSERT INTO a VALUES ('x;y'); -- a ; comment\nUPDATE \"b;c\" SET [d;e] = `f;g` /* ; */;",
       ),
     ).toEqual([
-      "INSERT INTO a VALUES ('x;y');",
-      '-- a ; comment\nUPDATE "b;c" SET [d;e] = `f;g` /* ; */;',
+      "INSERT INTO a VALUES ('x;y')",
+      '-- a ; comment\nUPDATE "b;c" SET [d;e] = `f;g` /* ; */',
     ]);
   });
 
@@ -94,8 +94,8 @@ describe("splitStatements", () => {
     const trigger =
       "CREATE TEMP TRIGGER t AFTER INSERT ON a BEGIN UPDATE b SET v = CASE WHEN NEW.x THEN 1 ELSE 2 END; DELETE FROM c; END;";
     expect(splitStatements(`${trigger} INSERT INTO a VALUES (1);`)).toEqual([
-      trigger,
-      "INSERT INTO a VALUES (1);",
+      trigger.slice(0, -1),
+      "INSERT INTO a VALUES (1)",
     ]);
     expect(
       splitStatements(
@@ -106,7 +106,7 @@ describe("splitStatements", () => {
 
   test("keeps a last statement without a semicolon and drops empty ones", () => {
     expect(splitStatements(";; SELECT 1 ;  ; SELECT 2  ")).toEqual([
-      "SELECT 1 ;",
+      "SELECT 1",
       "SELECT 2",
     ]);
     expect(splitStatements("  -- nothing\n ;")).toEqual([]);

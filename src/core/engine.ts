@@ -5,7 +5,7 @@ import { resolvePlugin } from "./api.js";
 import { INTERNAL_TABLES } from "./internal.js";
 import { hashResult, utf8ByteLength } from "./result-measure.js";
 import { statementKind, tablesRead, type ViewDefinition } from "./sql-text.js";
-import type { StorageAdapter } from "./storage.js";
+import { ANY_TABLE, type StorageAdapter } from "./storage.js";
 import {
   describeQueryDependencies,
   describeWrites,
@@ -87,12 +87,10 @@ function subscriptionUserKey(user: VexUser | null | undefined): string {
 }
 
 /**
- * A raw write in a mutation, which names no rows. An adapter that
- * reports which tables a write changed beyond its rows (`takeChanges`)
- * makes it precise; with any other, every changed table counts as
- * written by it, and no subscription is narrowed away.
+ * A raw write in a mutation, as its trace records it: it names no rows,
+ * and which tables it changed the adapter reports (`takeChanges`).
  */
-const UNATTRIBUTED_WRITE: WriteDependency = { table: "*", raw: true };
+const RAW_WRITE: WriteDependency = { table: ANY_TABLE, raw: true };
 
 function groupWritesByTable(
   writes: WriteDependency[] | undefined,
@@ -599,7 +597,7 @@ export class Vex {
                 dependencies?.push({ table, raw: true });
               }
               if (tables.length === 0)
-                dependencies?.push({ table: "*", raw: true });
+                dependencies?.push({ table: ANY_TABLE, raw: true });
             }
             return self.storage.rawQuery<T>(sql, ...params);
           };
@@ -728,11 +726,8 @@ export class Vex {
           sql: string,
           ...params: any[]
         ): Promise<T[]> {
-          if (
-            statementKind(sql) !== "read" &&
-            !writes?.includes(UNATTRIBUTED_WRITE)
-          )
-            writes?.push(UNATTRIBUTED_WRITE);
+          if (statementKind(sql) !== "read" && !writes?.includes(RAW_WRITE))
+            writes?.push(RAW_WRITE);
           return self.storage.rawQuery<T>(sql, ...params);
         },
         table(name: string): MutationTable {
@@ -898,20 +893,20 @@ export class Vex {
    * Whether a subscription with `dependencies` may have seen the changes.
    * Over a changed table, only equality filters that the writes' values
    * (WriteDependency.values) rule out let it be skipped, and only when
-   * every write to the table is one of those: not over a table
-   * `unattributed` names.
+   * every write to the table is one of those: not over an unattributed
+   * table.
    */
   private dependencyAffected(
     dependencies: QueryDependency[],
-    changedSet: Set<string>,
-    unattributed: (table: string) => boolean,
+    changed: Set<string>,
+    unattributed: Set<string>,
     writesByTable?: Map<string, WriteDependency[]>,
   ): boolean {
     if (dependencies.length === 0) return true;
     for (const dep of dependencies) {
-      if (dep.table === "*" && dep.raw) return true;
-      if (!changedSet.has(dep.table)) continue;
-      if (dep.raw || unattributed(dep.table)) return true;
+      if (dep.table === ANY_TABLE && dep.raw) return true;
+      if (!changed.has(dep.table)) continue;
+      if (dep.raw || unattributed.has(dep.table)) return true;
       const tableWrites = writesByTable?.get(dep.table) ?? [];
       if (
         tableWrites.length === 0 ||
@@ -941,22 +936,14 @@ export class Vex {
     ectx: ExecContext,
     writes?: WriteDependency[],
   ): Promise<void> {
-    const changes = this.storage.takeChanges?.();
-    const changed = changes?.tables ?? this.storage.getChangedTables();
-    if (changed.length === 0) return;
+    const changes = this.storage.takeChanges();
+    if (changes.tables.length === 0) return;
 
-    const changedSet = new Set(changed);
+    const changedSet = new Set(changes.tables);
+    const unattributed = new Set(changes.unattributed);
     const writesByTable = groupWritesByTable(writes);
-    // Which changed tables no equality filter can narrow: as the adapter
-    // reports them, or, when it cannot, all of them after a raw write.
-    let unattributed: (table: string) => boolean;
-    if (changes) {
-      const tables = new Set(changes.unattributed);
-      unattributed = (table) => tables.has(table);
-    } else {
-      const raw = writesByTable?.has(UNATTRIBUTED_WRITE.table) === true;
-      unattributed = () => raw;
-    }
+    // A change to any table affects every subscription.
+    const everything = changedSet.has(ANY_TABLE);
 
     return this.trace(
       "invalidation",
@@ -965,12 +952,14 @@ export class Vex {
       async (_invEctx, meta) => {
         const groups = new Map<string, Subscription[]>();
         for (const sub of this.subscriptions.values()) {
-          const affected = this.dependencyAffected(
-            sub.dependencies,
-            changedSet,
-            unattributed,
-            writesByTable,
-          );
+          const affected =
+            everything ||
+            this.dependencyAffected(
+              sub.dependencies,
+              changedSet,
+              unattributed,
+              writesByTable,
+            );
           if (!affected) continue;
           const key = subscriptionGroupKey(sub);
           let group = groups.get(key);

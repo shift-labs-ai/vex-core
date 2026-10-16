@@ -92,7 +92,7 @@ try {
       value: index,
     })),
   );
-  storage.getChangedTables();
+  storage.takeChanges().tables;
 
   console.log(
     `SQLite read contention: ${rowCount.toLocaleString()} rows, ${durationMs}ms phases, writer holds transactions ${writerHoldMs}ms`,

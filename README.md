@@ -170,7 +170,7 @@ SQLite reports what a statement reads and writes: its compiled program, as `EXPL
 - **Raw reads:** a raw read depends on exactly the tables its program reads, through views, subqueries and covering indexes. A raw read that reads no table re-runs after any write.
 - **Access policies:** raw SQL in a query context is refused when it reads a governed table, in any spelling or through any view. A literal or column that merely shares a governed table's name is not a read.
 - **Costs:** a statement's first run in a given schema compiles it once more for `EXPLAIN` (a few µs); after that, writes, reads and invalidation cost what they cost without tracking, within measurement noise. The query builder, bulk inserts and mutations run at parity with untracked writes; raw writes and raw reads run faster. On a Durable Object a single-statement write makes no more SQL calls, and bills no more rows, than without tracking; raw SQL of several statements reads `total_changes()` before and after.
-- **Adapters:** a custom `StorageAdapter` reports changed tables through `getChangedTables`, and may add `tablesRead` and `takeChanges` for the exact behaviour above. Without them, raw reads depend on every registered table they name, through named views, and a raw write disables narrowing for its mutation.
+- **Adapters:** a custom `StorageAdapter` reports changes through `takeChanges`; one that cannot tell which rows a write changed lists every changed table as unattributed, and `ANY_TABLE` when it cannot tell which tables. `tablesRead` is optional: without it, or when it cannot say (a virtual table, TEMP, an attached database), a raw read depends on every registered table it names, through named views.
 
 ## Query builder
 

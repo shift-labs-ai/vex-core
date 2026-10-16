@@ -239,12 +239,8 @@ export function durableObjectAdapter(
     },
 
     // The object is its database's only writer.
-    getChangedTables() {
-      return state.takeChanged().tables;
-    },
-
     takeChanges() {
-      return state.takeChanged();
+      return state.takeChanges();
     },
 
     tablesRead(query: string) {

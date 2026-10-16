@@ -333,7 +333,7 @@ export function adapterSuite(
       await adapter.insert("users", { name: "alice", age: 30 });
       await adapter.insert("users", { name: "bob", age: 25 });
       await adapter.insert("users", { name: "carol", age: 35 });
-      adapter.getChangedTables();
+      adapter.takeChanges().tables;
 
       const deleted = await adapter
         .query("users")
@@ -344,12 +344,12 @@ export function adapterSuite(
       expect(deleted).toBe(1);
       expect(remaining).toHaveLength(2);
       expect(remaining.every((r: any) => r.age >= 30)).toBe(true);
-      expect(adapter.getChangedTables()).toEqual(["users"]);
+      expect(adapter.takeChanges().tables).toEqual(["users"]);
     });
 
     test("query builder delete without matches does not mark table changed", async () => {
       await adapter.insert("users", { name: "alice", age: 30 });
-      adapter.getChangedTables();
+      adapter.takeChanges().tables;
 
       const deleted = await adapter
         .query("users")
@@ -357,7 +357,7 @@ export function adapterSuite(
         .delete();
 
       expect(deleted).toBe(0);
-      expect(adapter.getChangedTables()).toEqual([]);
+      expect(adapter.takeChanges().tables).toEqual([]);
     });
 
     // --- update ---
@@ -375,14 +375,14 @@ export function adapterSuite(
     });
 
     test("update nonexistent id does not mark table changed", async () => {
-      adapter.getChangedTables();
+      adapter.takeChanges().tables;
       await adapter.update("users", "missing", { age: 31 });
-      expect(adapter.getChangedTables()).toEqual([]);
+      expect(adapter.takeChanges().tables).toEqual([]);
     });
 
     test("update with empty data is a no-op", async () => {
       const id = await adapter.insert("users", { name: "alice", age: 30 });
-      adapter.getChangedTables();
+      adapter.takeChanges().tables;
 
       await adapter.update("users", id, {});
 
@@ -392,7 +392,7 @@ export function adapterSuite(
         name: "alice",
         age: 30,
       });
-      expect(adapter.getChangedTables()).toEqual([]);
+      expect(adapter.takeChanges().tables).toEqual([]);
     });
 
     // --- delete ---
@@ -407,10 +407,10 @@ export function adapterSuite(
     });
 
     test("delete nonexistent returns false", async () => {
-      adapter.getChangedTables();
+      adapter.takeChanges().tables;
       const deleted = await adapter.delete("users", "nope");
       expect(deleted).toBe(false);
-      expect(adapter.getChangedTables()).toEqual([]);
+      expect(adapter.takeChanges().tables).toEqual([]);
     });
 
     // --- upsert ---
@@ -439,7 +439,7 @@ export function adapterSuite(
 
     test("upsert with empty data no-ops existing rows", async () => {
       await adapter.insert("users", { name: "alice", age: 30 });
-      adapter.getChangedTables();
+      adapter.takeChanges().tables;
 
       await adapter.upsert("users", { name: "alice" }, {});
 
@@ -449,7 +449,7 @@ export function adapterSuite(
         .all<any>();
       expect(rows).toHaveLength(1);
       expect(rows[0].age).toBe(30);
-      expect(adapter.getChangedTables()).toEqual([]);
+      expect(adapter.takeChanges().tables).toEqual([]);
     });
 
     // --- transaction ---
@@ -501,7 +501,7 @@ export function adapterSuite(
       const rows = await adapter.query("users").all<{ name: string }>();
       expect(rows.map((row) => row.name)).toEqual(["kept"]);
       // The rollback leaves the committed transaction's change in place.
-      expect(adapter.getChangedTables()).toEqual(["users"]);
+      expect(adapter.takeChanges().tables).toEqual(["users"]);
     });
 
     test("a rollback keeps changes committed while it waited", async () => {
@@ -518,7 +518,7 @@ export function adapterSuite(
       await expect(failing).rejects.toThrow("boom");
       const rows = await adapter.query("users").all<{ name: string }>();
       expect(rows.map((row) => row.name)).toEqual(["kept"]);
-      expect(adapter.getChangedTables()).toEqual(["users"]);
+      expect(adapter.takeChanges().tables).toEqual(["users"]);
     });
 
     test("nested transaction error propagates and outer rolls back", async () => {
@@ -598,17 +598,17 @@ export function adapterSuite(
 
     // --- changedTables ---
 
-    test("getChangedTables tracks mutations", async () => {
-      adapter.getChangedTables(); // clear
+    test("takeChanges reports the tables mutations changed", async () => {
+      adapter.takeChanges().tables; // clear
       await adapter.insert("users", { name: "alice", age: 30 });
-      const changed = adapter.getChangedTables();
+      const changed = adapter.takeChanges().tables;
       expect(changed).toContain("users");
     });
 
-    test("getChangedTables clears after read", async () => {
+    test("takeChanges clears what it reported", async () => {
       await adapter.insert("users", { name: "alice", age: 30 });
-      adapter.getChangedTables();
-      const second = adapter.getChangedTables();
+      adapter.takeChanges().tables;
+      const second = adapter.takeChanges().tables;
       expect(second).toHaveLength(0);
     });
 
@@ -1434,7 +1434,7 @@ export function sqliteSchemaSuite(
       await adapter.ensureTable("items", {
         columns: { name: { type: "string" } },
       });
-      adapter.getChangedTables();
+      adapter.takeChanges().tables;
 
       await expect(
         adapter.transaction(async () => {
@@ -1444,7 +1444,7 @@ export function sqliteSchemaSuite(
       ).rejects.toThrow("rollback");
 
       expect(await adapter.query("items").count()).toBe(0);
-      expect(adapter.getChangedTables()).toEqual([]);
+      expect(adapter.takeChanges().tables).toEqual([]);
       adapter.close();
     });
 
@@ -1462,7 +1462,7 @@ export function sqliteSchemaSuite(
         }),
       ).rejects.toThrow("rollback");
 
-      expect(adapter.getChangedTables()).toEqual(["items"]);
+      expect(adapter.takeChanges().tables).toEqual(["items"]);
       adapter.close();
     });
 
@@ -1498,7 +1498,7 @@ export function sqliteSchemaSuite(
       });
 
       expect(await adapter.query("items").count()).toBe(2);
-      expect(adapter.getChangedTables()).toEqual(["items"]);
+      expect(adapter.takeChanges().tables).toEqual(["items"]);
       adapter.close();
     });
 
