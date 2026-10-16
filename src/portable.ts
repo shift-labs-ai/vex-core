@@ -29,7 +29,8 @@ export {
   RateLimitExceededError,
   RateLimiter,
 } from "./core/rate-limit.js";
-export type { StorageAdapter } from "./core/storage.js";
+export type { Changes, StorageAdapter } from "./core/storage.js";
+export { ANY_TABLE } from "./core/storage.js";
 export type {
   ExecContext,
   Span,
