@@ -20,16 +20,24 @@
  * PRAGMAs; `rawQuery`/`rawExec` surface those refusals as errors.
  */
 
+import {
+  mayChangeSchema,
+  parameterCount,
+  statementKind,
+} from "../core/sql-text.js";
 import type { StorageAdapter } from "../core/storage.js";
 import type { TableSchema } from "../core/types.js";
 import { createQueryBuilder, type DbExec } from "./shared.js";
 import {
   bulkInsertRows,
   deleteRow,
+  type ExplainRow,
   ensureSqliteTable,
   insertRow,
+  runCounted,
   SqliteAdapterState,
   type SqliteDriver,
+  type SqliteIntrospection,
   updateRow,
   upsertRow,
 } from "./sqlite-core.js";
@@ -40,7 +48,10 @@ import {
  */
 export interface DurableObjectSqlStorage {
   readonly sql: {
-    exec(query: string, ...bindings: any[]): { toArray(): any[] };
+    exec(
+      query: string,
+      ...bindings: any[]
+    ): { toArray(): any[]; readonly rowsWritten: number };
   };
   transaction<T>(closure: () => Promise<T>): Promise<T>;
   transactionSync<T>(closure: () => T): T;
@@ -52,37 +63,95 @@ export function durableObjectAdapter(
   const { sql } = storage;
   const run = (query: string, params: any[]): any[] =>
     sql.exec(query, ...params).toArray();
-  // `cursor.rowsWritten` also counts index rows, so changes come from
-  // SQLite itself.
-  const changes = (): number => run("SELECT changes() AS c", [])[0].c;
+  const value = (query: string): number =>
+    Object.values(run(query, [])[0] as Record<string, number>)[0];
+  // Each EXPLAIN gets text never used before: workerd caches statements
+  // by text, and re-running a cached EXPLAIN after its table was dropped
+  // and recreated crashes the runtime
+  // (https://github.com/cloudflare/workerd/issues/7783). The SQL API also
+  // wants every parameter bound, even to compile.
+  let explained = 0;
+  const introspection: SqliteIntrospection = {
+    explain: (statement) =>
+      run(
+        `EXPLAIN ${statement}\n/* vex ${++explained} */`,
+        new Array(parameterCount(statement)).fill(null),
+      ) as ExplainRow[],
+    rootPages: () =>
+      run(
+        "SELECT rootpage, tbl_name FROM sqlite_master WHERE rootpage > 0",
+        [],
+      ),
+  };
+  const state = new SqliteAdapterState();
 
-  const driver: SqliteDriver = {
+  // Migrations' bookkeeping writes are not changes anyone subscribes to.
+  const migrationDriver: SqliteDriver = {
     prepare: (query) => ({
       all: (...params) => run(query, params),
       get: (...params) => run(query, params)[0] ?? null,
-      run: (...params) => {
-        run(query, params);
-        return { changes: changes() };
-      },
+      run: (...params) => run(query, params),
     }),
+    // `cursor.rowsWritten` also counts index rows and trigger writes, so
+    // changes come from SQLite itself.
+    changes: () => value("SELECT changes()"),
     exec: (query) => {
       run(query, []);
     },
     atomically: (fn) => storage.transactionSync(fn),
   };
+  // A row write that wrote anything, its triggers' rows included, marks
+  // the tables it writes.
+  const driver: SqliteDriver = {
+    ...migrationDriver,
+    prepare: (query) => ({
+      ...migrationDriver.prepare(query),
+      run: (...params) => {
+        const { tables, direct } = state.written(introspection, query);
+        const cursor = sql.exec(query, ...params);
+        cursor.toArray();
+        if (cursor.rowsWritten > 0) state.markChanged(tables, direct);
+      },
+    }),
+  };
 
-  const state = new SqliteAdapterState();
-  const { markChanged } = state;
+  // Raw SQL. A single row write is counted by its cursor; text that may
+  // hold several statements, whose cursor counts only the last one's
+  // rows, by the connection's total changes.
+  function rawWrite<T>(query: string, params: any[]): T[] {
+    if (statementKind(query) === "write") {
+      const { tables, statements } = state.written(introspection, query);
+      if (statements === 1) {
+        const cursor = sql.exec(query, ...params);
+        const rows = cursor.toArray();
+        if (cursor.rowsWritten > 0) state.markChanged(tables, false);
+        return rows as T[];
+      }
+    }
+    const before = value("SELECT total_changes()");
+    try {
+      return run(query, params) as T[];
+    } finally {
+      if (mayChangeSchema(query)) state.schemaChanged();
+      if (value("SELECT total_changes()") > before) {
+        state.markChanged(state.written(introspection, query).tables, false);
+      }
+    }
+  }
+
+  // Open transactions, outermost first; inner ones are savepoints. The
+  // outermost one's writes wait in the adapter state until it commits.
+  let transactionDepth = 0;
+
   const exec: DbExec = {
     schemas: state.schemas,
-    markChanged,
     async all(query, params) {
       open();
       return driver.prepare(query).all(...params);
     },
     async run(query, params) {
       open();
-      return driver.prepare(query).run(...params);
+      return { changes: runCounted(driver, query, params) };
     },
   };
 
@@ -101,32 +170,28 @@ export function durableObjectAdapter(
       state.registerSchema(
         name,
         schema,
-        ensureSqliteTable(driver, name, schema),
+        ensureSqliteTable(migrationDriver, name, schema),
       );
     },
 
     async insert(table, row) {
       open();
-      const id = insertRow(driver, table, row);
-      markChanged(table, 1);
-      return id;
+      return insertRow(driver, table, row);
     },
 
     async upsert(table, keys, data) {
       open();
-      markChanged(table, upsertRow(driver, table, keys, data));
+      upsertRow(driver, table, keys, data);
     },
 
     async update(table, id, data) {
       open();
-      markChanged(table, updateRow(driver, table, id, data));
+      updateRow(driver, table, id, data);
     },
 
     async delete(table, id) {
       open();
-      const count = deleteRow(driver, table, id);
-      markChanged(table, count);
-      return count > 0;
+      return deleteRow(driver, table, id) > 0;
     },
 
     query(table) {
@@ -140,11 +205,16 @@ export function durableObjectAdapter(
         // another one to commit first, and the next may start as soon
         // as this one settles.
         const restore = state.snapshot();
+        if (++transactionDepth === 1) state.begin();
         try {
-          return await fn();
+          const result = await fn();
+          if (transactionDepth === 1) state.commit();
+          return result;
         } catch (error) {
           restore();
           throw error;
+        } finally {
+          transactionDepth--;
         }
       });
     },
@@ -154,21 +224,28 @@ export function durableObjectAdapter(
       ...params: any[]
     ): Promise<T[]> {
       open();
-      return run(query, params) as T[];
+      if (statementKind(query) === "read") return run(query, params) as T[];
+      return rawWrite<T>(query, params);
     },
 
     async rawExec(query: string, ...params: any[]): Promise<void> {
       open();
-      run(query, params);
+      rawWrite(query, params);
     },
 
     async bulkInsert(table, rows) {
       open();
-      markChanged(table, bulkInsertRows(driver, table, rows));
+      bulkInsertRows(driver, table, rows);
     },
 
-    getChangedTables() {
-      return state.takeChanged();
+    // The object is its database's only writer.
+    takeChanges() {
+      return state.takeChanges();
+    },
+
+    tablesRead(query: string) {
+      open();
+      return state.tablesRead(introspection, query);
     },
 
     getSchema(table) {

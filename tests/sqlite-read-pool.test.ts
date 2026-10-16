@@ -250,7 +250,8 @@ describe("SQLite read pool and statement cache", () => {
       await adapter.close();
       await adapter.close();
       storage = undefined;
-      expect(finalize).toHaveBeenCalledTimes(4);
+      // Four pooled statements, and the writer's three change counters.
+      expect(finalize).toHaveBeenCalledTimes(4 + 3);
     } finally {
       finalize.mockRestore();
     }

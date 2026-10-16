@@ -157,7 +157,20 @@ api.registerQuery("export", {
 });
 ```
 
-Reactive metadata is recorded on spans: `resultRows`, `resultBytes`, `reactive`, `budget`, and `budgetExceeded`. Query-builder reads record dependency descriptors for table, filters, selected columns, ordering, and limits. Raw SQL is tracked conservatively by parsed `FROM`/`JOIN` tables; external API work and unbounded exports should stay outside reactive queries or be marked `reactive: false`.
+Reactive metadata is recorded on spans: `resultRows`, `resultBytes`, `reactive`, `budget`, and `budgetExceeded`. Query-builder reads record dependency descriptors for table, filters, selected columns, ordering, and limits. External API work and unbounded exports should stay outside reactive queries or be marked `reactive: false`.
+
+### Change tracking and raw SQL
+
+SQLite reports what a statement reads and writes: its compiled program, as `EXPLAIN` lists it, opens a cursor on every table it touches, including the tables its triggers and foreign-key actions write. That depends only on the statement's text and the schema, never its parameters, so each text is compiled once, remembered until the schema changes, and every later run costs a cache lookup. Nothing is added to the database; no trigger runs per row.
+
+- **Writes:** a write marks the tables it writes when it changed any row (counted for free: Bun's `run().changes`, a Durable Object cursor's `rowsWritten`). That covers the query builder and `ctx.db.sql` of any shape (`INSERT`, `UPDATE … FROM`, `REPLACE`, upserts, `WITH … DELETE`, several statements in one string), plus rows written by triggers and foreign-key cascades. Tables created by raw SQL are tracked by name like any other.
+- **Transactions:** writes inside a transaction are reported when it commits, and a rolled-back one reports nothing.
+- **Other connections:** on a file database, a commit by another connection or process (`PRAGMA data_version`) marks every table changed at the next invalidation.
+- **Narrowing:** a subscription over a changed table re-runs unless an equality filter proves it could not have seen the change. Only values every touched row holds both before and after the write count as proof: an insert's row, an upsert's keys, the id of an update or delete. An update's new values do not, since the row may have just left the filtered set. A table changed by raw SQL, or by a write that ran a trigger or foreign-key action, proves nothing, and every subscription over it re-runs; narrowing on other tables is unaffected.
+- **Raw reads:** a raw read depends on exactly the tables its program reads, through views, subqueries and covering indexes. A raw read that reads no table re-runs after any write.
+- **Access policies:** raw SQL in a query context is refused when it reads a governed table, in any spelling or through any view. A literal or column that merely shares a governed table's name is not a read.
+- **Costs:** a statement's first run in a given schema compiles it once more for `EXPLAIN` (a few µs); after that, writes, reads and invalidation cost what they cost without tracking, within measurement noise. The query builder, bulk inserts and mutations run at parity with untracked writes; raw writes and raw reads run faster. On a Durable Object a single-statement write makes no more SQL calls, and bills no more rows, than without tracking; raw SQL of several statements reads `total_changes()` before and after.
+- **Adapters:** a custom `StorageAdapter` reports changes through `takeChanges`; one that cannot tell which rows a write changed lists every changed table as unattributed, and `ANY_TABLE` when it cannot tell which tables. `tablesRead` is optional: without it, or when it cannot say (a virtual table, TEMP, an attached database), a raw read depends on every registered table it names, through named views.
 
 ## Query builder
 

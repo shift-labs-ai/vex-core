@@ -4,7 +4,8 @@ import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
 import { INTERNAL_TABLES } from "./internal.js";
 import { hashResult, utf8ByteLength } from "./result-measure.js";
-import type { StorageAdapter } from "./storage.js";
+import { statementKind, tablesRead, type ViewDefinition } from "./sql-text.js";
+import { ANY_TABLE, type StorageAdapter } from "./storage.js";
 import {
   describeQueryDependencies,
   describeWrites,
@@ -84,6 +85,12 @@ function subscriptionGroupKey(subscription: Subscription): string {
 function subscriptionUserKey(user: VexUser | null | undefined): string {
   return JSON.stringify(user ? [user.id, user.name, user.isAdmin] : null);
 }
+
+/**
+ * A raw write in a mutation, as its trace records it: it names no rows,
+ * and which tables it changed the adapter reports (`takeChanges`).
+ */
+const RAW_WRITE: WriteDependency = { table: ANY_TABLE, raw: true };
 
 function groupWritesByTable(
   writes: WriteDependency[] | undefined,
@@ -577,22 +584,26 @@ export class Vex {
           sql: string,
           ...params: any[]
         ): Promise<T[]> {
-          const tables = self.extractTables(sql);
-          const governed = tables.filter((table) =>
-            self.accessPolicies.has(table),
-          );
-          if (governed.length > 0) {
-            return Promise.reject(governedRawSqlError(governed));
-          }
-          if (touchedTables || dependencies) {
-            for (const table of tables) {
-              touchedTables?.add(table);
-              dependencies?.push({ table, raw: true });
+          const read = (tables: string[]): Promise<T[]> => {
+            const governed = tables.filter((table) =>
+              self.accessPolicies.has(table),
+            );
+            if (governed.length > 0) {
+              return Promise.reject(governedRawSqlError(governed));
             }
-            if (tables.length === 0)
-              dependencies?.push({ table: "*", raw: true });
-          }
-          return self.storage.rawQuery<T>(sql, ...params);
+            if (touchedTables || dependencies) {
+              for (const table of tables) {
+                touchedTables?.add(table);
+                dependencies?.push({ table, raw: true });
+              }
+              if (tables.length === 0)
+                dependencies?.push({ table: ANY_TABLE, raw: true });
+            }
+            return self.storage.rawQuery<T>(sql, ...params);
+          };
+          // Known tables are answered at once, without a microtask hop.
+          const tables = self.rawReadTables(sql);
+          return Array.isArray(tables) ? read(tables) : tables.then(read);
         },
       },
       runtime: this.runtime(),
@@ -687,11 +698,21 @@ export class Vex {
     return tracked;
   }
 
-  private extractTables(sql: string): string[] {
-    const tables = new Set<string>();
-    const re = /\b(?:from|join)\s+["`]?([a-zA-Z_][\w]*)["`]?/gi;
-    for (const match of sql.matchAll(re)) tables.add(match[1]);
-    return [...tables];
+  /**
+   * The tables a raw statement reads: exactly, when the adapter can
+   * compile it (views and subqueries included); otherwise each registered
+   * table it names, and each one a view it names reads (sql-text.ts).
+   */
+  private rawReadTables(sql: string): string[] | Promise<string[]> {
+    const exact = this.storage.tablesRead?.(sql);
+    if (Array.isArray(exact)) return exact;
+    return Promise.resolve(exact).then(async (tables) => {
+      if (tables) return tables;
+      const views = await this.storage.rawQuery<ViewDefinition>(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'view'",
+      );
+      return tablesRead(sql, this.tables, views);
+    });
   }
 
   private buildMutationContext(
@@ -705,8 +726,8 @@ export class Vex {
           sql: string,
           ...params: any[]
         ): Promise<T[]> {
-          for (const table of self.extractTables(sql))
-            writes?.push({ table, raw: true });
+          if (statementKind(sql) !== "read" && !writes?.includes(RAW_WRITE))
+            writes?.push(RAW_WRITE);
           return self.storage.rawQuery<T>(sql, ...params);
         },
         table(name: string): MutationTable {
@@ -728,23 +749,46 @@ export class Vex {
               min: (col) => qb.min(col),
               max: (col) => qb.max(col),
               groupBy: (col, aggs) => qb.groupBy(col, aggs),
+              // Each write records the values its rows hold before and
+              // after it (WriteDependency.values): an insert's whole row,
+              // an upsert's keys that its data leaves alone, an update's or
+              // delete's id. An update's new values are not among them: the
+              // row may have left a filtered set by taking them.
               insert: (row) => {
-                writes?.push({ table: name, values: row });
+                writes?.push({
+                  table: name,
+                  values: row,
+                  columns: Object.keys(row),
+                });
                 return adapter.insert(name, row);
               },
               upsert: (keys, data) => {
-                writes?.push({ table: name, values: { ...keys, ...data } });
+                writes?.push({
+                  table: name,
+                  values: Object.fromEntries(
+                    Object.entries(keys).filter(
+                      ([column]) => !(column in data),
+                    ),
+                  ),
+                  columns: Object.keys({ ...keys, ...data }),
+                });
                 return adapter.upsert(name, keys, data);
               },
               update: (id, data) => {
-                writes?.push({ table: name, values: data });
+                writes?.push({
+                  table: name,
+                  values: { _id: id },
+                  columns: Object.keys(data),
+                });
                 return adapter.update(name, id, data);
               },
               delete: (id?) => {
+                if (typeof id === "string") {
+                  writes?.push({ table: name, values: { _id: id } });
+                  return adapter.delete(name, id);
+                }
                 writes?.push({ table: name });
-                return typeof id === "string"
-                  ? adapter.delete(name, id)
-                  : qb.delete();
+                return qb.delete();
               },
             };
           }
@@ -845,16 +889,24 @@ export class Vex {
     }
   }
 
+  /**
+   * Whether a subscription with `dependencies` may have seen the changes.
+   * Over a changed table, only equality filters that the writes' values
+   * (WriteDependency.values) rule out let it be skipped, and only when
+   * every write to the table is one of those: not over an unattributed
+   * table.
+   */
   private dependencyAffected(
     dependencies: QueryDependency[],
-    changedSet: Set<string>,
+    changed: Set<string>,
+    unattributed: Set<string>,
     writesByTable?: Map<string, WriteDependency[]>,
   ): boolean {
     if (dependencies.length === 0) return true;
     for (const dep of dependencies) {
-      if (dep.table === "*" && dep.raw) return true;
-      if (!changedSet.has(dep.table)) continue;
-      if (dep.raw) return true;
+      if (dep.table === ANY_TABLE && dep.raw) return true;
+      if (!changed.has(dep.table)) continue;
+      if (dep.raw || unattributed.has(dep.table)) return true;
       const tableWrites = writesByTable?.get(dep.table) ?? [];
       if (
         tableWrites.length === 0 ||
@@ -884,11 +936,14 @@ export class Vex {
     ectx: ExecContext,
     writes?: WriteDependency[],
   ): Promise<void> {
-    const changed = this.storage.getChangedTables();
-    if (changed.length === 0) return;
+    const changes = this.storage.takeChanges();
+    if (changes.tables.length === 0) return;
 
-    const changedSet = new Set(changed);
+    const changedSet = new Set(changes.tables);
+    const unattributed = new Set(changes.unattributed);
     const writesByTable = groupWritesByTable(writes);
+    // A change to any table affects every subscription.
+    const everything = changedSet.has(ANY_TABLE);
 
     return this.trace(
       "invalidation",
@@ -897,11 +952,14 @@ export class Vex {
       async (_invEctx, meta) => {
         const groups = new Map<string, Subscription[]>();
         for (const sub of this.subscriptions.values()) {
-          const affected = this.dependencyAffected(
-            sub.dependencies,
-            changedSet,
-            writesByTable,
-          );
+          const affected =
+            everything ||
+            this.dependencyAffected(
+              sub.dependencies,
+              changedSet,
+              unattributed,
+              writesByTable,
+            );
           if (!affected) continue;
           const key = subscriptionGroupKey(sub);
           let group = groups.get(key);
