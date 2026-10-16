@@ -67,8 +67,9 @@ export function durableObjectAdapter(
     Object.values(run(query, [])[0] as Record<string, number>)[0];
   // Each EXPLAIN gets text never used before: workerd caches statements
   // by text, and re-running a cached EXPLAIN after its table was dropped
-  // and recreated crashes the runtime. The SQL API also wants every
-  // parameter bound, even to compile.
+  // and recreated crashes the runtime
+  // (https://github.com/cloudflare/workerd/issues/7783). The SQL API also
+  // wants every parameter bound, even to compile.
   let explained = 0;
   const introspection: SqliteIntrospection = {
     explain: (statement) =>
