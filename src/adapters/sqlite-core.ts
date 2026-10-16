@@ -767,6 +767,16 @@ export class SqliteAdapterState {
 // insertRow returns the new row's id; deleteRow the number of rows it
 // deleted.
 
+/** Runs a write and answers the rows it changed itself. */
+export function runCounted(
+  db: SqliteDriver,
+  sql: string,
+  params: any[],
+): number {
+  db.prepare(sql).run(...params);
+  return db.changes();
+}
+
 export function insertRow(
   db: SqliteDriver,
   table: string,
@@ -793,8 +803,7 @@ export function updateRow(
 }
 
 export function deleteRow(db: SqliteDriver, table: string, id: string): number {
-  db.prepare(`DELETE FROM ${quoteIdent(table)} WHERE _id = ?`).run(id);
-  return db.changes();
+  return runCounted(db, `DELETE FROM ${quoteIdent(table)} WHERE _id = ?`, [id]);
 }
 
 /** Updates the row matching `keys` with `data`, or inserts both. */

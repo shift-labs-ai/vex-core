@@ -12,7 +12,15 @@ export interface QueryDependency {
 
 export interface WriteDependency {
   table: string;
+  /**
+   * Column values every row the write touched holds both before and
+   * after it: what invalidation may narrow on. A subscription filtered on
+   * another value of one of these columns cannot have seen the write.
+   * Absent when no such values are known.
+   */
   values?: Record<string, unknown>;
+  /** The columns the write set, for traces. */
+  columns?: string[];
   raw?: boolean;
 }
 
@@ -71,7 +79,7 @@ export function describeQueryDependencies(
 export function describeWrites(writes: WriteDependency[]): TraceWrite[] {
   return writes.map((write) => ({
     table: write.table,
-    ...(write.values ? { columns: Object.keys(write.values).sort() } : {}),
+    ...(write.columns ? { columns: [...write.columns].sort() } : {}),
     ...(write.raw ? { raw: true as const } : {}),
   }));
 }

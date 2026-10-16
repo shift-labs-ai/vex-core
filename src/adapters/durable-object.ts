@@ -29,6 +29,7 @@ import {
   deleteRow,
   ensureSqliteTable,
   insertRow,
+  runCounted,
   SqliteAdapterState,
   type SqliteDriver,
   updateRow,
@@ -93,10 +94,7 @@ export function durableObjectAdapter(
       return driver.prepare(query).all(...params);
     },
     async run(query, params) {
-      return write(() => {
-        driver.prepare(query).run(...params);
-        return { changes: driver.changes() };
-      });
+      return write(() => ({ changes: runCounted(driver, query, params) }));
     },
   };
 

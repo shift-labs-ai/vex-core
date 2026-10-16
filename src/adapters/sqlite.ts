@@ -13,6 +13,7 @@ import {
   deleteRow,
   ensureSqliteTable,
   insertRow,
+  runCounted,
   SqliteAdapterState,
   type SqliteDriver,
   updateRow,
@@ -73,20 +74,8 @@ interface Waiter<T> {
 const SQLITE_READ_POOL_SIZE = 4;
 const SQLITE_STATEMENT_CACHE_SIZE = 64;
 
-/**
- * The rows `connection`'s last statement changed itself. Bun's
- * `run().changes` is the connection's total-changes delta, which also
- * counts rows the change triggers wrote; SQLite's `changes()` does not.
- */
-function changes(connection: SqliteConnection): number {
-  const row = connection.statements
-    .prepare("SELECT changes() AS changes")
-    .get() as { changes: number };
-  return row.changes;
-}
-
 function wrapSync(
-  writer: SqliteConnection,
+  writer: SqliteDriver,
   state: SqliteAdapterState,
   write: <T>(fn: () => T) => Promise<T>,
   withReadConnection: <T>(
@@ -103,10 +92,7 @@ function wrapSync(
       );
     },
     async run(sql, params) {
-      return write(() => {
-        writer.statements.prepare(sql).run(...params);
-        return { changes: changes(writer) };
-      });
+      return write(() => ({ changes: runCounted(writer, sql, params) }));
     },
   };
 }
@@ -333,7 +319,14 @@ export function sqliteAdapter(
   // or, for ensureTable, synchronously between awaits.
   const writerDriver: SqliteDriver = {
     prepare: (sql) => writer.statements.prepare(sql),
-    changes: () => changes(writer),
+    // Bun's `run().changes` is the connection's total-changes delta, which
+    // also counts rows triggers wrote; SQLite's `changes()` does not.
+    changes: () =>
+      (
+        writer.statements.prepare("SELECT changes() AS c").get() as {
+          c: number;
+        }
+      ).c,
     exec: (sql) => db.exec(sql),
     atomically: (fn) => db.transaction(fn)(),
   };
@@ -352,7 +345,7 @@ export function sqliteAdapter(
     });
   }
 
-  const exec = wrapSync(writer, state, write, withReadConnection);
+  const exec = wrapSync(writerDriver, state, write, withReadConnection);
 
   return {
     name: "sqlite",

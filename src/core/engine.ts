@@ -749,23 +749,46 @@ export class Vex {
               min: (col) => qb.min(col),
               max: (col) => qb.max(col),
               groupBy: (col, aggs) => qb.groupBy(col, aggs),
+              // Each write records the values its rows hold before and
+              // after it (WriteDependency.values): an insert's whole row,
+              // an upsert's keys that its data leaves alone, an update's or
+              // delete's id. An update's new values are not among them: the
+              // row may have left a filtered set by taking them.
               insert: (row) => {
-                writes?.push({ table: name, values: row });
+                writes?.push({
+                  table: name,
+                  values: row,
+                  columns: Object.keys(row),
+                });
                 return adapter.insert(name, row);
               },
               upsert: (keys, data) => {
-                writes?.push({ table: name, values: { ...keys, ...data } });
+                writes?.push({
+                  table: name,
+                  values: Object.fromEntries(
+                    Object.entries(keys).filter(
+                      ([column]) => !(column in data),
+                    ),
+                  ),
+                  columns: Object.keys({ ...keys, ...data }),
+                });
                 return adapter.upsert(name, keys, data);
               },
               update: (id, data) => {
-                writes?.push({ table: name, values: data });
+                writes?.push({
+                  table: name,
+                  values: { _id: id },
+                  columns: Object.keys(data),
+                });
                 return adapter.update(name, id, data);
               },
               delete: (id?) => {
+                if (typeof id === "string") {
+                  writes?.push({ table: name, values: { _id: id } });
+                  return adapter.delete(name, id);
+                }
                 writes?.push({ table: name });
-                return typeof id === "string"
-                  ? adapter.delete(name, id)
-                  : qb.delete();
+                return qb.delete();
               },
             };
           }

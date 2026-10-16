@@ -45,6 +45,7 @@ describe("trace metadata", () => {
       {
         table: "documents",
         values: { workspaceId: "workspace-secret", content: secret },
+        columns: ["workspaceId", "content"],
       },
       { table: "documents" },
       { table: "documents", raw: true },

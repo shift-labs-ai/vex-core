@@ -274,6 +274,13 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
             return ctx.db.table("items").where("scope", "=", args.scope).all();
           },
         });
+        api.registerQuery("byId", {
+          args: { id: "string" },
+          async handler(ctx, args) {
+            count(`id:${args.id}`);
+            return ctx.db.table("items").where("_id", "=", args.id).first();
+          },
+        });
         api.registerQuery("raw", {
           args: { sql: "string" },
           async handler(ctx, args) {
@@ -295,6 +302,22 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
         api.registerMutation("add", {
           args: { scope: "string", name: "string" },
           handler: (ctx, args) => ctx.db.table("items").insert(args),
+        });
+        api.registerMutation("move", {
+          args: { id: "string", scope: "string" },
+          handler: (ctx, args) =>
+            ctx.db.table("items").update(args.id, { scope: args.scope }),
+        });
+        api.registerMutation("upsertScope", {
+          args: { name: "string", scope: "string" },
+          handler: (ctx, args) =>
+            ctx.db
+              .table("items")
+              .upsert({ name: args.name }, { scope: args.scope }),
+        });
+        api.registerMutation("remove", {
+          args: { id: "string" },
+          handler: (ctx, args) => ctx.db.table("items").delete(args.id),
         });
         api.registerMutation("addOther", {
           args: {},
@@ -375,6 +398,45 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
         const c = runs["scope:c"];
         await vex.mutate("ct.add", { scope: "b", name: "b2" });
         expect(runs["scope:c"]).toBe(c);
+      });
+    });
+
+    test("an update or upsert that moves a row out of a filtered set re-runs that set", async () => {
+      await withFixture(async ({ vex, runs }) => {
+        const [row] = await vex.query("ct.scope", { scope: "a" });
+        let seen: unknown[] = [];
+        await vex.subscribe("ct.scope", { scope: "a" }, (rows) => {
+          seen = rows;
+        });
+        expect(seen).toHaveLength(1);
+        // The new value is "b": only the row's id holds before and after.
+        await vex.mutate("ct.move", { id: row._id, scope: "b" });
+        expect(seen).toEqual([]);
+
+        await vex.mutate("ct.move", { id: row._id, scope: "a" });
+        expect(seen).toHaveLength(1);
+        const before = runs["scope:a"];
+        // Matched by name, it leaves scope "a" by its data, not its keys.
+        await vex.mutate("ct.upsertScope", { name: "a1", scope: "c" });
+        expect(runs["scope:a"]).toBe(before + 1);
+        expect(seen).toEqual([]);
+      });
+    });
+
+    test("writes addressed by id narrow on the id", async () => {
+      await withFixture(async ({ vex, runs }) => {
+        const [row] = await vex.query("ct.scope", { scope: "a" });
+        await vex.mutate("ct.add", { scope: "a", name: "a2" });
+        const rows = await vex.query("ct.scope", { scope: "a" });
+        const other = rows.find((r: { _id: string }) => r._id !== row._id);
+        await vex.subscribe("ct.byId", { id: row._id }, () => {});
+        await vex.subscribe("ct.byId", { id: other._id }, () => {});
+        const mine = runs[`id:${row._id}`];
+        const theirs = runs[`id:${other._id}`];
+        await vex.mutate("ct.move", { id: other._id, scope: "b" });
+        await vex.mutate("ct.remove", { id: other._id });
+        expect(runs[`id:${row._id}`]).toBe(mine);
+        expect(runs[`id:${other._id}`]).toBe(theirs + 2);
       });
     });
 
