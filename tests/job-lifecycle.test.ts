@@ -7,8 +7,8 @@
  * them consistent:
  *   - the last call for a name decides its handler, its `_jobs` row and
  *     its timer
- *   - a closed engine arms nothing, and refuses `addJob` and
- *     `subscribe`
+ *   - a closed engine arms nothing, starts no job run, and refuses job
+ *     changes, job runs and subscriptions
  */
 
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
@@ -23,9 +23,12 @@ afterEach(async () => {
   open = [];
 });
 
-async function engine(): Promise<Vex> {
+async function engine(
+  jobScheduler: "timers" | "external" = "timers",
+): Promise<Vex> {
   const vex = await Vex.create({
     storage: sqliteAdapter(":memory:"),
+    jobScheduler,
     plugins: [
       (api: VexPluginAPI) => {
         api.setName("t");
@@ -142,15 +145,72 @@ describe("a closed engine", () => {
     }
   });
 
-  test("refuses addJob and subscribe", async () => {
+  test("refuses job changes, job runs and subscriptions", async () => {
     const vex = await engine();
+    await vex.addJob("x", counting().job);
     await vex.close();
-    await expect(vex.addJob("x", counting().job)).rejects.toThrow(
-      "Vex engine is closed",
-    );
-    await expect(vex.subscribe("t.pure", {}, () => {})).rejects.toThrow(
-      "Vex engine is closed",
-    );
+    for (const call of [
+      () => vex.addJob("y", counting().job),
+      () => vex.removeJob("x"),
+      () => vex.setJobEnabled("x", false),
+      () => vex.triggerJob("x"),
+      () => vex.runDueJobs(),
+      () => vex.subscribe("t.pure", {}, () => {}),
+    ]) {
+      await expect(call()).rejects.toThrow("Vex engine is closed");
+    }
+  });
+
+  test("a subscribe in flight when close() runs registers nothing", async () => {
+    const vex = await engine();
+    const subscribing = vex.subscribe("t.pure", {}, () => {});
+    await vex.close();
+    await expect(subscribing).rejects.toThrow("Vex engine is closed");
+    expect(vex.activeSubscriptionCount()).toBe(0);
+  });
+
+  test("runDueJobs starts no further job once close() is called", async () => {
+    const vex = await engine("external");
+    const ran: string[] = [];
+    await vex.addJob("a", {
+      schedule: "every 1s",
+      handler() {
+        ran.push("a");
+        void vex.close();
+      },
+    });
+    await vex.addJob("b", {
+      schedule: "every 1s",
+      handler() {
+        ran.push("b");
+      },
+    });
+    await vex.runDueJobs(Date.now() + 60_000);
+    expect(ran).toEqual(["a"]);
+  });
+
+  test("a failing job makes no further attempt once close() is called", async () => {
+    const vex = await engine("external");
+    let attempts = 0;
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await vex.addJob("flaky", {
+        schedule: "every 1s",
+        retries: 3,
+        retryDelayMs: 50,
+        handler() {
+          attempts++;
+          throw new Error("down");
+        },
+      });
+      const running = vex.triggerJob("flaky");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await vex.close();
+      expect(await running).toMatchObject({ status: "error", error: "down" });
+      expect(attempts).toBe(1);
+    } finally {
+      errors.mockRestore();
+    }
   });
 
   test("a mutation after close() fails, in storage", async () => {

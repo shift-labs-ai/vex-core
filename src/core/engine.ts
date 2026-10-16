@@ -155,7 +155,8 @@ export class Vex {
   // name: the last call for a name decides its row and its timer.
   private jobChanges: Map<string, Promise<void>> = new Map();
   private jobScheduler: "timers" | "external" = "timers";
-  // Set by close(): a closed engine accepts no job or subscription.
+  // Set by close(): a closed engine refuses job changes, job runs and
+  // subscriptions.
   private closing: Promise<void> | null = null;
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
@@ -542,9 +543,11 @@ export class Vex {
         // so retries and future ticks never overlap a live handler.
         if (handlerPromise) await handlerPromise.catch(() => {});
 
-        if (attempt < maxRetries) {
+        // A closed engine starts no further attempt.
+        if (attempt < maxRetries && !this.closing) {
           await new Promise((r) => setTimeout(r, retryDelay));
         }
+        if (this.closing) break;
       }
     }
 
@@ -552,6 +555,7 @@ export class Vex {
   }
 
   async triggerJob(name: string) {
+    this.assertOpen();
     const handler = this.jobHandlers.get(name);
     if (!handler) throw new Error(`Job not found: ${name}`);
     return this.executeJob(name, handler);
@@ -571,8 +575,11 @@ export class Vex {
   async runDueJobs(
     now = Date.now(),
   ): Promise<Array<JobRunResult & { name: string }>> {
+    this.assertOpen();
     const results: Array<JobRunResult & { name: string }> = [];
     for (const { name, nextRun } of await this.scheduledJobs()) {
+      // A close() during an earlier run starts no further one.
+      if (this.closing) break;
       const handler = this.jobHandlers.get(name);
       if (!handler || nextRun > now) continue;
       results.push({ name, ...(await this.executeJob(name, handler)) });
@@ -1217,6 +1224,9 @@ export class Vex {
         dependencies,
         user,
       };
+      // A close() during the first run has already dropped every
+      // subscription; this one must not outlive it.
+      this.assertOpen();
       this.subscriptions.set(subId, sub);
       try {
         deliverSubscriptionResult(callback, result, measurement.serialized);
@@ -1435,20 +1445,22 @@ export class Vex {
   }
 
   /**
-   * Closes the engine: from the call on, it refuses jobs and
-   * subscriptions. Job changes in flight finish without arming a timer,
-   * running jobs settle, and then storage closes. Calling it again
-   * returns the same promise.
+   * Closes the engine. From the call on it refuses job changes, job runs
+   * and subscriptions, and no timer starts a job. Job changes in flight
+   * finish without arming a timer, running jobs settle, and then storage
+   * closes. Calling it again returns the same promise.
    */
   close(): Promise<void> {
-    this.closing ??= this.shutDown();
+    if (!this.closing) {
+      for (const timer of this.cronTimers.values()) clearTimeout(timer);
+      this.cronTimers.clear();
+      this.closing = this.shutDown();
+    }
     return this.closing;
   }
 
   private async shutDown(): Promise<void> {
     await Promise.allSettled([...this.jobChanges.values()]);
-    for (const timer of this.cronTimers.values()) clearTimeout(timer);
-    this.cronTimers.clear();
     await Promise.allSettled([...this.runningJobs.values()]);
     this.subscriptions.clear();
     await this.storage.close();
