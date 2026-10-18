@@ -838,20 +838,26 @@ export class Vex {
                 return adapter.upsert(name, keys, data);
               },
               update: (id, data) => {
+                const target = rowId(name, "update", id);
                 writes?.push({
                   table: name,
-                  values: { _id: id },
+                  values: { _id: target },
                   columns: Object.keys(data),
                 });
-                return adapter.update(name, id, data);
+                return adapter.update(name, target, data);
               },
-              delete: (id?) => {
-                if (typeof id === "string") {
-                  writes?.push({ table: name, values: { _id: id } });
-                  return adapter.delete(name, id);
+              // No argument deletes every row the filters match; an
+              // argument is one row's id, which `rowId` holds to a
+              // string: read as "no argument", a missing id would empty
+              // the table.
+              delete: (...args: [id?: string]) => {
+                if (args.length === 0) {
+                  writes?.push({ table: name });
+                  return qb.delete();
                 }
-                writes?.push({ table: name });
-                return qb.delete();
+                const target = rowId(name, "delete", args[0]);
+                writes?.push({ table: name, values: { _id: target } });
+                return adapter.delete(name, target);
               },
             };
           }
@@ -1497,6 +1503,22 @@ function claimTableNames(plugins: PluginDef[]): void {
       }
     }
   }
+}
+
+/**
+ * `id` as the row id an update or delete addresses. Anything but a
+ * non-empty string (a NULL `_id` read back, an undefined field)
+ * addresses no row, so the call throws instead of matching none, or,
+ * for `delete`, reading as the filtered bulk delete.
+ */
+function rowId(table: string, verb: "update" | "delete", id: unknown): string {
+  if (typeof id === "string" && id !== "") return id;
+  const got = id === "" ? "an empty string" : String(id);
+  throw new Error(
+    verb === "delete"
+      ? `${table}.delete(id) needs a row id, got ${got}; call delete() with no argument to delete the rows the filters match`
+      : `${table}.update(id) needs a row id, got ${got}`,
+  );
 }
 
 function normalizeCallContext(callCtx?: ExecContext | CallContext): {

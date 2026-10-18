@@ -108,9 +108,14 @@ export interface MutationTable {
   // Write
   insert(row: Record<string, any>): Promise<string>;
   upsert(keys: Record<string, any>, data: Record<string, any>): Promise<void>;
+  /** Updates one row; an id that is not a non-empty string throws. */
   update(id: string, data: Record<string, any>): Promise<void>;
 
-  // Overloaded: delete(id) for single row, delete() for bulk with filters
+  /**
+   * `delete(id)` deletes one row; `delete()` deletes every row the
+   * filters match. An id that is not a non-empty string throws rather
+   * than reading as `delete()`.
+   */
   delete(id?: string): Promise<boolean | number>;
 }
 

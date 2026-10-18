@@ -1494,3 +1494,86 @@ describe("handler timeout", () => {
     await tvex.close();
   });
 });
+
+describe("writes by row id", () => {
+  /** An engine over one table, with a NULL-id row already in it: SQLite
+   *  allows NULL in a TEXT primary key, and raw SQL can write one. */
+  async function boot() {
+    const vex = await Vex.create({
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("del");
+          api.registerTable("rows", { columns: { name: { type: "string" } } });
+          api.registerMutation("deleteRead", {
+            args: { name: "string" },
+            async handler(ctx, args) {
+              const row = await ctx.db
+                .table("rows")
+                .where("name", "=", args.name)
+                .first<{ _id: string }>();
+              return ctx.db.table("rows").delete(row?._id);
+            },
+          });
+          api.registerMutation("deleteMatching", {
+            args: { name: "string" },
+            handler: (ctx, args) =>
+              ctx.db.table("rows").where("name", "=", args.name).delete(),
+          });
+          api.registerMutation("renameRead", {
+            args: { name: "string", to: "string" },
+            async handler(ctx, args) {
+              const row = await ctx.db
+                .table("rows")
+                .where("name", "=", args.name)
+                .first<{ _id: string }>();
+              return ctx.db.table("rows").update(row?._id as string, {
+                name: args.to,
+              });
+            },
+          });
+        },
+      ],
+      storage: sqliteAdapter(":memory:"),
+    });
+    await vex.unsafeSql(
+      "INSERT INTO rows (_id, name) VALUES (NULL, 'nameless'), ('a1', 'keep'), ('b2', 'gone')",
+    );
+    return vex;
+  }
+  const names = async (vex: Vex) =>
+    (
+      (await vex.unsafeSql("SELECT name FROM rows ORDER BY name")) as Array<{
+        name: string;
+      }>
+    ).map((r) => r.name);
+
+  test("an id that is not a string is refused, never read as delete-everything", async () => {
+    const vex = await boot();
+    await expect(
+      vex.mutate("del.deleteRead", { name: "nameless" }),
+    ).rejects.toThrow("rows.delete(id) needs a row id, got null");
+    await expect(
+      vex.mutate("del.deleteRead", { name: "absent" }),
+    ).rejects.toThrow("got undefined");
+    expect(await names(vex)).toEqual(["gone", "keep", "nameless"]);
+    await vex.close();
+  });
+
+  test("an update by an id that is not a string throws instead of matching nothing", async () => {
+    const vex = await boot();
+    await expect(
+      vex.mutate("del.renameRead", { name: "nameless", to: "named" }),
+    ).rejects.toThrow("rows.update(id) needs a row id, got null");
+    await vex.mutate("del.renameRead", { name: "keep", to: "kept" });
+    expect(await names(vex)).toEqual(["gone", "kept", "nameless"]);
+    await vex.close();
+  });
+
+  test("delete(id) removes one row and delete() the rows the filters match", async () => {
+    const vex = await boot();
+    expect(await vex.mutate("del.deleteRead", { name: "keep" })).toBeTruthy();
+    expect(await vex.mutate("del.deleteMatching", { name: "gone" })).toBe(1);
+    expect(await names(vex)).toEqual(["nameless"]);
+    await vex.close();
+  });
+});
