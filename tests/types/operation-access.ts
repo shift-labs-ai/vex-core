@@ -7,6 +7,8 @@
 
 import type { PluginFunction, VexPluginAPI } from "../../src/core/api.js";
 import { Vex } from "../../src/core/engine.js";
+import { vexHandler } from "../../src/http/vex-handler.js";
+import { vexWebSocket } from "../../src/http/vex-websocket.js";
 import type { StorageAdapter } from "../../src/core/storage.js";
 import type { MiddlewareFn } from "../../src/core/types.js";
 
@@ -86,6 +88,39 @@ Vex.create<Access>({
     },
   ],
 });
+
+// A bare `Vex` holds an engine of any declaration, so code that only
+// calls it needs no type parameter.
+export async function holders() {
+  const held: Vex = await requiring;
+  const alsoHeld: Vex = await plain;
+  // Code that reads the declarations names them.
+  const reads: Vex<Access> = await requiring;
+  // The transports are such code that only calls the engine.
+  vexHandler(await requiring);
+  vexWebSocket(await requiring);
+  void [held, alsoHeld, reads];
+}
+
+// The engine describes each operation with its declaration, typed as
+// possibly missing and never widened.
+export async function descriptions() {
+  const engine = await requiring;
+  const described = engine.describeQuery("declared.list");
+  const access: Access | undefined = described?.access;
+  // @ts-expect-error A | undefined, not any
+  const widened: number = described?.access;
+  const listed: Access | undefined = (await engine.introspect()).mutations[0]
+    ?.access;
+  void [access, widened, listed];
+}
+
+// Nor is the declaration inferred from where the engine goes.
+export async function destination() {
+  // @ts-expect-error created without one, so it declares nothing
+  const target: Vex<Access> = await Vex.create({ storage, plugins: [] });
+  void target;
+}
 
 // ─── An app that chooses none ───
 
