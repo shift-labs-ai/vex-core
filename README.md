@@ -205,6 +205,8 @@ vex.use((ctx, info, next) => {
 });
 ```
 
+Code that only calls the engine holds it as a bare `Vex`, which holds an engine of any declaration; code that reads the declarations names the type (`Vex<Access>`). The type parameter is never inferred, from the plugins or from where the engine goes.
+
 Types vanish at runtime, so `info.access` is typed as possibly `undefined`: a gate must refuse what a cast let through. A plugin written against `VexPluginAPI` with no declaration is not accepted by an engine that requires one, and neither are file-based definitions (`vex-core/framework`), which declare none. Without a type parameter there is no declaration, and nothing changes.
 
 ## Query builder
