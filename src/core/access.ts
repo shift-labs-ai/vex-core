@@ -27,10 +27,15 @@
  *     re-runs): governed. Restricted terminal reads evaluate in JS
  *     over policy-accepted rows; unrestricted calls delegate to SQL
  *     untouched.
- *   - Raw SQL in a query context that mentions a governed table:
- *     refused for EVERY caller. A handler that works for admins and
- *     breaks for members is the bug class this module removes, and
+ *   - Raw SQL in a query context (`ctx.db.sql`) that reads a governed
+ *     table: refused for EVERY caller. A handler that works for admins
+ *     and breaks for members is the bug class this module removes, and
  *     there is no escape hatch on purpose.
+ *   - Published SQL (`ctx.db.publishedSql`), SQL someone other than the
+ *     app wrote: it reads a governed table only if the table is
+ *     published, and only for callers its policy leaves UNRESTRICTED.
+ *     Raw SQL cannot apply a row filter, so a restricted caller is
+ *     refused rather than shown rows their policy would hide.
  *   - Mutation contexts (mutations, jobs, webhooks): the trusted
  *     tier. Writes carry their own guards; reads there are engine
  *     plumbing, not user-facing answers.
@@ -510,5 +515,15 @@ export function governedRawSqlError(tables: string[]): Error {
   const list = tables.map((t) => `"${t}"`).join(", ");
   return new Error(
     `Raw SQL cannot read access-governed table${tables.length > 1 ? "s" : ""} ${list} from a query context — read through ctx.db.table() so the table's access policy applies`,
+  );
+}
+
+/**
+ * The refusal for published SQL that reads a governed table for a caller
+ * its policy restricts: raw SQL cannot apply the row filter.
+ */
+export function publishedGovernedError(table: string): Error {
+  return new Error(
+    `Published table "${table}" is access-governed: SQL reads it only for callers its policy leaves unrestricted`,
   );
 }
