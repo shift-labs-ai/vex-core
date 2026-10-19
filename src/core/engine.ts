@@ -105,13 +105,27 @@ function groupWritesByTable(
   return byTable;
 }
 
-interface RegisteredQuery {
+interface RegisteredQuery<A> {
   plugin: string;
-  def: QueryDef;
+  def: QueryDef<A>;
 }
-interface RegisteredMutation {
+interface RegisteredMutation<A> {
   plugin: string;
-  def: MutationDef;
+  def: MutationDef<A>;
+}
+
+/**
+ * How the engine describes a query or mutation, wherever it does: its
+ * plugin, its args, and the access it declares (`OperationAccess`).
+ */
+function describeOperation<A>(
+  registered: RegisteredQuery<A> | RegisteredMutation<A>,
+) {
+  return {
+    plugin: registered.plugin,
+    args: registered.def.args,
+    access: registered.def.access,
+  };
 }
 
 interface JobRunResult {
@@ -120,8 +134,13 @@ interface JobRunResult {
   durationMs: number;
 }
 
-export interface VexOptions {
-  plugins: Array<PluginFunction | PluginDef>;
+/**
+ * `A` is the app's access declaration (`OperationAccess`): what every
+ * query and mutation of every plugin must declare. Unchosen, there is
+ * none to declare.
+ */
+export interface VexOptions<A = undefined> {
+  plugins: Array<PluginFunction<A> | PluginDef<A>>;
   storage: StorageAdapter;
   tracer?: Tracer;
   appId?: string;
@@ -136,14 +155,14 @@ export interface VexOptions {
   jobScheduler?: "timers" | "external";
 }
 
-export class Vex {
+export class Vex<A = undefined> {
   private storage: StorageAdapter;
-  private plugins: PluginDef[] = [];
-  private queries: Map<string, RegisteredQuery> = new Map();
-  private mutations: Map<string, RegisteredMutation> = new Map();
+  private plugins: PluginDef<A>[] = [];
+  private queries: Map<string, RegisteredQuery<A>> = new Map();
+  private mutations: Map<string, RegisteredMutation<A>> = new Map();
   private subscriptions: Map<string, Subscription> = new Map();
   private tables: Set<string> = new Set();
-  private middleware: MiddlewareFn[] = [];
+  private middleware: MiddlewareFn<A>[] = [];
   // Row-level access policies by table (core/access.ts). Applied to
   // every query-context read; mutation contexts are the trusted tier.
   private accessPolicies: Map<string, TableAccessPolicy<any>> = new Map();
@@ -212,8 +231,14 @@ export class Vex {
 
   // ─── Factory ───
 
-  static async create(options: VexOptions): Promise<Vex> {
-    const vex = new Vex(options.storage);
+  /**
+   * `A` is never inferred from the plugins: an app names its access
+   * declaration (`Vex.create<Access>`) or has none.
+   */
+  static async create<A = undefined>(
+    options: VexOptions<NoInfer<A>>,
+  ): Promise<Vex<A>> {
+    const vex = new Vex<A>(options.storage);
     if (options.tracer) vex.tracer = options.tracer;
     if (options.appId) vex.appId = options.appId;
     if (options.jobScheduler) vex.jobScheduler = options.jobScheduler;
@@ -245,7 +270,7 @@ export class Vex {
 
   // ─── Internal ───
 
-  private async registerPlugin(plugin: PluginDef): Promise<void> {
+  private async registerPlugin(plugin: PluginDef<A>): Promise<void> {
     if (plugin.middleware) this.middleware.push(...plugin.middleware);
 
     for (const [tableName, schema] of Object.entries(plugin.tables)) {
@@ -887,7 +912,7 @@ export class Vex {
 
   private async runMiddleware(
     ctx: QueryContext | MutationContext,
-    info: MiddlewareInfo,
+    info: MiddlewareInfo<A>,
     handler: () => Promise<any> | any,
     ectx: ExecContext,
   ): Promise<any> {
@@ -909,7 +934,7 @@ export class Vex {
     });
   }
 
-  private resolveReactive(def: QueryDef): false | Required<ReactiveBudget> {
+  private resolveReactive(def: QueryDef<A>): false | Required<ReactiveBudget> {
     if (def.reactive === false) return false;
     return {
       maxRows: def.reactive?.maxRows ?? this.reactiveDefaults.maxRows,
@@ -1065,7 +1090,12 @@ export class Vex {
             );
             const result = await this.runMiddleware(
               ctx,
-              { type: "query", name: first.queryName, args: first.args },
+              {
+                type: "query",
+                name: first.queryName,
+                args: first.args,
+                access: reg.def.access,
+              },
               () => reg.def.handler(ctx, first.args),
               _invEctx,
             );
@@ -1111,7 +1141,7 @@ export class Vex {
 
   // ─── Public API ───
 
-  use(fn: MiddlewareFn) {
+  use(fn: MiddlewareFn<A>) {
     this.middleware.push(fn);
   }
 
@@ -1130,7 +1160,7 @@ export class Vex {
       const ctx = this.buildQueryContext(tables, user, dependencies);
       const result = await this.runMiddleware(
         ctx,
-        { type: "query", name, args },
+        { type: "query", name, args, access: reg.def.access },
         () => reg.def.handler(ctx, args),
         ectx,
       );
@@ -1167,7 +1197,7 @@ export class Vex {
       const result = await this.storage.transaction(() =>
         this.runMiddleware(
           ctx,
-          { type: "mutation", name, args },
+          { type: "mutation", name, args, access: reg.def.access },
           () => reg.def.handler(ctx, args),
           ectx,
         ),
@@ -1203,7 +1233,7 @@ export class Vex {
       const ctx = this.buildQueryContext(tables, user, dependencies);
       const result = await this.runMiddleware(
         ctx,
-        { type: "query", name, args },
+        { type: "query", name, args, access: reg.def.access },
         () => reg.def.handler(ctx, args),
         _ectx,
       );
@@ -1276,7 +1306,7 @@ export class Vex {
           } as WebhookResponse;
         }
         const ctx = this.buildMutationContext();
-        const info: MiddlewareInfo = {
+        const info: MiddlewareInfo<A> = {
           type: "webhook",
           name: `${match.plugin}.${match.name}`,
           args: req.body ?? {},
@@ -1410,11 +1440,11 @@ export class Vex {
 
   describeQuery(name: string) {
     const q = this.queries.get(name);
-    return q ? { plugin: q.plugin, args: q.def.args } : null;
+    return q ? describeOperation(q) : null;
   }
   describeMutation(name: string) {
     const m = this.mutations.get(name);
-    return m ? { plugin: m.plugin, args: m.def.args } : null;
+    return m ? describeOperation(m) : null;
   }
 
   async introspect() {
@@ -1423,13 +1453,11 @@ export class Vex {
     );
     const queries = [...this.queries.entries()].map(([name, q]) => ({
       name,
-      plugin: q.plugin,
-      args: q.def.args,
+      ...describeOperation(q),
     }));
     const mutations = [...this.mutations.entries()].map(([name, m]) => ({
       name,
-      plugin: m.plugin,
-      args: m.def.args,
+      ...describeOperation(m),
     }));
     return {
       tables,
@@ -1479,7 +1507,7 @@ export class Vex {
 // other's inserts, and a rename whose previous name is in use takes that
 // table away. Names are compared case-insensitively, as SQLite does, and
 // all of them are checked before any table is migrated.
-function claimTableNames(plugins: PluginDef[]): void {
+function claimTableNames<A>(plugins: PluginDef<A>[]): void {
   const claimants = new Map<string, string>();
   const claim = (table: string, claimant: string) => {
     const existing = claimants.get(table.toLowerCase());

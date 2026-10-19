@@ -59,7 +59,10 @@ export interface VexHandlerOptions {
 /** The default ceiling on a `/query`, `/mutate` or webhook body. */
 export const DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
 
-export function vexHandler(vex: Vex, opts: VexHandlerOptions = {}): Router {
+export function vexHandler<A>(
+  vex: Vex<A>,
+  opts: VexHandlerOptions = {},
+): Router {
   const getUser = opts.getUser ?? ((c: RequestCtx) => c.user ?? null);
   const rpcLimits: ReadLimits = {
     maxBytes: opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
@@ -121,7 +124,7 @@ function makeCallHandler(
   };
 }
 
-function makeWebhookHandler(vex: Vex, limits: ReadLimits): Handler {
+function makeWebhookHandler<A>(vex: Vex<A>, limits: ReadLimits): Handler {
   return async (ctx: RequestCtx): Promise<Response> => {
     // URLPattern's `*` capture for `/webhook/*` lands in params["0"].
     // The leading slash is not captured, so prepend one; an empty

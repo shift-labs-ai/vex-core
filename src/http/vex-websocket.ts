@@ -166,8 +166,8 @@ export interface VexWebSocketHandlers {
 const AUTH_TIMEOUT_DEFAULT_MS = 10_000;
 const POLICY_VIOLATION_CLOSE_CODE = 1008;
 
-export function vexWebSocket(
-  vex: Vex,
+export function vexWebSocket<A>(
+  vex: Vex<A>,
   opts: VexWebSocketOptions = {},
 ): VexWebSocketHandlers {
   const getUser = opts.getUser ?? (() => null);
@@ -399,8 +399,8 @@ function parseFrame(value: unknown): ClientFrame | null {
 
 // ─── Dispatch ─────────────────────────────────────────────
 
-async function dispatch(
-  vex: Vex,
+async function dispatch<A>(
+  vex: Vex<A>,
   ws: VexWebSocket,
   frame: ClientFrame,
 ): Promise<void> {
@@ -425,8 +425,8 @@ async function dispatch(
   }
 }
 
-async function handleSubscribe(
-  vex: Vex,
+async function handleSubscribe<A>(
+  vex: Vex<A>,
   ws: VexWebSocket,
   frame: { id: string; name: string; args?: Record<string, unknown> },
 ): Promise<void> {
@@ -488,8 +488,8 @@ function handleUnsubscribe(ws: VexWebSocket, frame: { id: string }): void {
   }
 }
 
-async function handleQuery(
-  vex: Vex,
+async function handleQuery<A>(
+  vex: Vex<A>,
   ws: VexWebSocket,
   frame: { id: string; name: string; args?: Record<string, unknown> },
 ): Promise<void> {
@@ -505,8 +505,8 @@ async function handleQuery(
   }
 }
 
-async function handleMutate(
-  vex: Vex,
+async function handleMutate<A>(
+  vex: Vex<A>,
   ws: VexWebSocket,
   frame: { id: string; name: string; args?: Record<string, unknown> },
 ): Promise<void> {

@@ -174,19 +174,33 @@ export interface ReactiveBudget {
   maxBytes?: number;
 }
 
-export interface QueryDef {
+/**
+ * What a query or mutation declares about who may run it. Its shape is
+ * the app's, chosen as `Vex.create<A>`: then every query and mutation
+ * must declare one, and leaving it out does not compile. The engine
+ * decides nothing with it; it hands it to middleware with every call
+ * (`MiddlewareInfo.access`) and answers it in `describeQuery` and
+ * `describeMutation`, so the app's own gate decides, and can list what
+ * every operation needs. An app that chooses none (`undefined`, the
+ * default) declares none.
+ */
+export type OperationAccess<A> = undefined extends A
+  ? { access?: A }
+  : { access: A };
+
+export type QueryDef<A = undefined> = {
   args: Record<string, string>;
   reactive?: false | ReactiveBudget;
   handler: (ctx: QueryContext, args: Record<string, any>) => Promise<any> | any;
-}
+} & OperationAccess<A>;
 
-export interface MutationDef {
+export type MutationDef<A = undefined> = {
   args: Record<string, string>;
   handler: (
     ctx: MutationContext,
     args: Record<string, any>,
   ) => Promise<any> | any;
-}
+} & OperationAccess<A>;
 
 export interface JobDef {
   schedule: string;
@@ -223,25 +237,40 @@ export interface WebhookDef {
   ) => Promise<WebhookResponse | any> | WebhookResponse | any;
 }
 
-export interface MiddlewareInfo {
-  type: "query" | "mutation" | "webhook";
-  name: string;
-  args: Record<string, any>;
-}
+/**
+ * The call middleware runs around. A query's or mutation's `access` is
+ * the one its definition declares; it is `undefined` when that
+ * definition has none, which the types allow only by default, but a
+ * gate must still refuse it: a cast reaches here too. A webhook
+ * declares none; its `verify` decides who may call it.
+ */
+export type MiddlewareInfo<A = undefined> =
+  | {
+      type: "query" | "mutation";
+      name: string;
+      args: Record<string, any>;
+      access: A | undefined;
+    }
+  | {
+      type: "webhook";
+      name: string;
+      args: Record<string, any>;
+      access?: undefined;
+    };
 
-export type MiddlewareFn = (
+export type MiddlewareFn<A = undefined> = (
   ctx: QueryContext | MutationContext,
-  info: MiddlewareInfo,
+  info: MiddlewareInfo<A>,
   next: () => Promise<any> | any,
 ) => Promise<any> | any;
 
-export interface PluginDef {
+export interface PluginDef<A = undefined> {
   name: string;
   version?: string;
   tables: Record<string, TableSchema>;
-  queries: Record<string, QueryDef>;
-  mutations: Record<string, MutationDef>;
+  queries: Record<string, QueryDef<A>>;
+  mutations: Record<string, MutationDef<A>>;
   jobs?: Record<string, JobDef>;
   webhooks?: Record<string, WebhookDef>;
-  middleware?: MiddlewareFn[];
+  middleware?: MiddlewareFn<A>[];
 }

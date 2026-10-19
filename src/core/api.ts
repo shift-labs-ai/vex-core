@@ -8,41 +8,46 @@ import type {
   WebhookDef,
 } from "./types.js";
 
-export interface VexPluginAPI {
+/**
+ * What a plugin registers through. `A` is the app's access declaration
+ * (`OperationAccess`): a plugin written against an API that declares
+ * none is not one an engine requiring a declaration accepts.
+ */
+export interface VexPluginAPI<A = undefined> {
   setName(name: string): void;
   registerTable(name: string, schema: TableSchema): void;
-  registerQuery(name: string, def: QueryDef): void;
-  registerMutation(name: string, def: MutationDef): void;
+  registerQuery(name: string, def: QueryDef<A>): void;
+  registerMutation(name: string, def: MutationDef<A>): void;
   registerJob(name: string, def: JobDef): void;
   registerWebhook(name: string, def: WebhookDef): void;
-  use(fn: MiddlewareFn): void;
+  use(fn: MiddlewareFn<A>): void;
 }
 
-export type PluginFunction = (api: VexPluginAPI) => void;
+export type PluginFunction<A = undefined> = (api: VexPluginAPI<A>) => void;
 
-export function createPluginAPI(): {
-  api: VexPluginAPI;
-  resolve: () => PluginDef;
+export function createPluginAPI<A = undefined>(): {
+  api: VexPluginAPI<A>;
+  resolve: () => PluginDef<A>;
 } {
   let name = "unknown";
   const tables: Record<string, TableSchema> = {};
-  const queries: Record<string, QueryDef> = {};
-  const mutations: Record<string, MutationDef> = {};
+  const queries: Record<string, QueryDef<A>> = {};
+  const mutations: Record<string, MutationDef<A>> = {};
   const jobs: Record<string, JobDef> = {};
   const webhooks: Record<string, WebhookDef> = {};
-  const middleware: MiddlewareFn[] = [];
+  const middleware: MiddlewareFn<A>[] = [];
 
-  const api: VexPluginAPI = {
+  const api: VexPluginAPI<A> = {
     setName(n: string) {
       name = n;
     },
     registerTable(tableName: string, schema: TableSchema) {
       tables[tableName] = schema;
     },
-    registerQuery(queryName: string, def: QueryDef) {
+    registerQuery(queryName: string, def: QueryDef<A>) {
       queries[queryName] = def;
     },
-    registerMutation(mutationName: string, def: MutationDef) {
+    registerMutation(mutationName: string, def: MutationDef<A>) {
       mutations[mutationName] = def;
     },
     registerJob(jobName: string, def: JobDef) {
@@ -51,12 +56,12 @@ export function createPluginAPI(): {
     registerWebhook(webhookName: string, def: WebhookDef) {
       webhooks[webhookName] = def;
     },
-    use(fn: MiddlewareFn) {
+    use(fn: MiddlewareFn<A>) {
       middleware.push(fn);
     },
   };
 
-  function resolve(): PluginDef {
+  function resolve(): PluginDef<A> {
     return {
       name,
       tables,
@@ -71,9 +76,11 @@ export function createPluginAPI(): {
   return { api, resolve };
 }
 
-export function resolvePlugin(input: PluginFunction | PluginDef): PluginDef {
+export function resolvePlugin<A = undefined>(
+  input: PluginFunction<A> | PluginDef<A>,
+): PluginDef<A> {
   if (typeof input === "function") {
-    const { api, resolve } = createPluginAPI();
+    const { api, resolve } = createPluginAPI<A>();
     input(api);
     return resolve();
   }

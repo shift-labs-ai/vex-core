@@ -172,6 +172,41 @@ SQLite reports what a statement reads and writes: its compiled program, as `EXPL
 - **Costs:** a statement's first run in a given schema compiles it once more for `EXPLAIN` (a few µs); after that, writes, reads and invalidation cost what they cost without tracking, within measurement noise. The query builder, bulk inserts and mutations run at parity with untracked writes; raw writes and raw reads run faster. On a Durable Object a single-statement write makes no more SQL calls, and bills no more rows, than without tracking; raw SQL of several statements reads `total_changes()` before and after.
 - **Adapters:** a custom `StorageAdapter` reports changes through `takeChanges`; one that cannot tell which rows a write changed lists every changed table as unattributed, and `ANY_TABLE` when it cannot tell which tables. `tablesRead` is optional: without it, or when it cannot say (a virtual table, TEMP, an attached database), a raw read depends on every registered table it names, through named views.
 
+## Operation access
+
+An app can make every query and mutation declare who may run it, so an operation without a declaration does not compile. Choose the declaration's shape as the engine's type parameter:
+
+```ts
+type Access = { permission: string } | "system";
+
+const vex = await Vex.create<Access>({
+  storage,
+  plugins: [
+    (api) => {
+      api.setName("notes");
+      api.registerQuery("list", {
+        args: {},
+        access: { permission: "notes.read" },
+        handler: (ctx) => ctx.db.table("notes").all(),
+      });
+      // api.registerQuery("open", { args: {}, handler }) → compile error: access is required
+    },
+  ],
+});
+```
+
+The engine decides nothing with it. It hands each call's declaration to middleware, where the app's own gate decides, and it describes each operation with its declaration (`describeQuery`, `describeMutation`, `introspect`), so the app can list what every operation needs:
+
+```ts
+vex.use((ctx, info, next) => {
+  if (info.type === "webhook") return next();   // a webhook's verify decides
+  if (info.access === undefined) throw new Error("Permission denied"); // a cast left it out
+  return authorize(ctx.user, info.access, info.args).then(next);
+});
+```
+
+Types vanish at runtime, so `info.access` is typed as possibly `undefined`: a gate must refuse what a cast let through. A plugin written against `VexPluginAPI` with no declaration is not accepted by an engine that requires one, and neither are file-based definitions (`vex-core/framework`), which declare none. Without a type parameter there is no declaration, and nothing changes.
+
 ## Query builder
 
 Reads, filters, aggregations — pushed down to SQL.

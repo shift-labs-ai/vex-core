@@ -51,7 +51,7 @@
     "format": "bunx biome format --write src/",
     "lint": "bunx biome lint src/",
     "check": "bunx biome check src/",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tests/types",
     "prepublishOnly": "bun run typecheck && bun run build"
   },
   "keywords": [
