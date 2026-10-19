@@ -1,5 +1,10 @@
 import type { TableAccessPolicy } from "./access.js";
-import { governedRawSqlError, guardQueryBuilder } from "./access.js";
+import {
+  governedRawSqlError,
+  guardQueryBuilder,
+  publishedGovernedError,
+  UNRESTRICTED,
+} from "./access.js";
 import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
 import { INTERNAL_TABLES } from "./internal.js";
@@ -16,6 +21,7 @@ import type { ExecContext, Tracer } from "./tracer.js";
 import { createRootSpan, isTraceRecording } from "./tracer.js";
 import type {
   CallContext,
+  DescribedColumn,
   JobDef,
   MiddlewareFn,
   MiddlewareInfo,
@@ -27,6 +33,7 @@ import type {
   QueryContext,
   QueryDef,
   ReactiveBudget,
+  TableSchema,
   VexRuntime,
   VexUser,
   WebhookRequest,
@@ -678,6 +685,17 @@ export class Vex<A = unknown> {
       }
       return prepared;
     }
+    // A raw read depends on every table it reads, any of whose changes
+    // re-runs it; one that reads no table, on any change at all.
+    function trackRaw(tables: readonly string[]): void {
+      if (!touchedTables && !dependencies) return;
+      for (const table of tables) {
+        touchedTables?.add(table);
+        dependencies?.push({ table, raw: true });
+      }
+      if (tables.length === 0)
+        dependencies?.push({ table: ANY_TABLE, raw: true });
+    }
     return {
       db: {
         table(name: string) {
@@ -698,19 +716,59 @@ export class Vex<A = unknown> {
             if (governed.length > 0) {
               return Promise.reject(governedRawSqlError(governed));
             }
-            if (touchedTables || dependencies) {
-              for (const table of tables) {
-                touchedTables?.add(table);
-                dependencies?.push({ table, raw: true });
-              }
-              if (tables.length === 0)
-                dependencies?.push({ table: ANY_TABLE, raw: true });
-            }
+            trackRaw(tables);
             return self.storage.rawQuery<T>(sql, ...params);
           };
           // Known tables are answered at once, without a microtask hop.
           const tables = self.rawReadTables(sql);
           return Array.isArray(tables) ? read(tables) : tables.then(read);
+        },
+        async publishedSql<T = Record<string, any>>(
+          sql: string,
+          ...params: any[]
+        ): Promise<T[]> {
+          const read = (await self.storage.readOnlyTables?.(sql)) ?? {
+            refused: "This storage cannot show what a statement reads.",
+          };
+          if ("refused" in read) throw new Error(read.refused);
+          const unpublished = read.tables.filter(
+            (table) => !self.storage.getSchema(table)?.published,
+          );
+          if (unpublished.length > 0) {
+            const list = unpublished.map((t) => `"${t}"`).join(", ");
+            throw new Error(
+              unpublished.length > 1
+                ? `Tables ${list} are not published`
+                : `Table ${list} is not published`,
+            );
+          }
+          for (const table of read.tables) {
+            const policy = self.accessPolicies.get(table);
+            if (
+              policy &&
+              (await resolvePrepared(table, policy)) !== UNRESTRICTED
+            ) {
+              throw publishedGovernedError(table);
+            }
+          }
+          trackRaw(read.tables);
+          return self.storage.rawQuery<T>(sql, ...params);
+        },
+        publishedTables() {
+          return [...self.tables].sort().flatMap((name) => {
+            const schema = self.storage.getSchema(name);
+            return schema?.published
+              ? [
+                  {
+                    name,
+                    columns: {
+                      _id: { type: "string" },
+                      ...declaredColumns(schema),
+                    },
+                  },
+                ]
+              : [];
+          });
         },
       },
       runtime: this.runtime(),
@@ -1443,18 +1501,9 @@ export class Vex<A = unknown> {
 
   async describeTable(table: string) {
     const rowCount = await this.storage.query(table).count();
-    const schema = this.storage.getSchema(table);
-    const columns: Record<string, { type: string; optional?: boolean }> = {};
-    if (schema?.columns) {
-      for (const [col, def] of Object.entries(schema.columns))
-        columns[col] = {
-          type: (def as any).type,
-          ...((def as any).optional ? { optional: true } : {}),
-        };
-    }
     return {
       name: table,
-      columns,
+      columns: declaredColumns(this.storage.getSchema(table)),
       rowCount,
     };
   }
@@ -1552,6 +1601,20 @@ function claimTableNames<A>(plugins: PluginDef<A>[]): void {
       }
     }
   }
+}
+
+/** A schema's columns as it declares them. */
+function declaredColumns(
+  schema: TableSchema | null,
+): Record<string, DescribedColumn> {
+  const columns: Record<string, DescribedColumn> = {};
+  for (const [name, def] of Object.entries(schema?.columns ?? {})) {
+    columns[name] = {
+      type: def.type,
+      ...(def.optional ? { optional: true } : {}),
+    };
+  }
+  return columns;
 }
 
 /**

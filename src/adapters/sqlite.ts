@@ -468,17 +468,17 @@ export function sqliteAdapter(
   // The baseline other connections' commits are measured from.
   state.takeChanges(dataVersion());
 
-  // Compiles a read on the connection it would run on, for its tables.
-  async function analyzeRead(sql: string): Promise<string[] | undefined> {
+  // Compiles a read on the connection it would run on.
+  async function analyzeRead<T>(
+    analyze: (on: SqliteIntrospection) => T,
+  ): Promise<T> {
     if (readsUseWriter()) {
-      return withConnectionLock(() =>
-        state.tablesRead(writerIntrospection, sql),
-      );
+      return withConnectionLock(() => analyze(writerIntrospection));
     }
     const connection = await acquireReadConnection();
     try {
       if (closed) throw closedError();
-      return state.tablesRead(introspection(connection.db), sql);
+      return analyze(introspection(connection.db));
     } finally {
       releaseReadConnection(connection);
     }
@@ -634,7 +634,11 @@ export function sqliteAdapter(
     tablesRead(sql: string) {
       const cached = state.cachedTablesRead(sql);
       if (cached !== undefined) return cached ?? undefined;
-      return analyzeRead(sql);
+      return analyzeRead((on) => state.tablesRead(on, sql));
+    },
+
+    readOnlyTables(sql: string) {
+      return analyzeRead((on) => state.readOnlyTables(on, sql));
     },
 
     getSchema(table: string) {

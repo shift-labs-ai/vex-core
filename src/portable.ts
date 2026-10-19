@@ -29,7 +29,11 @@ export {
   RateLimitExceededError,
   RateLimiter,
 } from "./core/rate-limit.js";
-export type { Changes, StorageAdapter } from "./core/storage.js";
+export type {
+  Changes,
+  ReadOnlyRead,
+  StorageAdapter,
+} from "./core/storage.js";
 export { ANY_TABLE } from "./core/storage.js";
 export type {
   ExecContext,
@@ -44,6 +48,7 @@ export type {
   CallContext,
   ColumnDef,
   ColumnType,
+  DescribedColumn,
   Filter,
   GroupByBuilder,
   JobDef,
@@ -53,6 +58,7 @@ export type {
   MutationDef,
   MutationTable,
   PluginDef,
+  PublishedTable,
   QueryBuilder,
   QueryContext,
   QueryDef,

@@ -31,10 +31,18 @@ export interface TableSchema {
   /**
    * Row-level access policy (see core/access.ts). When present, every
    * query-context read of this table is filtered to the rows the
-   * caller's prepared context accepts, raw SQL naming the table is
-   * refused in query contexts, and mutation contexts stay ungoverned.
+   * caller's prepared context accepts, `ctx.db.sql` reading the table is
+   * refused in query contexts, `ctx.db.publishedSql` reads it only for
+   * callers the policy leaves unrestricted, and mutation contexts stay
+   * ungoverned.
    */
   access?: TableAccessPolicy<any>;
+  /**
+   * The table is part of the published dataset: what
+   * `ctx.db.publishedSql` may read. Off unless set, so a table nobody
+   * decided about is never readable that way.
+   */
+  published?: boolean;
 }
 
 export interface Filter {
@@ -151,10 +159,40 @@ export interface VexRuntime {
   describeSubscriptions(): SubscriptionSummary;
 }
 
+/** A column as a table declares it. */
+export interface DescribedColumn {
+  type: ColumnType;
+  optional?: boolean;
+}
+
+/**
+ * A published table, with every column a statement can read: its
+ * declared columns and the `_id` every table has.
+ */
+export interface PublishedTable {
+  name: string;
+  columns: Record<string, DescribedColumn>;
+}
+
 export interface QueryContext {
   db: {
     table(name: string): QueryBuilder;
     sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
+    /**
+     * Runs SQL someone other than the app wrote: one statement that
+     * SQLite's compiled program shows writes nothing and opens only
+     * published tables (`TableSchema.published`), directly or through a
+     * view, subquery or index. A published table with an access policy
+     * is read only for callers the policy leaves unrestricted, since
+     * raw SQL cannot apply its row filter. Anything else is refused, and
+     * so is every statement on storage that cannot show its program.
+     */
+    publishedSql<T = Record<string, any>>(
+      sql: string,
+      ...params: any[]
+    ): Promise<T[]>;
+    /** The published dataset: every table `publishedSql` may read. */
+    publishedTables(): PublishedTable[];
   };
   runtime: VexRuntime;
   user?: VexUser | null;

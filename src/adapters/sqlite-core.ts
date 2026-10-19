@@ -1,6 +1,10 @@
 import { id as generateId } from "../core/id.js";
-import { changesRows, splitStatements } from "../core/sql-text.js";
-import { ANY_TABLE, type Changes } from "../core/storage.js";
+import {
+  changesRows,
+  leadingSqlKeyword,
+  splitStatements,
+} from "../core/sql-text.js";
+import { ANY_TABLE, type Changes, type ReadOnlyRead } from "../core/storage.js";
 import type { TableSchema } from "../core/types.js";
 import {
   buildInsertSql,
@@ -666,6 +670,8 @@ const READ_OPCODES = new Set(["OpenRead", "ReopenIdx", "OpenWrite", "Clear"]);
 // the program opens: nothing exact can be said.
 const VIRTUAL_OPCODES = new Set(["VOpen", "VUpdate"]);
 const SCHEMA_ROOT_PAGE = 1;
+// The statements that can only read, by their first keyword.
+const READ_KEYWORDS = new Set(["SELECT", "VALUES", "WITH"]);
 const ANALYSIS_CACHE_SIZE = 512;
 
 /** What a write statement writes, from its compiled program. */
@@ -731,6 +737,9 @@ export class SqliteAdapterState {
   private readonly reads = new BoundedMap<string, string[] | null>(
     ANALYSIS_CACHE_SIZE,
   );
+  private readonly plainReads = new BoundedMap<string, ReadOnlyRead>(
+    ANALYSIS_CACHE_SIZE,
+  );
   private roots: Map<number, string> | null = null;
   private dataVersion: number | undefined;
   private schemaEpoch = 0;
@@ -762,6 +771,7 @@ export class SqliteAdapterState {
     this.schemaEpoch++;
     this.writes.clear();
     this.reads.clear();
+    this.plainReads.clear();
     this.roots = null;
   }
 
@@ -826,6 +836,64 @@ export class SqliteAdapterState {
       this.reads.set(sql, tables);
     }
     return tables ?? undefined;
+  }
+
+  /** {@link StorageAdapter.readOnlyTables}, remembered per schema. */
+  readOnlyTables(
+    introspection: SqliteIntrospection,
+    sql: string,
+  ): ReadOnlyRead {
+    let read = this.plainReads.get(sql);
+    if (read === undefined) {
+      read = this.analyzeReadOnly(introspection, sql);
+      this.plainReads.set(sql, read);
+    }
+    return read;
+  }
+
+  private analyzeReadOnly(
+    introspection: SqliteIntrospection,
+    sql: string,
+  ): ReadOnlyRead {
+    const statements = splitStatements(sql);
+    if (statements.length !== 1) {
+      return { refused: "Only one statement is allowed." };
+    }
+    const [statement] = statements as [string];
+    if (!READ_KEYWORDS.has(leadingSqlKeyword(statement))) {
+      return { refused: "Only a SELECT, VALUES or WITH statement is allowed." };
+    }
+    let program: ExplainRow[];
+    try {
+      program = introspection.explain(statement);
+    } catch (error) {
+      return {
+        refused: `Invalid SQL: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    const tables = new Set<string>();
+    for (const { opcode, p2, p3 } of program) {
+      // A write opens a cursor to write, whatever its first word: a WITH
+      // may end in a DELETE.
+      if (WRITE_OPCODES.has(opcode)) {
+        return { refused: "The statement writes." };
+      }
+      if (VIRTUAL_OPCODES.has(opcode)) {
+        return { refused: "The statement reads a virtual table." };
+      }
+      if (!READ_OPCODES.has(opcode)) continue;
+      if (p3 !== 0) return { refused: "The statement reads another database." };
+      if (p2 === SCHEMA_ROOT_PAGE) {
+        tables.add("sqlite_schema");
+        continue;
+      }
+      const table = this.rootTable(introspection, p2);
+      if (table === undefined) {
+        return { refused: "The statement opens a table SQLite cannot name." };
+      }
+      tables.add(table);
+    }
+    return { tables: [...tables] };
   }
 
   /**

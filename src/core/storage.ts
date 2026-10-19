@@ -20,6 +20,11 @@ export interface Changes {
   unattributed: string[];
 }
 
+/** What a statement reads, or why it is not a plain read. */
+export type ReadOnlyRead =
+  | { readonly tables: readonly string[] }
+  | { readonly refused: string };
+
 export interface StorageAdapter {
   readonly name: string;
   ensureTable(name: string, schema: TableSchema): Promise<void> | void;
@@ -49,6 +54,13 @@ export interface StorageAdapter {
   tablesRead?(
     sql: string,
   ): string[] | undefined | Promise<string[] | undefined>;
+  /**
+   * The tables `sql` reads when it is one statement that SQLite's
+   * compiled program shows writes nothing and opens only main-database
+   * tables it can name; otherwise why not. Without it the engine
+   * refuses `publishedSql` outright.
+   */
+  readOnlyTables?(sql: string): ReadOnlyRead | Promise<ReadOnlyRead>;
   getSchema(table: string): TableSchema | null;
   close(): Promise<void> | void;
 }

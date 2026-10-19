@@ -168,9 +168,32 @@ SQLite reports what a statement reads and writes: its compiled program, as `EXPL
 - **Other connections:** on a file database, a commit by another connection or process (`PRAGMA data_version`) marks every table changed at the next invalidation.
 - **Narrowing:** a subscription over a changed table re-runs unless an equality filter proves it could not have seen the change. Only values every touched row holds both before and after the write count as proof: an insert's row, an upsert's keys, the id of an update or delete. An update's new values do not, since the row may have just left the filtered set. A table changed by raw SQL, or by a write that ran a trigger or foreign-key action, proves nothing, and every subscription over it re-runs; narrowing on other tables is unaffected.
 - **Raw reads:** a raw read depends on exactly the tables its program reads, through views, subqueries and covering indexes. A raw read that reads no table re-runs after any write.
-- **Access policies:** raw SQL in a query context is refused when it reads a governed table, in any spelling or through any view. A literal or column that merely shares a governed table's name is not a read.
+- **Access policies:** raw SQL in a query context (`ctx.db.sql`) is refused when it reads a governed table, in any spelling or through any view. A literal or column that merely shares a governed table's name is not a read. Published SQL has its own rule (below).
 - **Costs:** a statement's first run in a given schema compiles it once more for `EXPLAIN` (a few µs); after that, writes, reads and invalidation cost what they cost without tracking, within measurement noise. The query builder, bulk inserts and mutations run at parity with untracked writes; raw writes and raw reads run faster. On a Durable Object a single-statement write makes no more SQL calls, and bills no more rows, than without tracking; raw SQL of several statements reads `total_changes()` before and after.
-- **Adapters:** a custom `StorageAdapter` reports changes through `takeChanges`; one that cannot tell which rows a write changed lists every changed table as unattributed, and `ANY_TABLE` when it cannot tell which tables. `tablesRead` is optional: without it, or when it cannot say (a virtual table, TEMP, an attached database), a raw read depends on every registered table it names, through named views.
+- **Adapters:** a custom `StorageAdapter` reports changes through `takeChanges`; one that cannot tell which rows a write changed lists every changed table as unattributed, and `ANY_TABLE` when it cannot tell which tables. `tablesRead` is optional: without it, or when it cannot say (a virtual table, TEMP, an attached database), a raw read depends on every registered table it names, through named views. `readOnlyTables` is optional too: without it, `publishedSql` refuses everything.
+
+### Published SQL
+
+SQL that someone other than the app writes (an analyst, an agent) reads only what the app chose to publish. A table opts in; every other table is out of reach, so one nobody decided about is never readable this way:
+
+```ts
+api.registerTable("sessions", { columns: { /* … */ }, published: true });
+api.registerTable("api_keys", { columns: { /* … */ } }); // not published
+
+api.registerQuery("sql", {
+  args: { sql: "string", params: "json" },
+  reactive: false,
+  handler: (ctx, args) => ctx.db.publishedSql(args.sql, ...(args.params ?? [])),
+});
+```
+
+`ctx.db.publishedSql` runs a statement only when SQLite's compiled program for it shows:
+
+- **one statement**, a `SELECT`, `VALUES` or `WITH`, that opens no cursor to write (a `WITH … DELETE` is refused);
+- **published tables only**, however they are reached: by name, through a view, a CTE, a subquery, or an index that answers alone. `sqlite_schema` is never published;
+- **no virtual tables** (`pragma_*` functions, `dbstat`) and **no other database** (TEMP, attached).
+
+A published table with an access policy is read only for callers its policy leaves `UNRESTRICTED`, since raw SQL cannot apply the row filter; everyone else is refused. Storage that cannot show a statement's program (`StorageAdapter.readOnlyTables`) refuses every call. Results are reactive like any raw read: a subscription depends on exactly the tables the statement read. `ctx.db.publishedTables()` lists the dataset: each published table with every column a statement can read, `_id` included.
 
 ## Operation access
 

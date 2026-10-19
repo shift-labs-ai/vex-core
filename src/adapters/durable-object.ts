@@ -248,6 +248,11 @@ export function durableObjectAdapter(
       return state.tablesRead(introspection, query);
     },
 
+    readOnlyTables(query: string) {
+      open();
+      return state.readOnlyTables(introspection, query);
+    },
+
     getSchema(table) {
       return state.schemas.get(table) ?? null;
     },
