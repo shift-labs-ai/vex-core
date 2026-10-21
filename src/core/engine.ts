@@ -664,6 +664,10 @@ export class Vex<A = unknown> {
     // caller's standing once. Subscription re-runs rebuild the whole
     // context, so revocations apply on the next invalidation.
     const preparedAccess = new Map<string, Promise<unknown>>();
+    // The caller a policy prepares for is the context's own, as the
+    // middleware before the first read left it: what middleware
+    // learns about the caller, handlers and policies see alike.
+    let ctx: QueryContext;
     function baseBuilder(name: string) {
       const query = self.storage.query(name);
       if (!touchedTables && !dependencies) return query;
@@ -680,7 +684,7 @@ export class Vex<A = unknown> {
     ): Promise<unknown> {
       let prepared = preparedAccess.get(name);
       if (!prepared) {
-        prepared = Promise.resolve(policy.prepare(user, accessReader));
+        prepared = Promise.resolve(policy.prepare(ctx.user, accessReader));
         preparedAccess.set(name, prepared);
       }
       return prepared;
@@ -696,7 +700,7 @@ export class Vex<A = unknown> {
       if (tables.length === 0)
         dependencies?.push({ table: ANY_TABLE, raw: true });
     }
-    return {
+    ctx = {
       db: {
         table(name: string) {
           const policy = self.accessPolicies.get(name);
@@ -774,6 +778,7 @@ export class Vex<A = unknown> {
       runtime: this.runtime(),
       user: user ?? undefined,
     };
+    return ctx;
   }
 
   private trackQueryBuilder(

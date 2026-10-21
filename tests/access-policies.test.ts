@@ -750,3 +750,28 @@ describe("table access policies", () => {
     expect(aliceSees).toEqual([aliceBefore]);
   });
 });
+
+describe("the caller a policy prepares for", () => {
+  test("is the context's own, as the middleware before the read left it", async () => {
+    // Middleware that learns something about the caller replaces
+    // `ctx.user`; a policy deciding rows must see what handlers see.
+    const vex = await Vex.create({
+      plugins: [
+        docsPlugin,
+        (api: VexPluginAPI) => {
+          api.setName("as");
+          api.use(async (ctx, _info, next) => {
+            if (ctx.user?.id === "alice") ctx.user = { ...ctx.user, id: "bob" };
+            return next();
+          });
+        },
+      ],
+      storage: sqliteAdapter(":memory:"),
+    });
+    open.push(vex);
+    await seed(vex, 6);
+    const rows = (await run(vex, alice, { table: "docs", terminal: "all" })) as DocRow[];
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((row) => row.ownerId === "bob")).toBe(true);
+  });
+});

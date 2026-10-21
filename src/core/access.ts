@@ -66,6 +66,8 @@ export interface TableAccessPolicy<P = unknown> {
   /**
    * Resolve the caller's access context once per operation — load
    * whatever the row predicate needs (grants, bindings, membership).
+   * `user` is the operation's caller as middleware left it before the
+   * table's first read (`ctx.user`), the caller its handler sees.
    * Return {@link UNRESTRICTED} to bypass filtering for this caller.
    */
   prepare(
