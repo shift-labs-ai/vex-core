@@ -64,8 +64,9 @@ type Matcher =
 
 /**
  * What a router throws when nothing it holds matched: a 404 whose
- * rendering, however an error handler or boundary renders it, is
- * marked unmatched.
+ * rendering is marked unmatched, however a boundary renders it. An
+ * error handler that answers the miss with something other than a
+ * 404 (an app shell) has answered.
  */
 class NoRoute extends HttpError {
   constructor() {
@@ -239,7 +240,9 @@ export class Router {
       return await run(ctx);
     } catch (err) {
       const response = await this.handleError(ctx, err);
-      return err instanceof NoRoute ? unmatched(response) : response;
+      return err instanceof NoRoute && response.status === 404
+        ? unmatched(response)
+        : response;
     }
   }
 
