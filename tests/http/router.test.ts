@@ -181,6 +181,21 @@ describe("router — mount", () => {
     });
   });
 
+  test("a miss its error handler answers with something else (an app shell) is final", async () => {
+    const inner = createRouter()
+      .onError(
+        (err) => err instanceof HttpError && err.status === 404,
+        () => new Response("app shell"),
+      )
+      .get("/known", () => new Response("yes"));
+    const app = createRouter()
+      .mount("", inner)
+      .get("/elsewhere", () => new Response("later route"));
+    const res = await app.handle(new Request("http://x/elsewhere"));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("app shell");
+  });
+
   test("a mounted function falls through on any 404: it cannot say it matched", async () => {
     const app = createRouter()
       .mount("", () => new Response("nope", { status: 404 }))

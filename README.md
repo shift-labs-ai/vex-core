@@ -328,7 +328,7 @@ createRouter({ prefix?: "/api" })
   .onError((err) => err instanceof HttpError && err.status === 404, render404);
 ```
 
-Routes and mounts are tried in the order they were added. A mounted router that matches nothing lets later matchers try; a 404 one of its routes answers (a refusal, a missing row) is final. A mounted function, which cannot say whether it matched, lets later matchers try on any 404.
+Routes and mounts are tried in the order they were added. A mounted router that matches nothing lets later matchers try, unless its error handler answers the miss with something other than a 404 (an app shell); a 404 one of its routes answers (a refusal, a missing row) is final. A mounted function, which cannot say whether it matched, lets later matchers try on any 404.
 
 Path syntax is whatever [URLPattern](https://developer.mozilla.org/en-US/docs/Web/API/URLPattern) supports: `:param`, `*`, regex groups. Captures land in `ctx.params`.
 
