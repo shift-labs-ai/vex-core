@@ -6,6 +6,10 @@
  *   POST /mutate     JSON body { name, args? } → { data } | { error }
  *   ALL  /webhook/*  → vex.handleWebhook
  *
+ * A call that throws an HttpError answers as it renders (its status,
+ * headers and body: a refusal's 403 or 404 with its code); anything
+ * else thrown is a 500 carrying its message.
+ *
  * Reactive reads (the "live state" surface) are handled by
  * `vexWebSocket` over a WebSocket at whatever path the host wires
  * up — typically `/subscribe`. One connection per client multiplexes
@@ -33,6 +37,7 @@
 import type { Vex } from "../core/engine.js";
 import type { VexUser } from "../core/types.js";
 import { type ReadLimits, readText } from "./body.js";
+import { errorMessage, isHttpError } from "./error.js";
 import { createRouter, type Router } from "./router.js";
 import type { Handler, RequestCtx } from "./types.js";
 
@@ -116,7 +121,7 @@ function makeCallHandler(
     try {
       return json({ data: await call(name, args, getUser(ctx)) });
     } catch (err: unknown) {
-      return json({ error: errorMessage(err) }, 500);
+      return failure(err);
     }
   };
 }
@@ -170,7 +175,7 @@ function makeWebhookHandler(vex: Vex, limits: ReadLimits): Handler {
       }
       return json(result.body ?? null, status);
     } catch (err: unknown) {
-      return json({ error: errorMessage(err) }, 500);
+      return failure(err);
     }
   };
 }
@@ -215,12 +220,9 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === "string") return err;
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
-  }
+/** A thrown call: an HttpError as it renders, anything else a 500. */
+function failure(err: unknown): Response {
+  return isHttpError(err)
+    ? err.toResponse()
+    : json({ error: errorMessage(err) }, 500);
 }

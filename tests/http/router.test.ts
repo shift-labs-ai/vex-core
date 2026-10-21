@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  cors,
   createRouter,
+  errorBoundary,
   HttpError,
   type Middleware,
 } from "../../src/http/index.js";
@@ -140,13 +142,50 @@ describe("router — mount", () => {
     expect(await res.text()).toBe("PARENT");
   });
 
-  test("404 from a mount falls through to later matchers", async () => {
+  test("a mount that matches nothing falls through to later matchers", async () => {
     const inner = createRouter().get("/known", () => new Response("yes"));
     const app = createRouter()
       .mount("", inner)
       .get("/fallback", () => new Response("fell through"));
     const res = await app.handle(new Request("http://x/fallback"));
     expect(res.status).toBe(200);
+    expect(await res.text()).toBe("fell through");
+  });
+
+  test("it falls through however its middleware renders or decorates the miss", async () => {
+    const inner = createRouter()
+      .use(cors())
+      .use(errorBoundary({ logger: () => {} }))
+      .get("/known", () => new Response("yes"));
+    const app = createRouter()
+      .mount("", inner)
+      .get("/fallback", () => new Response("fell through"));
+    const res = await app.handle(new Request("http://x/fallback"));
+    expect(await res.text()).toBe("fell through");
+  });
+
+  test("a 404 a mounted route answers is final: a refusal keeps its body", async () => {
+    const inner = createRouter().get("/item", () => {
+      throw new HttpError(404, "Item not found", {
+        body: { error: "Item not found", code: "not_found" },
+      });
+    });
+    const app = createRouter()
+      .mount("", inner)
+      .get("/item", () => new Response("someone else's item"));
+    const res = await app.handle(new Request("http://x/item"));
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({
+      error: "Item not found",
+      code: "not_found",
+    });
+  });
+
+  test("a mounted function falls through on any 404: it cannot say it matched", async () => {
+    const app = createRouter()
+      .mount("", () => new Response("nope", { status: 404 }))
+      .get("/fallback", () => new Response("fell through"));
+    const res = await app.handle(new Request("http://x/fallback"));
     expect(await res.text()).toBe("fell through");
   });
 });

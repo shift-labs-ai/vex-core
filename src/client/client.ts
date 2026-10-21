@@ -24,6 +24,22 @@
  *     aren't necessarily idempotent.
  */
 
+/**
+ * A call the server answered with an error: its message, and for one
+ * it threw as an HttpError (a refusal), the status and body it carried
+ * (`body.code` says which refusal).
+ */
+export class VexCallError extends Error {
+  readonly status?: number;
+  readonly body?: unknown;
+  constructor(message: string, status?: number, body?: unknown) {
+    super(message);
+    this.name = "VexCallError";
+    if (status !== undefined) this.status = status;
+    if (body !== undefined) this.body = body;
+  }
+}
+
 interface PendingResult<T = unknown> {
   resolve: (value: T) => void;
   reject: (err: Error) => void;
@@ -386,7 +402,14 @@ export class VexClient {
 
   private handleFrame(raw: string | ArrayBuffer | Blob): void {
     if (typeof raw !== "string") return; // we only emit text frames
-    let frame: { type: string; id: string; data?: unknown; message?: string };
+    let frame: {
+      type: string;
+      id: string;
+      data?: unknown;
+      message?: string;
+      status?: number;
+      body?: unknown;
+    };
     try {
       frame = JSON.parse(raw);
     } catch {
@@ -432,7 +455,13 @@ export class VexClient {
       const pending = this.pendingResults.get(frame.id);
       if (pending) {
         this.pendingResults.delete(frame.id);
-        pending.reject(new Error(frame.message ?? "unknown error"));
+        pending.reject(
+          new VexCallError(
+            frame.message ?? "unknown error",
+            frame.status,
+            frame.body,
+          ),
+        );
         return;
       }
       const sub = this.subscriptions.get(frame.id);
@@ -443,7 +472,11 @@ export class VexClient {
         // error usually points at a registration bug (unknown
         // query name, invalid args) the developer wants to see
         // even if the consumer didn't pass an onError.
-        const err = new Error(frame.message ?? "subscription error");
+        const err = new VexCallError(
+          frame.message ?? "subscription error",
+          frame.status,
+          frame.body,
+        );
         console.error(
           `[vex-client] subscription ${frame.id} (${sub.name}) errored:`,
           err.message,
