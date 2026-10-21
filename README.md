@@ -328,6 +328,8 @@ createRouter({ prefix?: "/api" })
   .onError((err) => err instanceof HttpError && err.status === 404, render404);
 ```
 
+Routes and mounts are tried in the order they were added. A mounted router that matches nothing lets later matchers try; a 404 one of its routes answers (a refusal, a missing row) is final. A mounted function, which cannot say whether it matched, lets later matchers try on any 404.
+
 Path syntax is whatever [URLPattern](https://developer.mozilla.org/en-US/docs/Web/API/URLPattern) supports: `:param`, `*`, regex groups. Captures land in `ctx.params`.
 
 ### Context
@@ -373,6 +375,8 @@ POST /mutate             { name, args? }
 GET  /subscribe          ?name=...&args=... (SSE)
 ALL  /webhook/*          user-defined webhooks
 ```
+
+A query or mutation that throws an `HttpError` answers as it renders, its status, headers and body: a refusal reaches the caller as the 403 or 404 it is, with whatever its body carries (a `code`, the permission it lacked). Anything else thrown is a 500 carrying its message. The WebSocket's error frame carries the same: `{ type: "error", id, message, status?, body? }`, and `VexClient` rejects with a `VexCallError` holding `status` and `body`.
 
 Request bodies are read under a byte ceiling: `vexHandler(vex, { maxBodyBytes, maxWebhookBodyBytes, bodyTimeoutMs })`. `maxBodyBytes` defaults to 8 MiB (`DEFAULT_MAX_BODY_BYTES`) and covers `/query` and `/mutate`. Webhooks use the same ceiling unless `maxWebhookBodyBytes` gives them their own. A body past the ceiling gets a 413 before it is buffered, and no query, mutation or webhook runs. With `bodyTimeoutMs` set, a body that stalls gets a 408. Mounted behind `bodyParser`, the dispatcher uses the body the parser already read.
 

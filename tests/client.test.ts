@@ -9,9 +9,17 @@ import { Vex } from "../src/core/engine.js";
 import {
   cors,
   createRouter,
+  HttpError,
   vexHandler,
   vexWebSocket,
 } from "../src/http/index.js";
+
+/** What the `items.refused` query throws: a refusal with a code. */
+const REFUSAL = {
+  error: "Item not found",
+  code: "not_found",
+  resource: "Item",
+};
 
 let vex: Vex;
 let server: Server;
@@ -43,6 +51,18 @@ beforeAll(async () => {
             handler: async (ctx) => {
               await ctx.db.table("items").count();
               return undefined;
+            },
+          },
+          refused: {
+            args: {},
+            handler: async () => {
+              throw new HttpError(404, REFUSAL.error, { body: REFUSAL });
+            },
+          },
+          broken: {
+            args: {},
+            handler: async () => {
+              throw new Error("disk on fire");
             },
           },
         },
@@ -198,7 +218,12 @@ interface VexClient {
   sendRaw(text: string): void;
   send(frame: Record<string, unknown>): void;
   /** Resolve when a `result` or `error` for `id` arrives. */
-  expectResult(id: string): Promise<{ data?: unknown; error?: string }>;
+  expectResult(id: string): Promise<{
+    data?: unknown;
+    error?: string;
+    status?: number;
+    body?: unknown;
+  }>;
   /** Stream of `data` frames for this id. */
   onData(id: string, fn: (data: unknown) => void): () => void;
   close(): Promise<void>;
@@ -215,12 +240,24 @@ async function openClient(path = "/vex/subscribe"): Promise<VexClient> {
 
   const pendingResults = new Map<
     string,
-    (frame: { data?: unknown; error?: string }) => void
+    (frame: {
+      data?: unknown;
+      error?: string;
+      status?: number;
+      body?: unknown;
+    }) => void
   >();
   const dataListeners = new Map<string, Set<(data: unknown) => void>>();
 
   ws.addEventListener("message", (ev) => {
-    let frame: { type: string; id: string; data?: unknown; message?: string };
+    let frame: {
+      type: string;
+      id: string;
+      data?: unknown;
+      message?: string;
+      status?: number;
+      body?: unknown;
+    };
     try {
       frame = JSON.parse(ev.data as string);
     } catch {
@@ -230,7 +267,12 @@ async function openClient(path = "/vex/subscribe"): Promise<VexClient> {
       pendingResults.get(frame.id)?.({ data: frame.data });
       pendingResults.delete(frame.id);
     } else if (frame.type === "error") {
-      pendingResults.get(frame.id)?.({ error: frame.message });
+      pendingResults.get(frame.id)?.({
+        error: frame.message,
+        ...(frame.status === undefined
+          ? {}
+          : { status: frame.status, body: frame.body }),
+      });
       pendingResults.delete(frame.id);
     } else if (frame.type === "data") {
       const subs = dataListeners.get(frame.id);
@@ -1678,5 +1720,69 @@ describe("WebSocket live channel", () => {
     expect(res.status).toBe(426);
     const body = await res.text();
     expect(body).toContain("WebSocket upgrade required");
+  });
+});
+
+// ─── Refusals ───────────────────────────────────────────────────────
+//
+// A call that throws an HttpError (a refusal: 403, 404) answers its own
+// status and body on every transport, so the caller can tell which
+// refusal it got by its code, never its words; anything else thrown
+// stays a 500 carrying its message.
+
+describe("a refused call answers its status and body", () => {
+  const call = (name: string) =>
+    fetch(`${base}/vex/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, args: {} }),
+    });
+
+  test("over HTTP", async () => {
+    const refused = await call("items.refused");
+    expect(refused.status).toBe(404);
+    expect(await refused.json()).toEqual(REFUSAL);
+    const broken = await call("items.broken");
+    expect(broken.status).toBe(500);
+    expect(await broken.json()).toEqual({ error: "disk on fire" });
+  });
+
+  test("over the socket", async () => {
+    const client = await openClient();
+    try {
+      const refused = client.expectResult("refused-1");
+      client.send({ type: "query", id: "refused-1", name: "items.refused" });
+      expect(await refused).toEqual({
+        error: REFUSAL.error,
+        status: 404,
+        body: REFUSAL,
+      });
+      const broken = client.expectResult("broken-1");
+      client.send({ type: "query", id: "broken-1", name: "items.broken" });
+      expect(await broken).toEqual({ error: "disk on fire" });
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("through VexClient", async () => {
+    const { VexCallError, VexClient } = await import(
+      "../src/client/client.js"
+    );
+    const client = new VexClient({ basePath: `${base}/vex` });
+    try {
+      const refused = await client.query("items.refused").catch((e) => e);
+      expect(refused).toBeInstanceOf(VexCallError);
+      expect(refused).toMatchObject({
+        message: REFUSAL.error,
+        status: 404,
+        body: REFUSAL,
+      });
+      const broken = await client.query("items.broken").catch((e) => e);
+      expect(broken).toMatchObject({ message: "disk on fire" });
+      expect(broken.status).toBeUndefined();
+    } finally {
+      client.close();
+    }
   });
 });

@@ -38,16 +38,23 @@ export class HttpError extends Error {
     this.expose = opts.expose ?? (status >= 400 && status < 500);
   }
 
+  /**
+   * The body it answers with: its own, unless it is a 5xx whose
+   * details stay hidden. HTTP renders it (`toResponse`); the
+   * WebSocket's error frame carries it beside its status.
+   */
+  shownBody(): unknown {
+    return this.expose || this.status < 500
+      ? this.body
+      : { error: "Internal Server Error" };
+  }
+
   toResponse(): Response {
     const headers: Record<string, string> = {
       "content-type": "application/json; charset=utf-8",
       ...this.headers,
     };
-    const body =
-      this.expose || this.status < 500
-        ? this.body
-        : { error: "Internal Server Error" };
-    return new Response(JSON.stringify(body), {
+    return new Response(JSON.stringify(this.shownBody()), {
       status: this.status,
       headers,
     });
@@ -92,4 +99,15 @@ export class HttpError extends Error {
 /** True when the thrown value is an HttpError. */
 export function isHttpError(e: unknown): e is HttpError {
   return e instanceof HttpError;
+}
+
+/** A thrown value's message, whatever was thrown. */
+export function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
 }

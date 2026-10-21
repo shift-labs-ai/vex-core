@@ -31,7 +31,9 @@
  *     { type: "pong",   id }           keepalive answer
  *     { type: "data",   id, data }     subscribe initial + each update
  *     { type: "result", id, data }     query/mutate + auth completion
- *     { type: "error",  id, message }  per-id failure
+ *     { type: "error",  id, message,   per-id failure; a thrown
+ *       status?, body? }               HttpError adds its status and
+ *                                      body, as HTTP RPC answers them
  *
  * Keepalive
  *   The protocol is otherwise silent between changes, and real
@@ -77,6 +79,7 @@
 import type { Server as BunServer, ServerWebSocket } from "bun";
 import { type Vex, withSerializedSubscriptionResult } from "../core/engine.js";
 import type { VexUser } from "../core/types.js";
+import { errorMessage, isHttpError } from "./error.js";
 
 // Bun's `Server` is generic over the websocket payload shape; we
 // don't attach data on the server-handle side (everything we care
@@ -463,7 +466,7 @@ async function handleSubscribe(
     );
   } catch (err) {
     ws.data.subs.delete(frame.id);
-    sendError(ws, frame.id, errorMessage(err));
+    sendFailure(ws, frame.id, err);
     return;
   }
 
@@ -501,7 +504,7 @@ async function handleQuery(
     );
     sendResult(ws, frame.id, data);
   } catch (err) {
-    sendError(ws, frame.id, errorMessage(err));
+    sendFailure(ws, frame.id, err);
   }
 }
 
@@ -518,7 +521,7 @@ async function handleMutate(
     );
     sendResult(ws, frame.id, data);
   } catch (err) {
-    sendError(ws, frame.id, errorMessage(err));
+    sendFailure(ws, frame.id, err);
   }
 }
 
@@ -566,12 +569,19 @@ function sendError(ws: VexWebSocket, id: string, message: string): void {
   send(ws, { type: "error", id, message });
 }
 
-function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === "string") return err;
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
+/** A thrown call's error frame: an HttpError's status and body with it. */
+function sendFailure(ws: VexWebSocket, id: string, err: unknown): void {
+  if (!isHttpError(err)) {
+    sendError(ws, id, errorMessage(err));
+    return;
   }
+  const body = err.shownBody();
+  const shown = (body as { error?: unknown } | null)?.error;
+  send(ws, {
+    type: "error",
+    id,
+    message: typeof shown === "string" ? shown : err.message,
+    status: err.status,
+    body,
+  });
 }

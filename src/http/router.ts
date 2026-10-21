@@ -22,15 +22,19 @@
  *     at root — every request flows through the inner handler.
  *   - `router.use(mw)` adds middleware that runs before every matcher.
  *   - Dispatch is **registration-ordered**: routes and mounts are
- *     tried in the order they were added. A child mount that returns
- *     404 lets later routes try to match; this is how you can mix
- *     "engine at root" with a `/health` route above it.
+ *     tried in the order they were added. A child router that matches
+ *     nothing lets later routes try; this is how you can mix "engine
+ *     at root" with a `/health` route above it. A 404 one of its
+ *     routes answers (a refusal, a missing row) is final. A mounted
+ *     function, which cannot say whether it matched, lets later
+ *     routes try on any 404.
  *   - Nested routers inherit nothing except their path scope; parent
  *     middleware runs before the child's dispatch.
  */
 
 import { compose } from "./compose.js";
 import { HttpError, isHttpError } from "./error.js";
+import { isUnmatched, unmatched } from "./response.js";
 import type { ErrorHandler, Handler, Middleware, RequestCtx } from "./types.js";
 
 type Method =
@@ -54,7 +58,23 @@ type Matcher =
       kind: "mount";
       prefix: string;
       inner: (req: Request, parent?: Partial<RequestCtx>) => Promise<Response>;
+      /** A Router, which marks its no-match answer; else a function. */
+      router: boolean;
     };
+
+/**
+ * What a router throws when nothing it holds matched: a 404 whose
+ * rendering, however an error handler or boundary renders it, is
+ * marked unmatched.
+ */
+class NoRoute extends HttpError {
+  constructor() {
+    super(404, "Not Found");
+  }
+  override toResponse(): Response {
+    return unmatched(super.toResponse());
+  }
+}
 
 interface RegisteredErrorHandler {
   predicate: (err: unknown, ctx: RequestCtx) => boolean;
@@ -149,8 +169,13 @@ export class Router {
         : async (req: Request) => inner(req);
     // Empty prefix (`""`, `"/"`) means "mount at root" — every request
     // flows through the inner handler. Still honors registration
-    // order: if the inner returns 404, later routes get a chance.
-    this.matchers.push({ kind: "mount", prefix: p, inner: innerFn });
+    // order: if the inner matches nothing, later routes get a chance.
+    this.matchers.push({
+      kind: "mount",
+      prefix: p,
+      inner: innerFn,
+      router: inner instanceof Router,
+    });
     return this;
   }
 
@@ -200,7 +225,7 @@ export class Router {
     const terminal = async (c: RequestCtx): Promise<Response> => {
       const response = await this.match(c, req);
       if (response) return response;
-      throw HttpError.notFound();
+      throw new NoRoute();
     };
 
     const run =
@@ -213,7 +238,8 @@ export class Router {
     try {
       return await run(ctx);
     } catch (err) {
-      return this.handleError(ctx, err);
+      const response = await this.handleError(ctx, err);
+      return err instanceof NoRoute ? unmatched(response) : response;
     }
   }
 
@@ -238,10 +264,11 @@ export class Router {
     const { pathname } = ctx.url;
     const method = req.method.toUpperCase() as Method;
 
-    // Walk matchers in registration order. A 404 from a mount (or
-    // from a route chain that returned undefined) falls through to
-    // the next matcher, so you can stack `app.get("/health", …)`
-    // above an `app.mount("", inner)` and both work.
+    // Walk matchers in registration order. A mount that matched
+    // nothing (or a route chain that returned undefined) falls
+    // through to the next matcher, so you can stack
+    // `app.get("/health", …)` above an `app.mount("", inner)` and
+    // both work.
     for (const m of this.matchers) {
       if (m.kind === "mount") {
         const matches =
@@ -252,7 +279,10 @@ export class Router {
         const rewritten =
           m.prefix === "" ? req : rewriteRequestPath(req, ctx.url, m.prefix);
         const response = await m.inner(rewritten, ctx);
-        if (response.status === 404) continue; // fall through
+        const nothingMatched = m.router
+          ? isUnmatched(response)
+          : response.status === 404;
+        if (nothingMatched) continue; // fall through
         return response;
       }
 
