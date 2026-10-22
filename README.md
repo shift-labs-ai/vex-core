@@ -332,6 +332,27 @@ Routes and mounts are tried in the order they were added. A mounted router that 
 
 Path syntax is whatever [URLPattern](https://developer.mozilla.org/en-US/docs/Web/API/URLPattern) supports: `:param`, `*`, regex groups. Captures land in `ctx.params`.
 
+### Route access
+
+A router typed with your access type takes `{ access }` on every route, and the compiler refuses a route without one. A guard runs once a route has matched and before its handlers, with the route and what it declares; throwing refuses the request. What a route without `access` means (one registered past the types) is the guard's to say: refusing it is the safe answer. Guards apply to routers mounted below, and `routes()` lists every route with its `access`, for checks at build time.
+
+```ts
+type Access = { permission: string } | { public: string };
+
+const app = createRouter<Access>()
+  .guard(async (ctx, route) => {
+    if (!route.access) throw HttpError.forbidden("Undeclared route");
+    if ("public" in route.access) return;
+    await authorize(ctx.user, route.access.permission, ctx.params); // throws to refuse
+  })
+  .get("/health", { access: { public: "probes" } }, () => new Response("ok"))
+  .get("/notes/:id", { access: { permission: "notes.read" } }, readNote);
+
+app.routes(); // [{ kind: "route", method: "GET", path: "/health", access: { public: "probes" } }, …]
+```
+
+An untyped router (`createRouter()`) takes handlers alone. A typed router mounts routers of its own type, or untyped ones, whose routes its guards see without `access`.
+
 ### Context
 
 Every middleware and handler receives a `RequestCtx`:
@@ -346,6 +367,7 @@ interface RequestCtx {
   user?: VexUser | null;             // set by auth middleware
   session?: Session;                 // set by sessions middleware
   span?: Span;                       // set by tracer middleware
+  route?: { method; path; access? }; // the matched route, set by the router
 }
 ```
 

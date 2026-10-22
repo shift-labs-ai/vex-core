@@ -23,6 +23,26 @@ export interface Session {
   destroy(): Promise<void>;
 }
 
+/** An HTTP method a route answers; `ALL` answers every one. */
+export type RouteMethod =
+  | "GET"
+  | "POST"
+  | "PUT"
+  | "PATCH"
+  | "DELETE"
+  | "OPTIONS"
+  | "HEAD"
+  | "ALL";
+
+/** A route once it has matched: what its guards and handlers see. */
+export interface MatchedRoute<A = unknown> {
+  readonly method: RouteMethod;
+  /** The full pattern it was registered at, prefix included. */
+  readonly path: string;
+  /** Absent on a route registered without any. */
+  readonly access?: A;
+}
+
 /**
  * The request context threaded through every middleware and handler.
  *
@@ -47,6 +67,8 @@ export interface RequestCtx {
    */
   span?: SpanHandle;
   session?: Session;
+  /** The route that matched, set by the router before its guards and handlers run. */
+  route?: MatchedRoute;
 }
 
 /**
