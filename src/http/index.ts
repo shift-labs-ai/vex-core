@@ -36,7 +36,7 @@ export type { RequestIdOptions } from "./middleware/request-id.js";
 export { requestId } from "./middleware/request-id.js";
 export type { SessionOptions } from "./middleware/sessions.js";
 export { sessions } from "./middleware/sessions.js";
-export type { RouterOptions } from "./router.js";
+export type { RouteEntry, RouteMethod, RouterOptions } from "./router.js";
 export { createRouter, Router } from "./router.js";
 export type {
   ServeDirOptions,

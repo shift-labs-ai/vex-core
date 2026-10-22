@@ -37,7 +37,8 @@ import { HttpError, isHttpError } from "./error.js";
 import { isUnmatched, unmatched } from "./response.js";
 import type { ErrorHandler, Handler, Middleware, RequestCtx } from "./types.js";
 
-type Method =
+/** An HTTP method a route answers; `ALL` answers every one. */
+export type RouteMethod =
   | "GET"
   | "POST"
   | "PUT"
@@ -47,10 +48,14 @@ type Method =
   | "HEAD"
   | "ALL";
 
+type Method = RouteMethod;
+
 type Matcher =
   | {
       kind: "route";
       method: Method;
+      /** The full path it was registered at, prefix included. */
+      path: string;
       pattern: URLPattern;
       handlers: Handler[];
     }
@@ -58,9 +63,22 @@ type Matcher =
       kind: "mount";
       prefix: string;
       inner: (req: Request, parent?: Partial<RequestCtx>) => Promise<Response>;
-      /** A Router, which marks its no-match answer; else a function. */
-      router: boolean;
+      /** The Router mounted, which marks its no-match answer; absent for a function. */
+      router?: Router;
     };
+
+/**
+ * What a router serves, as `routes()` lists it: each route by method
+ * and full path, and each mounted function by its prefix, which it
+ * answers under without saying what.
+ */
+export type RouteEntry =
+  | {
+      readonly kind: "route";
+      readonly method: RouteMethod;
+      readonly path: string;
+    }
+  | { readonly kind: "mount"; readonly path: string };
 
 /**
  * What a router throws when nothing it holds matched: a 404 whose
@@ -175,7 +193,7 @@ export class Router {
       kind: "mount",
       prefix: p,
       inner: innerFn,
-      router: inner instanceof Router,
+      ...(inner instanceof Router ? { router: inner } : {}),
     });
     return this;
   }
@@ -206,6 +224,29 @@ export class Router {
       });
     }
     return this;
+  }
+
+  /**
+   * Every route this router serves, in the order it tries them, a
+   * mounted router's under its prefix; a mounted function by its
+   * prefix alone.
+   */
+  routes(): RouteEntry[] {
+    return this.routesUnder("");
+  }
+
+  private routesUnder(base: string): RouteEntry[] {
+    return this.matchers.flatMap((m): RouteEntry[] => {
+      if (m.kind === "route") {
+        return [
+          { kind: "route", method: m.method, path: joinPath(base, m.path) },
+        ];
+      }
+      const prefix = joinPath(base, m.prefix || "/");
+      return m.router
+        ? m.router.routesUnder(prefix === "/" ? "" : prefix)
+        : [{ kind: "mount", path: prefix }];
+    });
   }
 
   /** Dispatch a Request through this router. The top-level entry point. */
@@ -256,7 +297,13 @@ export class Router {
     // URLPattern lets us use `:param`, `*`, and regex groups. We pin
     // pathname matching; method and host are not part of the pattern.
     const pattern = new URLPattern({ pathname: full });
-    this.matchers.push({ kind: "route", method, pattern, handlers });
+    this.matchers.push({
+      kind: "route",
+      method,
+      path: full,
+      pattern,
+      handlers,
+    });
     return this;
   }
 

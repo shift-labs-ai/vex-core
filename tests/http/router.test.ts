@@ -205,6 +205,26 @@ describe("router — mount", () => {
   });
 });
 
+describe("router — routes()", () => {
+  test("lists every route by method and full path, through mounted routers", () => {
+    const api = createRouter({ prefix: "/v1" })
+      .get("/items/:id", () => new Response("item"))
+      .post("/items", () => new Response("made"));
+    const app = createRouter()
+      .get("/health", () => new Response("ok"))
+      .mount("/api", api)
+      .mount("", createRouter().all("/hooks/*", () => new Response("hook")))
+      .mount("/raw", () => new Response("raw"));
+    expect(app.routes()).toEqual([
+      { kind: "route", method: "GET", path: "/health" },
+      { kind: "route", method: "GET", path: "/api/v1/items/:id" },
+      { kind: "route", method: "POST", path: "/api/v1/items" },
+      { kind: "route", method: "ALL", path: "/hooks/*" },
+      { kind: "mount", path: "/raw" },
+    ]);
+  });
+});
+
 describe("router — error handling", () => {
   test("HttpError renders via toResponse()", async () => {
     const app = createRouter().get("/x", () => {
