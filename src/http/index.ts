@@ -36,7 +36,13 @@ export type { RequestIdOptions } from "./middleware/request-id.js";
 export { requestId } from "./middleware/request-id.js";
 export type { SessionOptions } from "./middleware/sessions.js";
 export { sessions } from "./middleware/sessions.js";
-export type { RouteEntry, RouteMethod, RouterOptions } from "./router.js";
+export type {
+  RouteArgs,
+  RouteEntry,
+  RouteGuard,
+  RouteOptions,
+  RouterOptions,
+} from "./router.js";
 export { createRouter, Router } from "./router.js";
 export type {
   ServeDirOptions,
@@ -47,8 +53,10 @@ export { serveDir, serveFile } from "./serve-static.js";
 export type {
   ErrorHandler,
   Handler,
+  MatchedRoute,
   Middleware,
   RequestCtx,
+  RouteMethod,
   Session,
 } from "./types.js";
 export type { VexHandlerOptions } from "./vex-handler.js";

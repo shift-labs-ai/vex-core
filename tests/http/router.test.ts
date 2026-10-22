@@ -213,7 +213,10 @@ describe("router — routes()", () => {
     const app = createRouter()
       .get("/health", () => new Response("ok"))
       .mount("/api", api)
-      .mount("", createRouter().all("/hooks/*", () => new Response("hook")))
+      .mount(
+        "",
+        createRouter().all("/hooks/*", () => new Response("hook")),
+      )
       .mount("/raw", () => new Response("raw"));
     expect(app.routes()).toEqual([
       { kind: "route", method: "GET", path: "/health" },
@@ -221,6 +224,102 @@ describe("router — routes()", () => {
       { kind: "route", method: "POST", path: "/api/v1/items" },
       { kind: "route", method: "ALL", path: "/hooks/*" },
       { kind: "mount", path: "/raw" },
+    ]);
+  });
+});
+
+describe("router — access and guards", () => {
+  type Access = { permission: string } | "public";
+  const ok = () => new Response("ok");
+
+  test("a guard sees the matched route and its access, before its handlers", async () => {
+    const seen: string[] = [];
+    const app = createRouter<Access>()
+      .guard((ctx, route) => {
+        seen.push(
+          `guard ${route.method} ${route.path} ${JSON.stringify(route.access)} ${ctx.params.id}`,
+        );
+      })
+      .get("/notes/:id", { access: { permission: "notes.read" } }, (ctx) => {
+        seen.push(`handler ${ctx.route?.path}`);
+        return new Response("note");
+      });
+    const res = await app.handle(new Request("http://x/notes/7"));
+    expect(await res.text()).toBe("note");
+    expect(seen).toEqual([
+      'guard GET /notes/:id {"permission":"notes.read"} 7',
+      "handler /notes/:id",
+    ]);
+  });
+
+  test("a guard that throws refuses the request: no handler runs", async () => {
+    let ran = false;
+    const app = createRouter<Access>()
+      .guard((_ctx, route) => {
+        if (route.access !== "public") throw HttpError.forbidden("no");
+      })
+      .get("/secret", { access: { permission: "x" } }, () => {
+        ran = true;
+        return ok();
+      })
+      .get("/health", { access: "public" }, ok);
+    expect((await app.handle(new Request("http://x/secret"))).status).toBe(403);
+    expect(ran).toBe(false);
+    expect((await app.handle(new Request("http://x/health"))).status).toBe(200);
+  });
+
+  test("a guard runs for routes a mounted router matches, and not for a miss", async () => {
+    const guarded: string[] = [];
+    const inner = createRouter<Access>().get("/ping", { access: "public" }, ok);
+    const app = createRouter<Access>()
+      .guard((_ctx, route) => {
+        guarded.push(route.path);
+      })
+      .mount("/api", inner);
+    expect((await app.handle(new Request("http://x/api/ping"))).status).toBe(
+      200,
+    );
+    expect((await app.handle(new Request("http://x/api/none"))).status).toBe(
+      404,
+    );
+    expect(guarded).toEqual(["/ping"]);
+  });
+
+  test("a route registered without access reaches the guard with none", async () => {
+    let access: unknown = "unset";
+    const app = createRouter<Access>().guard((_ctx, route) => {
+      access = route.access;
+      if (route.access === undefined) throw HttpError.forbidden("undeclared");
+    });
+    // An untyped caller, past the compiler.
+    (app as unknown as { get: (p: string, h: () => Response) => void }).get(
+      "/raw",
+      ok,
+    );
+    expect((await app.handle(new Request("http://x/raw"))).status).toBe(403);
+    expect(access).toBeUndefined();
+  });
+
+  test("routes() lists each route's access, and none for one registered without", () => {
+    const app = createRouter<Access>()
+      .get("/notes", { access: { permission: "notes.read" } }, ok)
+      .mount(
+        "/api",
+        createRouter<Access>().post("/x", { access: "public" }, ok),
+      );
+    (app as unknown as { get: (p: string, h: () => Response) => void }).get(
+      "/raw",
+      ok,
+    );
+    expect(app.routes()).toEqual([
+      {
+        kind: "route",
+        method: "GET",
+        path: "/notes",
+        access: { permission: "notes.read" },
+      },
+      { kind: "route", method: "POST", path: "/api/x", access: "public" },
+      { kind: "route", method: "GET", path: "/raw" },
     ]);
   });
 });

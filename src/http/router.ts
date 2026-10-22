@@ -28,43 +28,72 @@
  *     routes answers (a refusal, a missing row) is final. A mounted
  *     function, which cannot say whether it matched, lets later
  *     routes try on any 404.
- *   - Nested routers inherit nothing except their path scope; parent
- *     middleware runs before the child's dispatch.
+ *   - Nested routers inherit their path scope and their parents'
+ *     guards; parent middleware runs before the child's dispatch.
+ *
+ * Access
+ *   - A router typed with an access type (`createRouter<A>()`) takes
+ *     `{ access }` on every route, as its second argument: the
+ *     compiler refuses a route without one. Untyped, routes take
+ *     handlers alone.
+ *   - `router.guard(fn)` runs once a route has matched and before its
+ *     handlers, with the route and its `access` (absent on a route
+ *     registered without one). Throwing refuses the request; the
+ *     guard is the app's, so what an absent `access` means is too.
+ *     Guards apply to mounted routers as well.
+ *   - `routes()` lists every route with its `access`.
  */
 
 import { compose } from "./compose.js";
 import { HttpError, isHttpError } from "./error.js";
 import { isUnmatched, unmatched } from "./response.js";
-import type { ErrorHandler, Handler, Middleware, RequestCtx } from "./types.js";
+import type {
+  ErrorHandler,
+  Handler,
+  MatchedRoute,
+  Middleware,
+  RequestCtx,
+  RouteMethod,
+} from "./types.js";
 
-/** An HTTP method a route answers; `ALL` answers every one. */
-export type RouteMethod =
-  | "GET"
-  | "POST"
-  | "PUT"
-  | "PATCH"
-  | "DELETE"
-  | "OPTIONS"
-  | "HEAD"
-  | "ALL";
+/** What a route declares beside its handlers. */
+export interface RouteOptions<A> {
+  /** What the route needs, as the router's guards read it. */
+  readonly access: A;
+}
 
-type Method = RouteMethod;
+/**
+ * A route's arguments: its handlers alone on an untyped router, its
+ * options and then its handlers on one typed with an access type.
+ */
+export type RouteArgs<A> = [A] extends [never]
+  ? Handler[]
+  : [RouteOptions<A>, Handler, ...Handler[]];
+
+/** Runs between a route's match and its handlers; throwing refuses the request. */
+export type RouteGuard<A = unknown> = (
+  ctx: RequestCtx,
+  route: MatchedRoute<A>,
+) => void | Promise<void>;
 
 type Matcher =
   | {
       kind: "route";
-      method: Method;
-      /** The full path it was registered at, prefix included. */
-      path: string;
+      /** The route as its guards and handlers see it, built once. */
+      route: MatchedRoute;
       pattern: URLPattern;
       handlers: Handler[];
     }
   | {
       kind: "mount";
       prefix: string;
-      inner: (req: Request, parent?: Partial<RequestCtx>) => Promise<Response>;
+      inner: (
+        req: Request,
+        parent?: Partial<RequestCtx>,
+        guards?: readonly RouteGuard[],
+      ) => Promise<Response>;
       /** The Router mounted, which marks its no-match answer; absent for a function. */
-      router?: Router;
+      router?: Router<unknown>;
     };
 
 /**
@@ -72,11 +101,13 @@ type Matcher =
  * and full path, and each mounted function by its prefix, which it
  * answers under without saying what.
  */
-export type RouteEntry =
+export type RouteEntry<A = unknown> =
   | {
       readonly kind: "route";
       readonly method: RouteMethod;
       readonly path: string;
+      /** Absent on a route registered without any. */
+      readonly access?: A;
     }
   | { readonly kind: "mount"; readonly path: string };
 
@@ -129,11 +160,12 @@ function buildCtx(
   };
 }
 
-export class Router {
+export class Router<A = never> {
   private readonly prefix: string;
   private readonly middlewares: Middleware[] = [];
   private readonly matchers: Matcher[] = [];
   private readonly errorHandlers: RegisteredErrorHandler[] = [];
+  private readonly guards: RouteGuard<A>[] = [];
 
   constructor(opts: RouterOptions = {}) {
     this.prefix = normalizePrefix(opts.prefix ?? "");
@@ -145,30 +177,39 @@ export class Router {
     return this;
   }
 
+  /**
+   * Run `guard` for every route this router, or a router mounted in
+   * it, matches: after the match, before its handlers.
+   */
+  guard(guard: RouteGuard<A>): this {
+    this.guards.push(guard);
+    return this;
+  }
+
   /** Register handlers for any method matching the path. */
-  all(path: string, ...handlers: Handler[]): this {
-    return this.route("ALL", path, handlers);
+  all(path: string, ...args: RouteArgs<A>): this {
+    return this.route("ALL", path, args);
   }
-  get(path: string, ...handlers: Handler[]): this {
-    return this.route("GET", path, handlers);
+  get(path: string, ...args: RouteArgs<A>): this {
+    return this.route("GET", path, args);
   }
-  post(path: string, ...handlers: Handler[]): this {
-    return this.route("POST", path, handlers);
+  post(path: string, ...args: RouteArgs<A>): this {
+    return this.route("POST", path, args);
   }
-  put(path: string, ...handlers: Handler[]): this {
-    return this.route("PUT", path, handlers);
+  put(path: string, ...args: RouteArgs<A>): this {
+    return this.route("PUT", path, args);
   }
-  patch(path: string, ...handlers: Handler[]): this {
-    return this.route("PATCH", path, handlers);
+  patch(path: string, ...args: RouteArgs<A>): this {
+    return this.route("PATCH", path, args);
   }
-  delete(path: string, ...handlers: Handler[]): this {
-    return this.route("DELETE", path, handlers);
+  delete(path: string, ...args: RouteArgs<A>): this {
+    return this.route("DELETE", path, args);
   }
-  options(path: string, ...handlers: Handler[]): this {
-    return this.route("OPTIONS", path, handlers);
+  options(path: string, ...args: RouteArgs<A>): this {
+    return this.route("OPTIONS", path, args);
   }
-  head(path: string, ...handlers: Handler[]): this {
-    return this.route("HEAD", path, handlers);
+  head(path: string, ...args: RouteArgs<A>): this {
+    return this.route("HEAD", path, args);
   }
 
   /**
@@ -179,7 +220,10 @@ export class Router {
    */
   mount(
     prefix: string,
-    inner: Router | ((req: Request) => Response | Promise<Response>),
+    inner:
+      | Router<A>
+      | Router
+      | ((req: Request) => Response | Promise<Response>),
   ): this {
     const p = normalizePrefix(prefix);
     const innerFn =
@@ -193,7 +237,7 @@ export class Router {
       kind: "mount",
       prefix: p,
       inner: innerFn,
-      ...(inner instanceof Router ? { router: inner } : {}),
+      ...(inner instanceof Router ? { router: inner as Router<unknown> } : {}),
     });
     return this;
   }
@@ -231,15 +275,15 @@ export class Router {
    * mounted router's under its prefix; a mounted function by its
    * prefix alone.
    */
-  routes(): RouteEntry[] {
-    return this.routesUnder("");
+  routes(): RouteEntry<A>[] {
+    return this.routesUnder("") as RouteEntry<A>[];
   }
 
   private routesUnder(base: string): RouteEntry[] {
     return this.matchers.flatMap((m): RouteEntry[] => {
       if (m.kind === "route") {
         return [
-          { kind: "route", method: m.method, path: joinPath(base, m.path) },
+          { kind: "route", ...m.route, path: joinPath(base, m.route.path) },
         ];
       }
       const prefix = joinPath(base, m.prefix || "/");
@@ -256,16 +300,19 @@ export class Router {
 
   /**
    * Internal dispatch. Separate from `handle` so mounted routers can
-   * thread the parent's ctx annotations through.
+   * thread the parent's ctx annotations and guards through.
    */
   async dispatch(
     req: Request,
     parent?: Partial<RequestCtx>,
+    inherited: readonly RouteGuard[] = [],
   ): Promise<Response> {
     const ctx = buildCtx(req, {}, parent);
+    const own = this.guards as RouteGuard[];
+    const guards = inherited.length === 0 ? own : [...inherited, ...own];
 
     const terminal = async (c: RequestCtx): Promise<Response> => {
-      const response = await this.match(c, req);
+      const response = await this.match(c, req, guards);
       if (response) return response;
       throw new NoRoute();
     };
@@ -289,7 +336,11 @@ export class Router {
 
   // ─── internals ───────────────────────────────────────────────────
 
-  private route(method: Method, path: string, handlers: Handler[]): this {
+  private route(method: RouteMethod, path: string, args: unknown[]): this {
+    const [first, ...rest] = args;
+    const declared =
+      first !== null && typeof first === "object" && "access" in first;
+    const handlers = (declared ? rest : args) as Handler[];
     if (handlers.length === 0) {
       throw new Error(`${method} ${path}: at least one handler required`);
     }
@@ -299,8 +350,13 @@ export class Router {
     const pattern = new URLPattern({ pathname: full });
     this.matchers.push({
       kind: "route",
-      method,
-      path: full,
+      route: {
+        method,
+        path: full,
+        ...(declared
+          ? { access: (first as RouteOptions<unknown>).access }
+          : {}),
+      },
       pattern,
       handlers,
     });
@@ -310,9 +366,10 @@ export class Router {
   private async match(
     ctx: RequestCtx,
     req: Request,
+    guards: readonly RouteGuard[],
   ): Promise<Response | undefined> {
     const { pathname } = ctx.url;
-    const method = req.method.toUpperCase() as Method;
+    const method = req.method.toUpperCase() as RouteMethod;
 
     // Walk matchers in registration order. A mount that matched
     // nothing (or a route chain that returned undefined) falls
@@ -328,7 +385,7 @@ export class Router {
         if (!matches) continue;
         const rewritten =
           m.prefix === "" ? req : rewriteRequestPath(req, ctx.url, m.prefix);
-        const response = await m.inner(rewritten, ctx);
+        const response = await m.inner(rewritten, ctx, guards);
         const nothingMatched = m.router
           ? isUnmatched(response)
           : response.status === 404;
@@ -336,14 +393,17 @@ export class Router {
         return response;
       }
 
-      if (m.method !== "ALL" && m.method !== method) continue;
+      const { route } = m;
+      if (route.method !== "ALL" && route.method !== method) continue;
       const execResult = m.pattern.exec({ pathname });
       if (!execResult) continue;
       const params = extractParams(execResult);
       const routeCtx: RequestCtx = {
         ...ctx,
         params: { ...ctx.params, ...params },
+        route,
       };
+      for (const guard of guards) await guard(routeCtx, route);
       for (const handler of m.handlers) {
         const result = await handler(routeCtx);
         if (result instanceof Response) return result;
@@ -378,8 +438,8 @@ export class Router {
 }
 
 /** Shortcut: `createRouter(opts?)`. */
-export function createRouter(opts?: RouterOptions): Router {
-  return new Router(opts);
+export function createRouter<A = never>(opts?: RouterOptions): Router<A> {
+  return new Router<A>(opts);
 }
 
 // ─── helpers ───────────────────────────────────────────────────────
