@@ -160,8 +160,8 @@ interface JobRunResult {
 
 /**
  * `A` is the app's access declaration (`OperationAccess`): what every
- * query and mutation of every plugin must declare. Unchosen, there is
- * none to declare.
+ * query, mutation and action of every plugin must declare. Unchosen,
+ * there is none to declare.
  */
 export interface VexOptions<A = undefined> {
   plugins: Array<PluginFunction<A> | PluginDef<A>>;
@@ -667,24 +667,27 @@ export class Vex<A = unknown> {
   }
 
   /**
-   * An action's context: each call it makes is made as `user`, the
-   * action's caller as it called, a child of the action's span; an
-   * action it calls stops with it (`signal`).
+   * An action's context: each call it makes is a child of the action's
+   * span, made as the context's caller as middleware left it, so the
+   * handler and what it calls see one caller; an action it calls stops
+   * with it (`signal`).
    */
   private buildActionContext(
     user: VexUser | null | undefined,
     parent: ExecContext,
     signal: AbortSignal | undefined,
   ): ActionContext {
-    const as = { parent, user };
-    return {
-      query: (name, args = {}) => this.query(name, args, as),
-      mutate: (name, args = {}) => this.mutate(name, args, as),
-      action: (name, args = {}) => this.action(name, args, { ...as, signal }),
+    // Read at call time: middleware may have told the context more.
+    const as = (): CallContext => ({ parent, user: ctx.user });
+    const ctx: ActionContext = {
+      query: (name, args = {}) => this.query(name, args, as()),
+      mutate: (name, args = {}) => this.mutate(name, args, as()),
+      action: (name, args = {}) => this.action(name, args, { ...as(), signal }),
       runtime: this.runtime(),
-      user,
+      user: user ?? undefined,
       signal,
     };
+    return ctx;
   }
 
   private buildQueryContext(
@@ -1337,7 +1340,9 @@ export class Vex<A = unknown> {
   /**
    * Runs action `name` as the caller: decided by middleware like any
    * operation, outside any transaction, its calls to queries and
-   * mutations each made as the same caller (`ActionContext`).
+   * mutations each made as the same caller (`ActionContext`). A caller
+   * that has already stopped waiting starts nothing: the call rejects
+   * with the signal's reason, as `fetch` does.
    */
   async action<T = any>(
     name: string,
@@ -1348,6 +1353,7 @@ export class Vex<A = unknown> {
     return this.trace("action", name, parent, async (ectx, meta) => {
       const reg = this.actions.get(name);
       if (!reg) throw new Error(`Action not found: ${name}`);
+      signal?.throwIfAborted();
       if (isTraceRecording(ectx)) meta.plugin = reg.plugin;
       const ctx = this.buildActionContext(user, ectx, signal);
       return (await this.runMiddleware(

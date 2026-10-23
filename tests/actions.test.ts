@@ -178,6 +178,47 @@ describe("actions", () => {
     expect(await engine.action("notes.watch", {}, { user: dana })).toBeNull();
   });
 
+  test("a caller that has already stopped waiting starts nothing", async () => {
+    const { engine, seen } = await recording();
+    const caller = new AbortController();
+    caller.abort(new Error("gone"));
+    await expect(
+      engine.action(
+        "notes.import",
+        { texts: ["a"] },
+        { user: dana, signal: caller.signal },
+      ),
+    ).rejects.toThrow("gone");
+    expect(seen).toEqual([]);
+    expect(await engine.query("notes.list")).toEqual([]);
+  });
+
+  test("what middleware tells an action of its caller, the calls it makes carry", async () => {
+    // A gate that resolves the caller's standing hands the handler and
+    // every call it makes the same caller.
+    const told: Array<[string, unknown]> = [];
+    const elevated: VexUser = { ...dana, isAdmin: true };
+    vex = await Vex.create<Access>({
+      storage: sqliteAdapter(":memory:"),
+      plugins: [
+        notesPlugin,
+        (api) => {
+          api.setName("gate");
+          api.use((ctx, info, next) => {
+            if (info.type === "action") ctx.user = elevated;
+            else told.push([info.name, ctx.user]);
+            return next();
+          });
+        },
+      ],
+    });
+    await vex.action("notes.import", { texts: ["a"] }, { user: dana });
+    expect(told).toEqual([
+      ["notes.add", elevated],
+      ["notes.list", elevated],
+    ]);
+  });
+
   test("an unknown action is refused by name", async () => {
     const { engine } = await recording();
     await expect(engine.action("notes.nope")).rejects.toThrow(

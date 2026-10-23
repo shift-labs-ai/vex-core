@@ -8,7 +8,7 @@ npm install vex-core
 
 **Runtime requirement:** Bun 1.3+
 
-`vex-core` intentionally targets Bun. Its SQLite adapter and WebSocket server use Bun runtime APIs. The engine, with queries, mutations, subscriptions and jobs, and the HTTP router also run inside a Cloudflare Durable Object; see [Cloudflare Durable Objects](#cloudflare-durable-objects).
+`vex-core` intentionally targets Bun. Its SQLite adapter and WebSocket server use Bun runtime APIs. The engine, with queries, mutations, actions, subscriptions and jobs, and the HTTP router also run inside a Cloudflare Durable Object; see [Cloudflare Durable Objects](#cloudflare-durable-objects).
 
 Peer: `react` ^19 (only if you use `vex-core/client`).
 
@@ -157,7 +157,7 @@ api.registerQuery("export", {
 });
 ```
 
-Reactive metadata is recorded on spans: `resultRows`, `resultBytes`, `reactive`, `budget`, and `budgetExceeded`. Query-builder reads record dependency descriptors for table, filters, selected columns, ordering, and limits. External API work and unbounded exports should stay outside reactive queries or be marked `reactive: false`.
+Reactive metadata is recorded on spans: `resultRows`, `resultBytes`, `reactive`, `budget`, and `budgetExceeded`. Query-builder reads record dependency descriptors for table, filters, selected columns, ordering, and limits. External API work belongs in [actions](#actions); unbounded exports stay outside reactive queries or are marked `reactive: false`.
 
 ### Change tracking and raw SQL
 
@@ -212,7 +212,7 @@ api.registerAction("import", {
 await vex.action("notes.import", { url });
 ```
 
-An action has no database. It reads and writes through the queries and mutations it calls (`ctx.query`, `ctx.mutate`, `ctx.action`), each made as the action's caller, decided by middleware, traced, and in its own transaction: what one mutation wrote stays even if the action fails later. Middleware decides the action itself first (`info.type === "action"`). No handler timeout bounds an action, since it holds no read and no transaction; its own work bounds it, and `ctx.signal` aborts when its caller stops waiting (`vex.action(name, args, { user, signal })`; an `/action` request closing), so long work can stop with it. An action it calls inherits the signal. Actions are called over HTTP (`POST /action`), over the WebSocket (`{ type: "action", id, name, args? }`), and with `VexClient.action()`, and never subscribed to.
+An action has no database. It reads and writes through the queries and mutations it calls (`ctx.query`, `ctx.mutate`, `ctx.action`), each made as the action's caller, decided by middleware, traced, and in its own transaction: what one mutation wrote stays even if the action fails later. Middleware decides the action itself first (`info.type === "action"`). No handler timeout bounds an action, since it holds no read and no transaction; its own work bounds it, and `ctx.signal` aborts when its caller stops waiting (`vex.action(name, args, { user, signal })`; an `/action` request closing), so long work can stop with it. An action it calls inherits the signal. Actions are called over HTTP (`POST /action`), over the WebSocket (`{ type: "action", id, name, args? }`, stopped when the connection closes), and with `VexClient.action()`, and never subscribed to. A caller that has already stopped waiting starts nothing. Middleware that tells the action more about its caller (`ctx.user`) tells every call it makes.
 
 ## Operation access
 
@@ -283,11 +283,14 @@ import { table } from "vex-core/framework";
 export const todos = table({ text: "string", done: "boolean" });
 
 // todos.ts
-import { query, mutation } from "vex-core/framework";
+import { action, query, mutation } from "vex-core/framework";
 export const list = query({}, async (ctx) => ctx.db.table("todos").all());
 export const add = mutation({ text: "string" }, async (ctx, args) =>
   ctx.db.table("todos").insert({ text: args.text, done: false }),
 );
+export const importAll = action({ texts: "json" }, async (ctx, args) => {
+  for (const text of args.texts) await ctx.mutate("todos.add", { text });
+});
 ```
 
 ```ts
@@ -557,11 +560,11 @@ function Todos() {
 }
 ```
 
-SSE-backed — data updates automatically on mutations that touch the underlying tables.
+Backed by the `/subscribe` WebSocket: data updates automatically on mutations that touch the underlying tables.
 
 ## Observability
 
-Every engine operation is a span. Pass a `tracer` to `Vex.create` to capture queries, mutations, handler timings, tables touched, invalidated subscriptions, and errors. See `src/core/tracer.ts` for the `Tracer` and `Span` interfaces.
+Every engine operation is a span. Pass a `tracer` to `Vex.create` to capture queries, mutations, actions, handler timings, tables touched, invalidated subscriptions, and errors. See `src/core/tracer.ts` for the `Tracer` and `Span` interfaces.
 
 A tracer can make one head-sampling decision for each root. Returning `false` prevents the entire trace from recording and skips result-size instrumentation for one-shot queries:
 
@@ -596,7 +599,7 @@ Age retention alone is not a hard volume bound. Production sinks should also cap
 | Entry | Contents |
 |-------|----------|
 | `vex-core` | `Vex`, `sqliteAdapter`, `durableObjectAdapter`, `id`, core types, tracer, `RateLimiter`. Under the `workerd` condition, everything but `sqliteAdapter` and `config` |
-| `vex-core/framework` | `table`, `query`, `mutation`, `webhook`, `job`, `middleware`, `scanDirectory` |
+| `vex-core/framework` | `table`, `query`, `mutation`, `action`, `webhook`, `job`, `middleware`, `scanDirectory` |
 | `vex-core/http` | `Router`, `createRouter`, `HttpError`, `compose`, `vexHandler`, static handlers (`serveDir`, `serveFile`), plus middleware (`cors`, `bearerAuth`, `bodyParser`, `accessLog`, `requestId`, `rateLimit`, `errorBoundary`, `sessions`) |
 | `vex-core/client` | `VexProvider`, `useQuery`, `useMutation` |
 | `vex-core/adapters/sqlite` | `sqliteAdapter` |

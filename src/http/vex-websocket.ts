@@ -1,12 +1,10 @@
 /**
  * vexWebSocket — multiplexed live channel for vex.
  *
- * Replaces the old SSE-based `/subscribe` (one connection per query)
- * and `/events` (blanket invalidation, force a refetch) with a single
- * WebSocket per client that carries every reactive read and (optionally)
- * one-shot RPC. The engine's `vex.subscribe()` machinery does the
- * actual work — table-precise re-runs, hash-deduped pushes — and this
- * module just frames it onto a wire protocol.
+ * One WebSocket per client carries every reactive read and one-shot
+ * calls. The engine's `vex.subscribe()` machinery does the actual work
+ * — table-precise re-runs, hash-deduped pushes — and this module frames
+ * it onto a wire protocol.
  *
  * Why one connection
  *   - HTTP/1.1 caps origins at ~6 simultaneous connections, which made
@@ -48,7 +46,8 @@
  * `id` is client-assigned and opaque to the server; the server only
  * uses it to route responses back to the right caller. Subscription
  * ids must be stable for the life of the subscription; query, mutate
- * and action ids are one-shot.
+ * and action ids are one-shot. Closing the connection stops its
+ * actions, as closing an `/action` request does.
  *
  * Auth
  *   Two ways in, one resolution contract:
@@ -106,6 +105,8 @@ export interface VexWebSocketConnectionState {
   pendingAuth: Promise<void> | null;
   /** Deadline for sockets admitted unauthenticated. */
   authTimer: ReturnType<typeof setTimeout> | null;
+  /** Aborted when the connection closes: its actions' signal. */
+  closed: AbortController;
 }
 
 /** Convenience alias for the typed `ServerWebSocket` Bun hands us. */
@@ -262,6 +263,7 @@ export function vexWebSocket(
         subs: new Map(),
         pendingAuth: null,
         authTimer: null,
+        closed: new AbortController(),
       };
 
       const ok = server.upgrade(req, { data });
@@ -313,6 +315,7 @@ export function vexWebSocket(
     },
 
     close(ws) {
+      ws.data.closed.abort();
       if (ws.data.authTimer) {
         clearTimeout(ws.data.authTimer);
         ws.data.authTimer = null;
@@ -503,15 +506,18 @@ async function handleCall(
     args?: Record<string, unknown>;
   },
 ): Promise<void> {
-  const as = ws.data.user ? { user: ws.data.user } : undefined;
+  const user = ws.data.user ?? undefined;
   const args = frame.args ?? {};
   try {
     const data =
       frame.type === "query"
-        ? await vex.query(frame.name, args, as)
+        ? await vex.query(frame.name, args, { user })
         : frame.type === "mutate"
-          ? await vex.mutate(frame.name, args, as)
-          : await vex.action(frame.name, args, as);
+          ? await vex.mutate(frame.name, args, { user })
+          : await vex.action(frame.name, args, {
+              user,
+              signal: ws.data.closed.signal,
+            });
     sendResult(ws, frame.id, data);
   } catch (err) {
     sendFailure(ws, frame.id, err);

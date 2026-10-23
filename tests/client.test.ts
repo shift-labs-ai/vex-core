@@ -102,7 +102,7 @@ beforeAll(async () => {
   });
 
   // The composed app dripyard-style: HTTP RPC on /vex/{query,mutate,
-  // webhook}, the live channel on /vex/subscribe via WebSocket
+  // action,webhook}, the live channel on /vex/subscribe via WebSocket
   // upgrade. The router only owns HTTP; WS upgrade needs a `Server`
   // reference so it lives inline in the fetch handler.
   const app = createRouter().use(cors()).mount("/vex", vexHandler(vex));
@@ -1641,6 +1641,19 @@ describe("WebSocket live channel", () => {
     } finally {
       await client.close();
     }
+  });
+
+  test("closing the connection stops its actions", async () => {
+    const client = await openClient();
+    const before = stopped.length;
+    client.send({ type: "action", id: "hold-1", name: "items.stoppable" });
+    await Bun.sleep(50);
+    expect(stopped).toHaveLength(before);
+    await client.close();
+    for (let tries = 0; tries < 50 && stopped.length === before; tries++) {
+      await Bun.sleep(10);
+    }
+    expect(stopped).toHaveLength(before + 1);
   });
 
   test("VexClient.action runs an action over the socket", async () => {

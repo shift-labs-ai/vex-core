@@ -3,7 +3,7 @@
  *
  * Owns one connection for the lifetime of the app. Allocates an opaque
  * `id` per request, routes incoming `data` / `result` / `error` frames
- * back to the right callback. Exposes three primitives the hooks wrap:
+ * back to the right callback. Exposes the primitives the hooks wrap:
  *
  *   subscribe(name, args, cb) → () => void   live query
  *   query(name, args) → Promise<T>           one-shot read
