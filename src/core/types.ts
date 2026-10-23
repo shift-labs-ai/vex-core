@@ -136,6 +136,9 @@ export interface VexUser {
 export interface CallContext {
   parent?: ExecContext;
   user?: VexUser | null;
+  /** An action's caller stopping: the action sees it as
+   *  `ActionContext.signal`. Queries and mutations ignore it. */
+  signal?: AbortSignal;
 }
 
 export interface SubscriptionSummary {
@@ -216,9 +219,13 @@ export interface MutationContext {
 export interface ActionContext {
   query<T = any>(name: string, args?: Record<string, any>): Promise<T>;
   mutate<T = any>(name: string, args?: Record<string, any>): Promise<T>;
+  /** Another action, as the same caller, stopped when this one is. */
   action<T = any>(name: string, args?: Record<string, any>): Promise<T>;
   runtime: VexRuntime;
   user?: VexUser | null;
+  /** Aborted when the caller stops waiting (`/action`'s request
+   *  closing): work that outlives its answer stops with it. */
+  signal?: AbortSignal;
 }
 
 export interface ReactiveBudget {

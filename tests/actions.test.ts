@@ -52,6 +52,16 @@ function notesPlugin(api: VexPluginAPI<Access>) {
       return "waited";
     },
   });
+  api.registerAction("watch", {
+    args: {},
+    access: { permission: "notes.wait" },
+    handler: (ctx) => ctx.signal ?? null,
+  });
+  api.registerAction("watchThrough", {
+    args: {},
+    access: { permission: "notes.wait" },
+    handler: (ctx) => ctx.action("notes.watch"),
+  });
   api.registerQuery("slow", {
     args: { ms: "number" },
     access: { permission: "notes.read" },
@@ -157,6 +167,17 @@ describe("actions", () => {
     );
   });
 
+  test("an action, and each action it calls, sees its caller's signal", async () => {
+    const { engine } = await recording();
+    const caller = new AbortController();
+    const call = { user: dana, signal: caller.signal };
+    expect(await engine.action("notes.watch", {}, call)).toBe(caller.signal);
+    expect(await engine.action("notes.watchThrough", {}, call)).toBe(
+      caller.signal,
+    );
+    expect(await engine.action("notes.watch", {}, { user: dana })).toBeNull();
+  });
+
   test("an unknown action is refused by name", async () => {
     const { engine } = await recording();
     await expect(engine.action("notes.nope")).rejects.toThrow(
@@ -170,6 +191,8 @@ describe("actions", () => {
       "notes.import",
       "notes.relay",
       "notes.wait",
+      "notes.watch",
+      "notes.watchThrough",
     ]);
     expect(engine.describeAction("notes.import")).toEqual({
       plugin: "notes",

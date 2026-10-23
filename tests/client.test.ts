@@ -24,6 +24,8 @@ const REFUSAL = {
 let vex: Vex;
 let server: Server;
 let base: string;
+/** What `items.stoppable` saw, as it saw it. */
+const stopped: string[] = [];
 
 beforeAll(async () => {
   vex = await Vex.create({
@@ -82,6 +84,17 @@ beforeAll(async () => {
               const rows = await ctx.query("items.byName", { name: args.name });
               return { count: rows.length, as: ctx.user?.id ?? null };
             },
+          },
+          // Waits until its caller stops waiting, and says it saw so.
+          stoppable: {
+            args: {},
+            handler: (ctx) =>
+              new Promise<void>((resolve) => {
+                ctx.signal?.addEventListener("abort", () => {
+                  stopped.push("stopped");
+                  resolve();
+                });
+              }),
           },
         },
       },
@@ -238,6 +251,24 @@ describe("action endpoint", () => {
     });
     expect(res.status).toBe(400);
     expect((await res.json()).error).toBe("Missing action name");
+  });
+
+  test("a caller who stops waiting stops the action", async () => {
+    const caller = new AbortController();
+    const answer = fetch(`${base}/vex/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "items.stoppable", args: {} }),
+      signal: caller.signal,
+    }).catch(() => "gone");
+    await Bun.sleep(50);
+    expect(stopped).toEqual([]);
+    caller.abort();
+    expect(await answer).toBe("gone");
+    for (let tries = 0; tries < 50 && stopped.length === 0; tries++) {
+      await Bun.sleep(10);
+    }
+    expect(stopped).toEqual(["stopped"]);
   });
 
   test("returns error for unknown action", async () => {

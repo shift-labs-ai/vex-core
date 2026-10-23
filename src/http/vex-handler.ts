@@ -100,7 +100,7 @@ export function vexHandler(vex: Vex, opts: VexHandlerOptions = {}): Router {
     "/action",
     makeCallHandler(
       "action",
-      (name, args, user) => vex.action(name, args, { user }),
+      (name, args, user, signal) => vex.action(name, args, { user, signal }),
       getUser,
       rpcLimits,
     ),
@@ -116,6 +116,8 @@ type Call = (
   name: string,
   args: Record<string, unknown>,
   user: VexUser | null | undefined,
+  /** The request's: aborted when its caller goes away. */
+  signal: AbortSignal,
 ) => Promise<unknown>;
 
 /** `/query`, `/mutate` or `/action`: a `{ name, args? }` body → `{ data }`. */
@@ -129,7 +131,9 @@ function makeCallHandler(
     const { name, args } = parseCall(await bodyText(ctx, limits));
     if (!name) return json({ error: `Missing ${kind} name` }, 400);
     try {
-      return json({ data: await call(name, args, getUser(ctx)) });
+      return json({
+        data: await call(name, args, getUser(ctx), ctx.req.signal),
+      });
     } catch (err: unknown) {
       return failure(err);
     }

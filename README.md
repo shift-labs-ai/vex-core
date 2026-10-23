@@ -212,7 +212,7 @@ api.registerAction("import", {
 await vex.action("notes.import", { url });
 ```
 
-An action has no database. It reads and writes through the queries and mutations it calls (`ctx.query`, `ctx.mutate`, `ctx.action`), each made as the action's caller, decided by middleware, traced, and in its own transaction: what one mutation wrote stays even if the action fails later. Middleware decides the action itself first (`info.type === "action"`). No handler timeout bounds an action, since it holds no read and no transaction; its own work bounds it. Actions are called over HTTP (`POST /action`), over the WebSocket (`{ type: "action", id, name, args? }`), and with `VexClient.action()`, and never subscribed to.
+An action has no database. It reads and writes through the queries and mutations it calls (`ctx.query`, `ctx.mutate`, `ctx.action`), each made as the action's caller, decided by middleware, traced, and in its own transaction: what one mutation wrote stays even if the action fails later. Middleware decides the action itself first (`info.type === "action"`). No handler timeout bounds an action, since it holds no read and no transaction; its own work bounds it, and `ctx.signal` aborts when its caller stops waiting (`vex.action(name, args, { user, signal })`; an `/action` request closing), so long work can stop with it. An action it calls inherits the signal. Actions are called over HTTP (`POST /action`), over the WebSocket (`{ type: "action", id, name, args? }`), and with `VexClient.action()`, and never subscribed to.
 
 ## Operation access
 
