@@ -1,4 +1,5 @@
 import type {
+  ActionDef,
   JobDef,
   MiddlewareFn,
   MutationDef,
@@ -18,6 +19,7 @@ export interface VexPluginAPI<A = undefined> {
   registerTable(name: string, schema: TableSchema): void;
   registerQuery(name: string, def: QueryDef<A>): void;
   registerMutation(name: string, def: MutationDef<A>): void;
+  registerAction(name: string, def: ActionDef<A>): void;
   registerJob(name: string, def: JobDef): void;
   registerWebhook(name: string, def: WebhookDef): void;
   use(fn: MiddlewareFn<A>): void;
@@ -33,6 +35,7 @@ export function createPluginAPI<A = undefined>(): {
   const tables: Record<string, TableSchema> = {};
   const queries: Record<string, QueryDef<A>> = {};
   const mutations: Record<string, MutationDef<A>> = {};
+  const actions: Record<string, ActionDef<A>> = {};
   const jobs: Record<string, JobDef> = {};
   const webhooks: Record<string, WebhookDef> = {};
   const middleware: MiddlewareFn<A>[] = [];
@@ -49,6 +52,9 @@ export function createPluginAPI<A = undefined>(): {
     },
     registerMutation(mutationName: string, def: MutationDef<A>) {
       mutations[mutationName] = def;
+    },
+    registerAction(actionName: string, def: ActionDef<A>) {
+      actions[actionName] = def;
     },
     registerJob(jobName: string, def: JobDef) {
       jobs[jobName] = def;
@@ -67,6 +73,7 @@ export function createPluginAPI<A = undefined>(): {
       tables,
       queries,
       mutations,
+      actions,
       jobs,
       webhooks,
       middleware: middleware.length > 0 ? middleware : undefined,

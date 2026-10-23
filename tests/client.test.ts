@@ -24,6 +24,8 @@ const REFUSAL = {
 let vex: Vex;
 let server: Server;
 let base: string;
+/** What `items.stoppable` saw, as it saw it. */
+const stopped: string[] = [];
 
 beforeAll(async () => {
   vex = await Vex.create({
@@ -72,12 +74,35 @@ beforeAll(async () => {
             handler: async (ctx, args) => ctx.db.table("items").insert(args),
           },
         },
+        actions: {
+          // Writes through a mutation, then reads through a query, as
+          // its caller: the answer names who it ran as.
+          tally: {
+            args: { name: "string" },
+            handler: async (ctx, args) => {
+              await ctx.mutate("items.create", { name: args.name, value: 1 });
+              const rows = await ctx.query("items.byName", { name: args.name });
+              return { count: rows.length, as: ctx.user?.id ?? null };
+            },
+          },
+          // Waits until its caller stops waiting, and says it saw so.
+          stoppable: {
+            args: {},
+            handler: (ctx) =>
+              new Promise<void>((resolve) => {
+                ctx.signal?.addEventListener("abort", () => {
+                  stopped.push("stopped");
+                  resolve();
+                });
+              }),
+          },
+        },
       },
     ],
   });
 
   // The composed app dripyard-style: HTTP RPC on /vex/{query,mutate,
-  // webhook}, the live channel on /vex/subscribe via WebSocket
+  // action,webhook}, the live channel on /vex/subscribe via WebSocket
   // upgrade. The router only owns HTTP; WS upgrade needs a `Server`
   // reference so it lives inline in the fetch handler.
   const app = createRouter().use(cors()).mount("/vex", vexHandler(vex));
@@ -204,6 +229,56 @@ describe("mutation endpoint", () => {
     expect(res.ok).toBe(false);
     const body = await res.json();
     expect(body.error).toBeDefined();
+  });
+});
+
+describe("action endpoint", () => {
+  test("runs the action and returns its result", async () => {
+    const res = await fetch(`${base}/vex/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "items.tally", args: { name: "http" } }),
+    });
+    expect(res.ok).toBe(true);
+    expect(await res.json()).toEqual({ data: { count: 1, as: null } });
+  });
+
+  test("returns 400 for missing action name", async () => {
+    const res = await fetch(`${base}/vex/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ args: {} }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("Missing action name");
+  });
+
+  test("a caller who stops waiting stops the action", async () => {
+    const caller = new AbortController();
+    const answer = fetch(`${base}/vex/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "items.stoppable", args: {} }),
+      signal: caller.signal,
+    }).catch(() => "gone");
+    await Bun.sleep(50);
+    expect(stopped).toEqual([]);
+    caller.abort();
+    expect(await answer).toBe("gone");
+    for (let tries = 0; tries < 50 && stopped.length === 0; tries++) {
+      await Bun.sleep(10);
+    }
+    expect(stopped).toEqual(["stopped"]);
+  });
+
+  test("returns error for unknown action", async () => {
+    const res = await fetch(`${base}/vex/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "items.nope", args: {} }),
+    });
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toBe("Action not found: items.nope");
   });
 });
 
@@ -1552,6 +1627,48 @@ describe("WebSocket live channel", () => {
     }
   });
 
+  test("action frame runs the action and answers its result", async () => {
+    const client = await openClient();
+    try {
+      const got = client.expectResult("a-1");
+      client.send({
+        type: "action",
+        id: "a-1",
+        name: "items.tally",
+        args: { name: "ws-action" },
+      });
+      expect(await got).toEqual({ data: { count: 1, as: null } });
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("closing the connection stops its actions", async () => {
+    const client = await openClient();
+    const before = stopped.length;
+    client.send({ type: "action", id: "hold-1", name: "items.stoppable" });
+    await Bun.sleep(50);
+    expect(stopped).toHaveLength(before);
+    await client.close();
+    for (let tries = 0; tries < 50 && stopped.length === before; tries++) {
+      await Bun.sleep(10);
+    }
+    expect(stopped).toHaveLength(before + 1);
+  });
+
+  test("VexClient.action runs an action over the socket", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const client = new VexClient({ basePath: `${base}/vex` });
+    try {
+      expect(await client.action("items.tally", { name: "client" })).toEqual({
+        count: 1,
+        as: null,
+      });
+    } finally {
+      client.close();
+    }
+  });
+
   test("mutate frame round-trips data and triggers active subscriptions", async () => {
     const client = await openClient();
     try {
@@ -1766,9 +1883,7 @@ describe("a refused call answers its status and body", () => {
   });
 
   test("through VexClient", async () => {
-    const { VexCallError, VexClient } = await import(
-      "../src/client/client.js"
-    );
+    const { VexCallError, VexClient } = await import("../src/client/client.js");
     const client = new VexClient({ basePath: `${base}/vex` });
     try {
       const refused = await client.query("items.refused").catch((e) => e);

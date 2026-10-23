@@ -40,6 +40,23 @@ export const declared: PluginFunction<Access> = (api) => {
   // @ts-expect-error access is required
   api.registerMutation("open", { args: {}, handler: () => null });
 
+  api.registerAction("sync", {
+    args: {},
+    access: { permission: "notes.sync" },
+    handler: (ctx) => ctx.query("declared.list"),
+  });
+
+  // Nor does an action.
+  // @ts-expect-error access is required
+  api.registerAction("open", { args: {}, handler: () => null });
+
+  api.registerAction("raw", {
+    args: {},
+    access: "system",
+    // @ts-expect-error an action has no database: it calls operations
+    handler: (ctx) => ctx.db,
+  });
+
   api.registerQuery("wrong", {
     args: {},
     // @ts-expect-error a declaration of another shape

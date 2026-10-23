@@ -2,6 +2,7 @@ import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { MiddlewareFn, PluginDef, TableSchema } from "../core/types.js";
 import {
+  isAction,
   isJob,
   isMiddleware,
   isMutation,
@@ -16,6 +17,7 @@ export interface ScanResult {
   tableCount: number;
   queryCount: number;
   mutationCount: number;
+  actionCount: number;
   webhookCount: number;
   jobCount: number;
   middlewareCount: number;
@@ -59,6 +61,7 @@ export async function scanDirectory(dir: string): Promise<ScanResult> {
   let tableCount = 0;
   let queryCount = 0;
   let mutationCount = 0;
+  let actionCount = 0;
   let webhookCount = 0;
   let jobCount = 0;
   let middlewareCount = 0;
@@ -104,6 +107,7 @@ export async function scanDirectory(dir: string): Promise<ScanResult> {
     const tables: Record<string, TableSchema> = {};
     const queries: PluginDef["queries"] = {};
     const mutations: PluginDef["mutations"] = {};
+    const actions: NonNullable<PluginDef["actions"]> = {};
     const webhooks: PluginDef["webhooks"] = {};
     const jobs: PluginDef["jobs"] = {};
 
@@ -117,6 +121,9 @@ export async function scanDirectory(dir: string): Promise<ScanResult> {
       } else if (isMutation(value)) {
         mutations[exportName] = untag(value);
         mutationCount++;
+      } else if (isAction(value)) {
+        actions[exportName] = untag(value);
+        actionCount++;
       } else if (isWebhook(value)) {
         webhooks[exportName] = untag(value);
         webhookCount++;
@@ -132,6 +139,7 @@ export async function scanDirectory(dir: string): Promise<ScanResult> {
     const hasContent =
       Object.keys(queries).length > 0 ||
       Object.keys(mutations).length > 0 ||
+      Object.keys(actions).length > 0 ||
       Object.keys(webhooks).length > 0 ||
       Object.keys(jobs).length > 0 ||
       Object.keys(tables).length > 0;
@@ -142,6 +150,7 @@ export async function scanDirectory(dir: string): Promise<ScanResult> {
         tables,
         queries,
         mutations,
+        actions: Object.keys(actions).length > 0 ? actions : undefined,
         jobs: Object.keys(jobs).length > 0 ? jobs : undefined,
         webhooks: Object.keys(webhooks).length > 0 ? webhooks : undefined,
       });
@@ -157,12 +166,16 @@ export async function scanDirectory(dir: string): Promise<ScanResult> {
     });
   }
 
-  // Attach global middleware to first plugin with queries or mutations
+  // Middleware is engine-wide whichever plugin carries it: the first
+  // with a call for it to wrap carries it, so an app of actions or
+  // webhooks alone keeps its gate.
   if (globalMiddleware.length > 0) {
     const target = plugins.find(
       (p) =>
         Object.keys(p.queries).length > 0 ||
-        Object.keys(p.mutations).length > 0,
+        Object.keys(p.mutations).length > 0 ||
+        Object.keys(p.actions ?? {}).length > 0 ||
+        Object.keys(p.webhooks ?? {}).length > 0,
     );
     if (target) target.middleware = globalMiddleware;
   }
@@ -172,6 +185,7 @@ export async function scanDirectory(dir: string): Promise<ScanResult> {
     tableCount,
     queryCount,
     mutationCount,
+    actionCount,
     webhookCount,
     jobCount,
     middlewareCount,

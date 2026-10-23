@@ -1,4 +1,5 @@
 import type {
+  ActionContext,
   ColumnDef,
   ColumnType,
   MiddlewareFn,
@@ -26,6 +27,15 @@ export interface VexMutation {
   args: Record<string, string>;
   handler: (
     ctx: MutationContext,
+    args: Record<string, any>,
+  ) => Promise<any> | any;
+}
+
+export interface VexAction {
+  [KIND]: "action";
+  args: Record<string, string>;
+  handler: (
+    ctx: ActionContext,
     args: Record<string, any>,
   ) => Promise<any> | any;
 }
@@ -96,6 +106,13 @@ export function mutation(
   return { [KIND]: "mutation", args, handler };
 }
 
+export function action(
+  args: Record<string, string>,
+  handler: VexAction["handler"],
+): VexAction {
+  return { [KIND]: "action", args, handler };
+}
+
 export function webhook(
   path: string,
   handler: VexWebhook["handler"],
@@ -145,6 +162,9 @@ export function isQuery(v: any): v is VexQuery {
 }
 export function isMutation(v: any): v is VexMutation {
   return v?.[KIND] === "mutation";
+}
+export function isAction(v: any): v is VexAction {
+  return v?.[KIND] === "action";
 }
 export function isWebhook(v: any): v is VexWebhook {
   return v?.[KIND] === "webhook";

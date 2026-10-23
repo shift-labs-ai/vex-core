@@ -3,11 +3,12 @@
  *
  * Owns one connection for the lifetime of the app. Allocates an opaque
  * `id` per request, routes incoming `data` / `result` / `error` frames
- * back to the right callback. Exposes three primitives the hooks wrap:
+ * back to the right callback. Exposes the primitives the hooks wrap:
  *
  *   subscribe(name, args, cb) → () => void   live query
  *   query(name, args) → Promise<T>           one-shot read
  *   mutate(name, args) → Promise<T>          one-shot write
+ *   action(name, args) → Promise<T>          one-shot action
  *
  * Lifecycle
  *   - Lazy connect: the WS opens on the first call. Until it's open,
@@ -18,10 +19,10 @@
  *     subscriptions re-send their `subscribe` frames after the
  *     new connection opens, so the consumer doesn't have to know
  *     a reconnect happened — they just see a fresh `data` frame.
- *   - In-flight one-shots (query/mutate) waiting for a `result`
+ *   - In-flight one-shots (query/mutate/action) waiting for a `result`
  *     when the socket dies are rejected with `connection lost`.
  *     The caller can retry; we don't auto-retry because mutations
- *     aren't necessarily idempotent.
+ *     and actions aren't necessarily idempotent.
  */
 
 /**
@@ -180,6 +181,14 @@ export class VexClient {
     return this.callOneShot<T>("mutate", name, args);
   }
 
+  /** One-shot action. Resolves with the action's result. */
+  action<T = unknown>(
+    name: string,
+    args: Record<string, unknown> = {},
+  ): Promise<T> {
+    return this.callOneShot<T>("action", name, args);
+  }
+
   /**
    * Tear down the connection and reject all pending requests. Active
    * subscriptions are dropped silently — their callbacks just stop
@@ -218,7 +227,7 @@ export class VexClient {
   }
 
   private callOneShot<T>(
-    type: "query" | "mutate",
+    type: "query" | "mutate" | "action",
     name: string,
     args: Record<string, unknown>,
   ): Promise<T> {

@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { sqliteAdapter } from "../src/adapters/sqlite.js";
+import { Vex } from "../src/core/engine.js";
 import {
+  action,
+  isAction,
   isJob,
   isMiddleware,
   isMutation,
@@ -64,6 +68,15 @@ describe("define", () => {
     const m = mutation({ name: "string" }, handler);
     expect(isMutation(m)).toBe(true);
     expect(m.args).toEqual({ name: "string" });
+  });
+
+  test("action() returns tagged action", () => {
+    const handler = async () => "done";
+    const a = action({ url: "string" }, handler);
+    expect(isAction(a)).toBe(true);
+    expect(isMutation(a)).toBe(false);
+    expect(a.args).toEqual({ url: "string" });
+    expect(a.handler).toBe(handler);
   });
 
   test("webhook() simple form", () => {
@@ -205,6 +218,52 @@ describe("scanner", () => {
     const items = result.plugins.find((p) => p.name === "items");
     expect(schema!.middleware).toBeUndefined();
     expect(items!.middleware).toHaveLength(1);
+  });
+
+  test("action files are scanned, and the engine runs them", async () => {
+    writeFile(
+      "notes.ts",
+      `import { action, mutation, query, table } from "@vex/define";
+       export const items = table({ text: "string" });
+       export const add = mutation({ text: "string" }, (ctx, args) =>
+         ctx.db.table("notes_items").insert({ text: args.text }));
+       export const count = query({}, (ctx) => ctx.db.table("notes_items").count());
+       export const importAll = action({ texts: "json" }, async (ctx, args) => {
+         for (const text of args.texts) await ctx.mutate("notes.add", { text });
+         return ctx.query("notes.count");
+       });`,
+    );
+    const result = await scanDirectory(TMP);
+    expect(result.actionCount).toBe(1);
+    const plugin = result.plugins.find((p) => p.name === "notes")!;
+    expect(isAction(plugin.actions!.importAll)).toBe(false);
+    const vex = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      plugins: result.plugins,
+    });
+    try {
+      expect(await vex.action("notes.importAll", { texts: ["a", "b"] })).toBe(
+        2,
+      );
+    } finally {
+      await vex.close();
+    }
+  });
+
+  test("middleware reaches an app of actions alone", async () => {
+    writeFile(
+      "middleware.ts",
+      `import { middleware } from "@vex/define";
+       export const auth = middleware(async (ctx, info, next) => next());`,
+    );
+    writeFile(
+      "jobs.ts",
+      `import { action } from "@vex/define";
+       export const run = action({}, async () => "ran");`,
+    );
+    const result = await scanDirectory(TMP);
+    const plugin = result.plugins.find((p) => p.name === "jobs");
+    expect(plugin!.middleware).toHaveLength(1);
   });
 
   test("skips .test.ts files", async () => {

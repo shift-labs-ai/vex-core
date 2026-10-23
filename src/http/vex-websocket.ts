@@ -1,12 +1,10 @@
 /**
  * vexWebSocket — multiplexed live channel for vex.
  *
- * Replaces the old SSE-based `/subscribe` (one connection per query)
- * and `/events` (blanket invalidation, force a refetch) with a single
- * WebSocket per client that carries every reactive read and (optionally)
- * one-shot RPC. The engine's `vex.subscribe()` machinery does the
- * actual work — table-precise re-runs, hash-deduped pushes — and this
- * module just frames it onto a wire protocol.
+ * One WebSocket per client carries every reactive read and one-shot
+ * calls. The engine's `vex.subscribe()` machinery does the actual work
+ * — table-precise re-runs, hash-deduped pushes — and this module frames
+ * it onto a wire protocol.
  *
  * Why one connection
  *   - HTTP/1.1 caps origins at ~6 simultaneous connections, which made
@@ -26,11 +24,12 @@
  *     { type: "unsubscribe", id }                stop one
  *     { type: "query",       id, name, args? }   one-shot read
  *     { type: "mutate",      id, name, args? }   one-shot write
+ *     { type: "action",      id, name, args? }   one-shot action
  *
  *   Server → Client
  *     { type: "pong",   id }           keepalive answer
  *     { type: "data",   id, data }     subscribe initial + each update
- *     { type: "result", id, data }     query/mutate + auth completion
+ *     { type: "result", id, data }     query/mutate/action + auth completion
  *     { type: "error",  id, message,   per-id failure; a thrown
  *       status?, body? }               HttpError adds its status and
  *                                      body, as HTTP RPC answers them
@@ -46,8 +45,9 @@
  *
  * `id` is client-assigned and opaque to the server; the server only
  * uses it to route responses back to the right caller. Subscription
- * ids must be stable for the life of the subscription; query/mutate
- * ids are one-shot.
+ * ids must be stable for the life of the subscription; query, mutate
+ * and action ids are one-shot. Closing the connection stops its
+ * actions, as closing an `/action` request does.
  *
  * Auth
  *   Two ways in, one resolution contract:
@@ -105,6 +105,8 @@ export interface VexWebSocketConnectionState {
   pendingAuth: Promise<void> | null;
   /** Deadline for sockets admitted unauthenticated. */
   authTimer: ReturnType<typeof setTimeout> | null;
+  /** Aborted when the connection closes: its actions' signal. */
+  closed: AbortController;
 }
 
 /** Convenience alias for the typed `ServerWebSocket` Bun hands us. */
@@ -261,6 +263,7 @@ export function vexWebSocket(
         subs: new Map(),
         pendingAuth: null,
         authTimer: null,
+        closed: new AbortController(),
       };
 
       const ok = server.upgrade(req, { data });
@@ -312,6 +315,7 @@ export function vexWebSocket(
     },
 
     close(ws) {
+      ws.data.closed.abort();
       if (ws.data.authTimer) {
         clearTimeout(ws.data.authTimer);
         ws.data.authTimer = null;
@@ -344,9 +348,8 @@ type ClientFrame =
       args?: Record<string, unknown>;
     }
   | { type: "unsubscribe"; id: string }
-  | { type: "query"; id: string; name: string; args?: Record<string, unknown> }
   | {
-      type: "mutate";
+      type: "query" | "mutate" | "action";
       id: string;
       name: string;
       args?: Record<string, unknown>;
@@ -377,6 +380,7 @@ function parseFrame(value: unknown): ClientFrame | null {
     case "subscribe":
     case "query":
     case "mutate":
+    case "action":
       if (typeof f.name !== "string") {
         console.warn(
           `[vex-ws] ${f.type} frame missing string \`name\`; ignored`,
@@ -422,9 +426,9 @@ async function dispatch(
     case "unsubscribe":
       return handleUnsubscribe(ws, frame);
     case "query":
-      return handleQuery(vex, ws, frame);
     case "mutate":
-      return handleMutate(vex, ws, frame);
+    case "action":
+      return handleCall(vex, ws, frame);
   }
 }
 
@@ -491,34 +495,29 @@ function handleUnsubscribe(ws: VexWebSocket, frame: { id: string }): void {
   }
 }
 
-async function handleQuery(
+/** A one-shot call, made as the connection's user; its answer or failure goes back by id. */
+async function handleCall(
   vex: Vex,
   ws: VexWebSocket,
-  frame: { id: string; name: string; args?: Record<string, unknown> },
+  frame: {
+    type: "query" | "mutate" | "action";
+    id: string;
+    name: string;
+    args?: Record<string, unknown>;
+  },
 ): Promise<void> {
+  const user = ws.data.user ?? undefined;
+  const args = frame.args ?? {};
   try {
-    const data = await vex.query(
-      frame.name,
-      frame.args ?? {},
-      ws.data.user ? { user: ws.data.user } : undefined,
-    );
-    sendResult(ws, frame.id, data);
-  } catch (err) {
-    sendFailure(ws, frame.id, err);
-  }
-}
-
-async function handleMutate(
-  vex: Vex,
-  ws: VexWebSocket,
-  frame: { id: string; name: string; args?: Record<string, unknown> },
-): Promise<void> {
-  try {
-    const data = await vex.mutate(
-      frame.name,
-      frame.args ?? {},
-      ws.data.user ? { user: ws.data.user } : undefined,
-    );
+    const data =
+      frame.type === "query"
+        ? await vex.query(frame.name, args, { user })
+        : frame.type === "mutate"
+          ? await vex.mutate(frame.name, args, { user })
+          : await vex.action(frame.name, args, {
+              user,
+              signal: ws.data.closed.signal,
+            });
     sendResult(ws, frame.id, data);
   } catch (err) {
     sendFailure(ws, frame.id, err);
