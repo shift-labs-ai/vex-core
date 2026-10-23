@@ -207,20 +207,34 @@ export interface MutationContext {
   user?: VexUser | null;
 }
 
+/**
+ * What an action runs with: no database. It reads and writes through
+ * the queries and mutations it calls, each a call of its own made as
+ * the action's caller: decided by middleware, traced, and in its own
+ * transaction. Nothing it does is held open while it waits.
+ */
+export interface ActionContext {
+  query<T = any>(name: string, args?: Record<string, any>): Promise<T>;
+  mutate<T = any>(name: string, args?: Record<string, any>): Promise<T>;
+  action<T = any>(name: string, args?: Record<string, any>): Promise<T>;
+  runtime: VexRuntime;
+  user?: VexUser | null;
+}
+
 export interface ReactiveBudget {
   maxRows?: number;
   maxBytes?: number;
 }
 
 /**
- * What a query or mutation declares about who may run it. Its shape is
- * the app's, chosen as `Vex.create<A>`: then every query and mutation
+ * What a query, mutation or action declares about who may run it. Its
+ * shape is the app's, chosen as `Vex.create<A>`: then every operation
  * must declare one, and leaving it out does not compile. The engine
  * decides nothing with it; it hands it to middleware with every call
- * (`MiddlewareInfo.access`) and answers it in `describeQuery` and
- * `describeMutation`, so the app's own gate decides, and can list what
- * every operation needs. An app that chooses none (`undefined`, the
- * default) declares none.
+ * (`MiddlewareInfo.access`) and answers it in `describeQuery`,
+ * `describeMutation` and `describeAction`, so the app's own gate
+ * decides, and can list what every operation needs. An app that
+ * chooses none (`undefined`, the default) declares none.
  */
 export type OperationAccess<A> = undefined extends A
   ? { access?: A }
@@ -236,6 +250,20 @@ export type MutationDef<A = undefined> = {
   args: Record<string, string>;
   handler: (
     ctx: MutationContext,
+    args: Record<string, any>,
+  ) => Promise<any> | any;
+} & OperationAccess<A>;
+
+/**
+ * Work that cannot sit in a transaction: it waits (on a person, on
+ * another process), spawns, or reaches outside the engine. It holds
+ * no read and no transaction while it runs, so no handler timeout
+ * bounds it; its own work does.
+ */
+export type ActionDef<A = undefined> = {
+  args: Record<string, string>;
+  handler: (
+    ctx: ActionContext,
     args: Record<string, any>,
   ) => Promise<any> | any;
 } & OperationAccess<A>;
@@ -276,15 +304,15 @@ export interface WebhookDef {
 }
 
 /**
- * The call middleware runs around. A query's or mutation's `access` is
- * the one its definition declares; it is `undefined` when that
- * definition has none, which the types allow only by default, but a
- * gate must still refuse it: a cast reaches here too. A webhook
+ * The call middleware runs around. A query's, mutation's or action's
+ * `access` is the one its definition declares; it is `undefined` when
+ * that definition has none, which the types allow only by default, but
+ * a gate must still refuse it: a cast reaches here too. A webhook
  * declares none; its `verify` decides who may call it.
  */
 export type MiddlewareInfo<A = undefined> =
   | {
-      type: "query" | "mutation";
+      type: "query" | "mutation" | "action";
       name: string;
       args: Record<string, any>;
       access: A | undefined;
@@ -297,7 +325,7 @@ export type MiddlewareInfo<A = undefined> =
     };
 
 export type MiddlewareFn<A = undefined> = (
-  ctx: QueryContext | MutationContext,
+  ctx: QueryContext | MutationContext | ActionContext,
   info: MiddlewareInfo<A>,
   next: () => Promise<any> | any,
 ) => Promise<any> | any;
@@ -308,6 +336,7 @@ export interface PluginDef<A = undefined> {
   tables: Record<string, TableSchema>;
   queries: Record<string, QueryDef<A>>;
   mutations: Record<string, MutationDef<A>>;
+  actions?: Record<string, ActionDef<A>>;
   jobs?: Record<string, JobDef>;
   webhooks?: Record<string, WebhookDef>;
   middleware?: MiddlewareFn<A>[];

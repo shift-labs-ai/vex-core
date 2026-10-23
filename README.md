@@ -1,6 +1,6 @@
 # vex-core
 
-Local-first reactive backend engine. Plugin architecture, SQLite storage, real-time subscriptions via SSE.
+Local-first reactive backend engine. Plugin architecture, SQLite storage, real-time subscriptions over a WebSocket.
 
 ```
 npm install vex-core
@@ -195,9 +195,28 @@ api.registerQuery("sql", {
 
 A published table with an access policy is read only for callers its policy leaves `UNRESTRICTED`, since raw SQL cannot apply the row filter; everyone else is refused. Storage that cannot show a statement's program (`StorageAdapter.readOnlyTables`) refuses every call. Results are reactive like any raw read: a subscription depends on exactly the tables the statement read. `ctx.db.publishedTables()` lists the dataset: each published table with every column a statement can read, `_id` included.
 
+## Actions
+
+A mutation runs inside one transaction, so it must not wait: on a person, on another process, on the network. Work that does is an action, the third kind of operation beside queries and mutations:
+
+```ts
+api.registerAction("import", {
+  args: { url: "string" },
+  async handler(ctx, args) {
+    const rows = await fetchRows(args.url);          // may take minutes
+    for (const row of rows) await ctx.mutate("notes.add", row);
+    return ctx.query("notes.count");
+  },
+});
+
+await vex.action("notes.import", { url });
+```
+
+An action has no database. It reads and writes through the queries and mutations it calls (`ctx.query`, `ctx.mutate`, `ctx.action`), each made as the action's caller, decided by middleware, traced, and in its own transaction: what one mutation wrote stays even if the action fails later. Middleware decides the action itself first (`info.type === "action"`). No handler timeout bounds an action, since it holds no read and no transaction; its own work bounds it. Actions are called over HTTP (`POST /action`), over the WebSocket (`{ type: "action", id, name, args? }`), and with `VexClient.action()`, and never subscribed to.
+
 ## Operation access
 
-An app can make every query and mutation declare who may run it, so an operation without a declaration does not compile. Choose the declaration's shape as the engine's type parameter:
+An app can make every query, mutation and action declare who may run it, so an operation without a declaration does not compile. Choose the declaration's shape as the engine's type parameter:
 
 ```ts
 type Access = { permission: string } | "system";
@@ -218,7 +237,7 @@ const vex = await Vex.create<Access>({
 });
 ```
 
-The engine decides nothing with it. It hands each call's declaration to middleware, where the app's own gate decides, and it describes each operation with its declaration (`describeQuery`, `describeMutation`, `introspect`), so the app can list what every operation needs:
+The engine decides nothing with it. It hands each call's declaration to middleware, where the app's own gate decides, and it describes each operation with its declaration (`describeQuery`, `describeMutation`, `describeAction`, `introspect`), so the app can list what every operation needs:
 
 ```ts
 vex.use((ctx, info, next) => {
@@ -394,13 +413,13 @@ Exposes, relative to wherever it's mounted:
 ```
 POST /query              { name, args? }
 POST /mutate             { name, args? }
-GET  /subscribe          ?name=...&args=... (SSE)
+POST /action             { name, args? }
 ALL  /webhook/*          user-defined webhooks
 ```
 
-A query or mutation that throws an `HttpError` answers as it renders, its status, headers and body: a refusal reaches the caller as the 403 or 404 it is, with whatever its body carries (a `code`, the permission it lacked). Anything else thrown is a 500 carrying its message. The WebSocket's error frame carries the same: `{ type: "error", id, message, status?, body? }`, and `VexClient` rejects with a `VexCallError` holding `status` and `body`.
+A query, mutation or action that throws an `HttpError` answers as it renders, its status, headers and body: a refusal reaches the caller as the 403 or 404 it is, with whatever its body carries (a `code`, the permission it lacked). Anything else thrown is a 500 carrying its message. The WebSocket's error frame carries the same: `{ type: "error", id, message, status?, body? }`, and `VexClient` rejects with a `VexCallError` holding `status` and `body`.
 
-Request bodies are read under a byte ceiling: `vexHandler(vex, { maxBodyBytes, maxWebhookBodyBytes, bodyTimeoutMs })`. `maxBodyBytes` defaults to 8 MiB (`DEFAULT_MAX_BODY_BYTES`) and covers `/query` and `/mutate`. Webhooks use the same ceiling unless `maxWebhookBodyBytes` gives them their own. A body past the ceiling gets a 413 before it is buffered, and no query, mutation or webhook runs. With `bodyTimeoutMs` set, a body that stalls gets a 408. Mounted behind `bodyParser`, the dispatcher uses the body the parser already read.
+Request bodies are read under a byte ceiling: `vexHandler(vex, { maxBodyBytes, maxWebhookBodyBytes, bodyTimeoutMs })`. `maxBodyBytes` defaults to 8 MiB (`DEFAULT_MAX_BODY_BYTES`) and covers `/query`, `/mutate` and `/action`. Webhooks use the same ceiling unless `maxWebhookBodyBytes` gives them their own. A body past the ceiling gets a 413 before it is buffered, and no operation or webhook runs. With `bodyTimeoutMs` set, a body that stalls gets a 408. Mounted behind `bodyParser`, the dispatcher uses the body the parser already read.
 
 ### Request bodies under a byte ceiling
 

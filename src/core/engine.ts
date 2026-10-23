@@ -20,6 +20,8 @@ import {
 import type { ExecContext, Tracer } from "./tracer.js";
 import { createRootSpan, isTraceRecording } from "./tracer.js";
 import type {
+  ActionContext,
+  ActionDef,
   CallContext,
   DescribedColumn,
   JobDef,
@@ -124,9 +126,13 @@ interface RegisteredMutation {
   plugin: string;
   def: MutationDef<any>;
 }
+interface RegisteredAction {
+  plugin: string;
+  def: ActionDef<any>;
+}
 
 /**
- * How the engine describes a query or mutation, wherever it does: its
+ * How the engine describes an operation, wherever it does: its
  * plugin, its args, and the access it declares (`OperationAccess`),
  * `undefined` when it declares none.
  */
@@ -137,7 +143,7 @@ export interface OperationDescription<A> {
 }
 
 function describeOperation<A>(
-  registered: RegisteredQuery | RegisteredMutation,
+  registered: RegisteredQuery | RegisteredMutation | RegisteredAction,
 ): OperationDescription<A> {
   return {
     plugin: registered.plugin,
@@ -185,6 +191,7 @@ export class Vex<A = unknown> {
   private plugins: PluginDef<any>[] = [];
   private queries: Map<string, RegisteredQuery> = new Map();
   private mutations: Map<string, RegisteredMutation> = new Map();
+  private actions: Map<string, RegisteredAction> = new Map();
   private subscriptions: Map<string, Subscription> = new Map();
   private tables: Set<string> = new Set();
   private middleware: MiddlewareFn<any>[] = [];
@@ -316,6 +323,12 @@ export class Vex<A = unknown> {
       if (this.mutations.has(key))
         throw new Error(`Duplicate mutation: ${key}`);
       this.mutations.set(key, { plugin: plugin.name, def });
+    }
+
+    for (const [name, def] of Object.entries(plugin.actions ?? {})) {
+      const key = `${plugin.name}.${name}`;
+      if (this.actions.has(key)) throw new Error(`Duplicate action: ${key}`);
+      this.actions.set(key, { plugin: plugin.name, def });
     }
 
     for (const [name, job] of Object.entries(plugin.jobs ?? {})) {
@@ -650,6 +663,24 @@ export class Vex<A = unknown> {
       triggerJob: (name) => this.triggerJob(name),
       setJobEnabled: (name, enabled) => this.setJobEnabled(name, enabled),
       describeSubscriptions: () => this.describeSubscriptions(),
+    };
+  }
+
+  /**
+   * An action's context: each call it makes is made as `user`, the
+   * action's caller as it called, a child of the action's span.
+   */
+  private buildActionContext(
+    user: VexUser | null | undefined,
+    parent: ExecContext,
+  ): ActionContext {
+    const as = { parent, user };
+    return {
+      query: (name, args = {}) => this.query(name, args, as),
+      mutate: (name, args = {}) => this.mutate(name, args, as),
+      action: (name, args = {}) => this.action(name, args, as),
+      runtime: this.runtime(),
+      user,
     };
   }
 
@@ -992,25 +1023,30 @@ export class Vex<A = unknown> {
     ]);
   }
 
+  /**
+   * Runs `handler` inside every middleware. A query's or mutation's
+   * handler is bounded by the handler timeout, since it holds a read or
+   * a transaction; an action's holds neither, and is not.
+   */
   private async runMiddleware(
-    ctx: QueryContext | MutationContext,
+    ctx: QueryContext | MutationContext | ActionContext,
     info: MiddlewareInfo<any>,
     handler: () => Promise<any> | any,
     ectx: ExecContext,
   ): Promise<any> {
+    const run = () => {
+      const result = Promise.resolve(handler());
+      return info.type === "action" ? result : this.withTimeout(result);
+    };
     if (this.middleware.length === 0) {
-      return this.trace("handler", info.name, ectx, () =>
-        this.withTimeout(Promise.resolve(handler())),
-      );
+      return this.trace("handler", info.name, ectx, run);
     }
     return this.trace("middleware", info.name, ectx, (mwEctx) => {
       let i = 0;
       const chain = (): Promise<any> | any => {
         if (i < this.middleware.length)
           return this.middleware[i++](ctx, info, chain);
-        return this.trace("handler", info.name, mwEctx, () =>
-          this.withTimeout(Promise.resolve(handler())),
-        );
+        return this.trace("handler", info.name, mwEctx, run);
       };
       return chain();
     });
@@ -1295,6 +1331,31 @@ export class Vex<A = unknown> {
     });
   }
 
+  /**
+   * Runs action `name` as the caller: decided by middleware like any
+   * operation, outside any transaction, its calls to queries and
+   * mutations each made as the same caller (`ActionContext`).
+   */
+  async action<T = any>(
+    name: string,
+    args: Record<string, any> = {},
+    callCtx?: ExecContext | CallContext,
+  ): Promise<T> {
+    const { parent, user } = normalizeCallContext(callCtx);
+    return this.trace("action", name, parent, async (ectx, meta) => {
+      const reg = this.actions.get(name);
+      if (!reg) throw new Error(`Action not found: ${name}`);
+      if (isTraceRecording(ectx)) meta.plugin = reg.plugin;
+      const ctx = this.buildActionContext(user, ectx);
+      return (await this.runMiddleware(
+        ctx,
+        { type: "action", name, args, access: reg.def.access },
+        () => reg.def.handler(ctx, args),
+        ectx,
+      )) as T;
+    });
+  }
+
   async subscribe(
     name: string,
     args: Record<string, any>,
@@ -1462,6 +1523,9 @@ export class Vex<A = unknown> {
   listMutations(): string[] {
     return [...this.mutations.keys()];
   }
+  listActions(): string[] {
+    return [...this.actions.keys()];
+  }
   listPlugins() {
     return this.plugins.map((p) => ({ name: p.name }));
   }
@@ -1521,6 +1585,10 @@ export class Vex<A = unknown> {
     const m = this.mutations.get(name);
     return m ? describeOperation<A>(m) : null;
   }
+  describeAction(name: string): OperationDescription<A> | null {
+    const a = this.actions.get(name);
+    return a ? describeOperation<A>(a) : null;
+  }
 
   async introspect() {
     const tables = await Promise.all(
@@ -1534,10 +1602,15 @@ export class Vex<A = unknown> {
       name,
       ...describeOperation<A>(m),
     }));
+    const actions = [...this.actions.entries()].map(([name, a]) => ({
+      name,
+      ...describeOperation<A>(a),
+    }));
     return {
       tables,
       queries,
       mutations,
+      actions,
       subscriptions: this.subscriptions.size,
     };
   }

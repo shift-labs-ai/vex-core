@@ -44,6 +44,8 @@ export type {
 } from "./core/tracer.js";
 export { createRootSpan, noopExecCtx } from "./core/tracer.js";
 export type {
+  ActionContext,
+  ActionDef,
   AggDef,
   CallContext,
   ColumnDef,

@@ -1,9 +1,10 @@
 /**
  * vexHandler — the vex engine adapted as a Router.
  *
- * Exposes three routes relative to wherever it's mounted:
+ * Exposes four routes relative to wherever it's mounted:
  *   POST /query      JSON body { name, args? } → { data } | { error }
  *   POST /mutate     JSON body { name, args? } → { data } | { error }
+ *   POST /action     JSON body { name, args? } → { data } | { error }
  *   ALL  /webhook/*  → vex.handleWebhook
  *
  * A call that throws an HttpError answers as it renders (its status,
@@ -13,7 +14,7 @@
  * Reactive reads (the "live state" surface) are handled by
  * `vexWebSocket` over a WebSocket at whatever path the host wires
  * up — typically `/subscribe`. One connection per client multiplexes
- * many subscriptions plus one-shot query/mutate calls; see
+ * many subscriptions plus one-shot query/mutate/action calls; see
  * `vex-websocket.ts` for the wire protocol.
  *
  * Why split HTTP and WS into two factories
@@ -49,8 +50,8 @@ export interface VexHandlerOptions {
    */
   getUser?: (ctx: RequestCtx) => VexUser | null | undefined;
   /**
-   * The most bytes a `/query` or `/mutate` body may carry; a larger
-   * one is refused 413 before it is buffered. Default 8 MiB.
+   * The most bytes a `/query`, `/mutate` or `/action` body may carry;
+   * a larger one is refused 413 before it is buffered. Default 8 MiB.
    */
   maxBodyBytes?: number;
   /** The most bytes a `/webhook/*` body may carry. Defaults to
@@ -61,7 +62,7 @@ export interface VexHandlerOptions {
   bodyTimeoutMs?: number;
 }
 
-/** The default ceiling on a `/query`, `/mutate` or webhook body. */
+/** The default ceiling on a `/query`, `/mutate`, `/action` or webhook body. */
 export const DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
 
 export function vexHandler(vex: Vex, opts: VexHandlerOptions = {}): Router {
@@ -95,6 +96,15 @@ export function vexHandler(vex: Vex, opts: VexHandlerOptions = {}): Router {
       rpcLimits,
     ),
   );
+  router.post(
+    "/action",
+    makeCallHandler(
+      "action",
+      (name, args, user) => vex.action(name, args, { user }),
+      getUser,
+      rpcLimits,
+    ),
+  );
   router.all("/webhook/*", makeWebhookHandler(vex, webhookLimits));
 
   return router;
@@ -108,9 +118,9 @@ type Call = (
   user: VexUser | null | undefined,
 ) => Promise<unknown>;
 
-/** `/query` or `/mutate`: a `{ name, args? }` body → `{ data }`. */
+/** `/query`, `/mutate` or `/action`: a `{ name, args? }` body → `{ data }`. */
 function makeCallHandler(
-  kind: "query" | "mutation",
+  kind: "query" | "mutation" | "action",
   call: Call,
   getUser: (ctx: RequestCtx) => VexUser | null | undefined,
   limits: ReadLimits,

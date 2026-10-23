@@ -26,11 +26,12 @@
  *     { type: "unsubscribe", id }                stop one
  *     { type: "query",       id, name, args? }   one-shot read
  *     { type: "mutate",      id, name, args? }   one-shot write
+ *     { type: "action",      id, name, args? }   one-shot action
  *
  *   Server → Client
  *     { type: "pong",   id }           keepalive answer
  *     { type: "data",   id, data }     subscribe initial + each update
- *     { type: "result", id, data }     query/mutate + auth completion
+ *     { type: "result", id, data }     query/mutate/action + auth completion
  *     { type: "error",  id, message,   per-id failure; a thrown
  *       status?, body? }               HttpError adds its status and
  *                                      body, as HTTP RPC answers them
@@ -46,8 +47,8 @@
  *
  * `id` is client-assigned and opaque to the server; the server only
  * uses it to route responses back to the right caller. Subscription
- * ids must be stable for the life of the subscription; query/mutate
- * ids are one-shot.
+ * ids must be stable for the life of the subscription; query, mutate
+ * and action ids are one-shot.
  *
  * Auth
  *   Two ways in, one resolution contract:
@@ -344,9 +345,8 @@ type ClientFrame =
       args?: Record<string, unknown>;
     }
   | { type: "unsubscribe"; id: string }
-  | { type: "query"; id: string; name: string; args?: Record<string, unknown> }
   | {
-      type: "mutate";
+      type: "query" | "mutate" | "action";
       id: string;
       name: string;
       args?: Record<string, unknown>;
@@ -377,6 +377,7 @@ function parseFrame(value: unknown): ClientFrame | null {
     case "subscribe":
     case "query":
     case "mutate":
+    case "action":
       if (typeof f.name !== "string") {
         console.warn(
           `[vex-ws] ${f.type} frame missing string \`name\`; ignored`,
@@ -422,9 +423,9 @@ async function dispatch(
     case "unsubscribe":
       return handleUnsubscribe(ws, frame);
     case "query":
-      return handleQuery(vex, ws, frame);
     case "mutate":
-      return handleMutate(vex, ws, frame);
+    case "action":
+      return handleCall(vex, ws, frame);
   }
 }
 
@@ -491,34 +492,26 @@ function handleUnsubscribe(ws: VexWebSocket, frame: { id: string }): void {
   }
 }
 
-async function handleQuery(
+/** A one-shot call, made as the connection's user; its answer or failure goes back by id. */
+async function handleCall(
   vex: Vex,
   ws: VexWebSocket,
-  frame: { id: string; name: string; args?: Record<string, unknown> },
+  frame: {
+    type: "query" | "mutate" | "action";
+    id: string;
+    name: string;
+    args?: Record<string, unknown>;
+  },
 ): Promise<void> {
+  const as = ws.data.user ? { user: ws.data.user } : undefined;
+  const args = frame.args ?? {};
   try {
-    const data = await vex.query(
-      frame.name,
-      frame.args ?? {},
-      ws.data.user ? { user: ws.data.user } : undefined,
-    );
-    sendResult(ws, frame.id, data);
-  } catch (err) {
-    sendFailure(ws, frame.id, err);
-  }
-}
-
-async function handleMutate(
-  vex: Vex,
-  ws: VexWebSocket,
-  frame: { id: string; name: string; args?: Record<string, unknown> },
-): Promise<void> {
-  try {
-    const data = await vex.mutate(
-      frame.name,
-      frame.args ?? {},
-      ws.data.user ? { user: ws.data.user } : undefined,
-    );
+    const data =
+      frame.type === "query"
+        ? await vex.query(frame.name, args, as)
+        : frame.type === "mutate"
+          ? await vex.mutate(frame.name, args, as)
+          : await vex.action(frame.name, args, as);
     sendResult(ws, frame.id, data);
   } catch (err) {
     sendFailure(ws, frame.id, err);
