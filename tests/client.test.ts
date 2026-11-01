@@ -1901,3 +1901,172 @@ describe("a refused call answers its status and body", () => {
     }
   });
 });
+
+describe("VexClient connection status", () => {
+  /** A live channel that can go down and come back on the same port. */
+  function flakyServer() {
+    const handlers = vexWebSocket(vex, {});
+    const sockets = new Set<any>();
+    let down = false;
+    const server = Bun.serve({
+      port: 0,
+      fetch(req, srv) {
+        if (down) return new Response("down", { status: 503 });
+        return handlers.upgrade(req, srv);
+      },
+      websocket: {
+        open: ((ws: any) => {
+          sockets.add(ws);
+          (handlers.open as any)(ws);
+        }) as any,
+        message: handlers.message as any,
+        close: ((ws: any, code: number, reason: string) => {
+          sockets.delete(ws);
+          (handlers.close as any)(ws, code, reason);
+        }) as any,
+      },
+    });
+    return {
+      url: `http://localhost:${server.port}`,
+      goDown() {
+        down = true;
+        for (const ws of sockets) ws.close(1012, "restarting");
+      },
+      comeBack() {
+        down = false;
+      },
+      stop() {
+        server.stop(true);
+      },
+    };
+  }
+
+  async function until(check: () => boolean, ms = 3_000) {
+    const deadline = Date.now() + ms;
+    while (!check() && Date.now() < deadline) await Bun.sleep(10);
+    expect(check()).toBe(true);
+  }
+
+  test("idle until asked, then connecting, then open — and every change is heard", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const flaky = flakyServer();
+    const client = new VexClient({ basePath: flaky.url });
+    const heard: string[] = [];
+    const off = client.onConnectionChange((status) => heard.push(status.state));
+    try {
+      expect(client.connection()).toEqual({ state: "idle" });
+      const first = new Promise((resolve) =>
+        client.subscribe("items.list", {}, resolve),
+      );
+      expect(client.connection().state).toBe("connecting");
+      await first;
+      expect(client.connection()).toEqual({ state: "open" });
+      expect(heard).toEqual(["connecting", "open"]);
+    } finally {
+      off();
+      client.close();
+      flaky.stop();
+    }
+  });
+
+  test("a lost connection is reconnecting — since when, which attempt, and when the next one is — until it opens again", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const flaky = flakyServer();
+    const client = new VexClient({
+      basePath: flaky.url,
+      minReconnectDelayMs: 20,
+      maxReconnectDelayMs: 40,
+      heartbeatIntervalMs: 0,
+    });
+    try {
+      await new Promise((resolve) =>
+        client.subscribe("items.list", {}, resolve),
+      );
+      const before = Date.now();
+      flaky.goDown();
+      await until(() => client.connection().state === "reconnecting");
+      const lost = client.connection();
+      if (lost.state !== "reconnecting") throw new Error("not reconnecting");
+      expect(lost.since).toBeGreaterThanOrEqual(before);
+      expect(lost.attempt).toBeGreaterThanOrEqual(1);
+      // Still down after several tries: the loss is dated once, not per try.
+      await until(
+        () =>
+          client.connection().state === "reconnecting" &&
+          (client.connection() as { attempt: number }).attempt >= 3,
+      );
+      expect((client.connection() as { since: number }).since).toBe(lost.since);
+
+      flaky.comeBack();
+      await until(() => client.connection().state === "open");
+    } finally {
+      client.close();
+      flaky.stop();
+    }
+  });
+
+  test("a server down from the start is reconnecting, not connecting forever", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const flaky = flakyServer();
+    flaky.goDown();
+    const client = new VexClient({
+      basePath: flaky.url,
+      minReconnectDelayMs: 20,
+      maxReconnectDelayMs: 40,
+    });
+    try {
+      client.subscribe("items.list", {}, () => {});
+      await until(() => client.connection().state === "reconnecting");
+      flaky.comeBack();
+      await until(() => client.connection().state === "open");
+    } finally {
+      client.close();
+      flaky.stop();
+    }
+  });
+
+  test("reconnectNow tries at once instead of waiting out the backoff", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const flaky = flakyServer();
+    const client = new VexClient({
+      basePath: flaky.url,
+      minReconnectDelayMs: 60_000,
+      maxReconnectDelayMs: 60_000,
+      heartbeatIntervalMs: 0,
+    });
+    try {
+      await new Promise((resolve) =>
+        client.subscribe("items.list", {}, resolve),
+      );
+      flaky.goDown();
+      await until(() => client.connection().state === "reconnecting");
+      const waiting = client.connection() as { nextAttemptAt: number | null };
+      expect(waiting.nextAttemptAt).toBeGreaterThan(Date.now() + 30_000);
+      flaky.comeBack();
+      client.reconnectNow();
+      await until(() => client.connection().state === "open", 1_000);
+    } finally {
+      client.close();
+      flaky.stop();
+    }
+  });
+
+  test("close() is idle, and a listener removed hears nothing more", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const flaky = flakyServer();
+    const client = new VexClient({ basePath: flaky.url });
+    const heard: string[] = [];
+    const off = client.onConnectionChange((status) => heard.push(status.state));
+    try {
+      await new Promise((resolve) =>
+        client.subscribe("items.list", {}, resolve),
+      );
+      off();
+      client.close();
+      expect(client.connection()).toEqual({ state: "idle" });
+      expect(heard).toEqual(["connecting", "open"]);
+    } finally {
+      flaky.stop();
+    }
+  });
+});
