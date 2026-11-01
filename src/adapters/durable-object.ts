@@ -18,6 +18,13 @@
  *
  * The SQL API refuses `BEGIN`, `SAVEPOINT`, TEMP tables and most
  * PRAGMAs; `rawQuery`/`rawExec` surface those refusals as errors.
+ *
+ * Planner statistics (`GATHER_STATISTICS`) are due as the adapter
+ * opens, which is each time the object wakes, and after every schema
+ * change. The next operation on rows outside a transaction gathers
+ * them: once per wake, after its migrations, and once per run of
+ * changes. The object has one connection, so the statement that
+ * follows plans by them.
  */
 
 import {
@@ -33,6 +40,7 @@ import {
   deleteRow,
   type ExplainRow,
   ensureSqliteTable,
+  GATHER_STATISTICS,
   insertRow,
   runCounted,
   SqliteAdapterState,
@@ -115,6 +123,13 @@ export function durableObjectAdapter(
     }),
   };
 
+  // Open transactions, outermost first; inner ones are savepoints. The
+  // outermost one's writes wait in the adapter state until it commits.
+  let transactionDepth = 0;
+  // Planner statistics to gather before the next operation on rows: at
+  // open, and after a schema change.
+  let statisticsDue = true;
+
   // Raw SQL. A single row write is counted by its cursor; text that may
   // hold several statements, whose cursor counts only the last one's
   // rows, by the connection's total changes.
@@ -132,28 +147,15 @@ export function durableObjectAdapter(
     try {
       return run(query, params) as T[];
     } finally {
-      if (mayChangeSchema(query)) state.schemaChanged();
+      if (mayChangeSchema(query)) {
+        state.schemaChanged();
+        statisticsDue = true;
+      }
       if (value("SELECT total_changes()") > before) {
         state.markChanged(state.written(introspection, query).tables, false);
       }
     }
   }
-
-  // Open transactions, outermost first; inner ones are savepoints. The
-  // outermost one's writes wait in the adapter state until it commits.
-  let transactionDepth = 0;
-
-  const exec: DbExec = {
-    schemas: state.schemas,
-    async all(query, params) {
-      open();
-      return driver.prepare(query).all(...params);
-    },
-    async run(query, params) {
-      open();
-      return { changes: runCounted(driver, query, params) };
-    },
-  };
 
   let closed = false;
   // The object's storage outlives the adapter; closing only stops this
@@ -161,6 +163,27 @@ export function durableObjectAdapter(
   function open(): void {
     if (closed) throw new Error("Durable Object adapter is closed");
   }
+  // Before an operation on rows: statistics that are due are gathered,
+  // outside a transaction, where a rollback would undo them.
+  function ready(): void {
+    open();
+    if (statisticsDue && transactionDepth === 0) {
+      statisticsDue = false;
+      run(GATHER_STATISTICS, []);
+    }
+  }
+
+  const exec: DbExec = {
+    schemas: state.schemas,
+    async all(query, params) {
+      ready();
+      return driver.prepare(query).all(...params);
+    },
+    async run(query, params) {
+      ready();
+      return { changes: runCounted(driver, query, params) };
+    },
+  };
 
   return {
     name: "durable-object",
@@ -172,25 +195,26 @@ export function durableObjectAdapter(
         schema,
         ensureSqliteTable(migrationDriver, name, schema),
       );
+      statisticsDue = true;
     },
 
     async insert(table, row) {
-      open();
+      ready();
       return insertRow(driver, table, row);
     },
 
     async upsert(table, keys, data) {
-      open();
+      ready();
       upsertRow(driver, table, keys, data);
     },
 
     async update(table, id, data) {
-      open();
+      ready();
       updateRow(driver, table, id, data);
     },
 
     async delete(table, id) {
-      open();
+      ready();
       return deleteRow(driver, table, id) > 0;
     },
 
@@ -199,7 +223,7 @@ export function durableObjectAdapter(
     },
 
     async transaction<T>(fn: () => Promise<T> | T): Promise<T> {
-      open();
+      ready();
       return storage.transaction(async () => {
         // Snapshot and restore inside the transaction: it may wait for
         // another one to commit first, and the next may start as soon
@@ -223,18 +247,18 @@ export function durableObjectAdapter(
       query: string,
       ...params: any[]
     ): Promise<T[]> {
-      open();
+      ready();
       if (statementKind(query) === "read") return run(query, params) as T[];
       return rawWrite<T>(query, params);
     },
 
     async rawExec(query: string, ...params: any[]): Promise<void> {
-      open();
+      ready();
       rawWrite(query, params);
     },
 
     async bulkInsert(table, rows) {
-      open();
+      ready();
       bulkInsertRows(driver, table, rows);
     },
 

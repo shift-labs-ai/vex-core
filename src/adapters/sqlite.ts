@@ -14,6 +14,7 @@ import {
   deleteRow,
   type ExplainRow,
   ensureSqliteTable,
+  GATHER_STATISTICS,
   insertRow,
   runCounted,
   SqliteAdapterState,
@@ -69,6 +70,12 @@ interface SqliteConnection {
 interface ReadConnection extends SqliteConnection {
   db: Database;
   busy: boolean;
+  /**
+   * Planner statistics changed since it opened. A connection reads
+   * `sqlite_stat1` once, when it opens, so it is reopened before its
+   * next use.
+   */
+  stale: boolean;
 }
 
 interface Waiter<T> {
@@ -78,6 +85,8 @@ interface Waiter<T> {
 
 const SQLITE_READ_POOL_SIZE = 4;
 const SQLITE_STATEMENT_CACHE_SIZE = 64;
+/** How often planner statistics are refreshed while the adapter is open. */
+const SQLITE_STATISTICS_INTERVAL_MS = 60 * 60 * 1000;
 
 function wrapSync(
   writer: SqliteDriver,
@@ -107,10 +116,33 @@ function wrapSync(
 export interface SqliteOptions {
   busyTimeout?: number;
   cacheSize?: number;
+  /**
+   * How often planner statistics are refreshed, in ms; an hour unless
+   * set. They are also gathered at open and after every schema change.
+   */
+  statisticsIntervalMs?: number;
 }
 
 function isMemoryDatabase(path: string): boolean {
   return path === ":memory:" || path === "" || path.startsWith("file::memory:");
+}
+
+/** One read-only connection to `path`, with the adapter's pragmas. */
+function openReadDatabase(
+  path: string,
+  opts: SqliteOptions | undefined,
+): Database {
+  const readDb = new Database(path, { readonly: true });
+  try {
+    readDb.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
+    if (opts?.cacheSize) {
+      readDb.exec(`PRAGMA cache_size = ${opts.cacheSize}`);
+    }
+  } catch (error) {
+    readDb.close();
+    throw error;
+  }
+  return readDb;
 }
 
 function openReadConnections(
@@ -122,20 +154,12 @@ function openReadConnections(
   const connections: ReadConnection[] = [];
   try {
     for (let i = 0; i < SQLITE_READ_POOL_SIZE; i++) {
-      const readDb = new Database(path, { readonly: true });
-      try {
-        readDb.exec(`PRAGMA busy_timeout = ${opts?.busyTimeout ?? 5000}`);
-        if (opts?.cacheSize) {
-          readDb.exec(`PRAGMA cache_size = ${opts.cacheSize}`);
-        }
-      } catch (error) {
-        readDb.close();
-        throw error;
-      }
+      const readDb = openReadDatabase(path, opts);
       connections.push({
         db: readDb,
         statements: new StatementCache(readDb, SQLITE_STATEMENT_CACHE_SIZE),
         busy: false,
+        stale: false,
       });
     }
     return connections;
@@ -143,6 +167,30 @@ function openReadConnections(
     for (const connection of connections) connection.db.close();
     throw error;
   }
+}
+
+/**
+ * The planner statistics `db` holds: `sqlite_stat1`, which `ANALYZE`
+ * creates, or nothing before the first.
+ */
+function plannerStatistics(db: Database): string {
+  const analyzed = db
+    .query("SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1'")
+    .get();
+  if (!analyzed) return "";
+  return JSON.stringify(
+    db.query("SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY tbl, idx").all(),
+  );
+}
+
+/**
+ * Gather the planner statistics `db` lacks or has let go stale
+ * (`GATHER_STATISTICS`); answers whether they changed.
+ */
+function gatherStatistics(db: Database): boolean {
+  const before = plannerStatistics(db);
+  db.exec(GATHER_STATISTICS);
+  return plannerStatistics(db) !== before;
 }
 
 function isReadonlyError(error: unknown): boolean {
@@ -179,6 +227,9 @@ export function sqliteAdapter(
     // open it. Without this read, Bun can return SQLITE_CANTOPEN until the
     // writer executes its first schema-aware statement.
     db.exec("PRAGMA schema_version");
+    // Before the read pool opens, so each of its connections starts
+    // with them.
+    gatherStatistics(db);
     readConnections = openReadConnections(path, opts);
   } catch (error) {
     db.close();
@@ -239,6 +290,21 @@ export function sqliteAdapter(
     for (const waiter of readWaiters.splice(0)) waiter.reject(error);
   }
 
+  // A connection reads planner statistics only as it opens: one opened
+  // before they changed is reopened before its next use.
+  function current(connection: ReadConnection): ReadConnection {
+    if (!connection.stale) return connection;
+    connection.statements.clear();
+    connection.db.close();
+    connection.db = openReadDatabase(path, opts);
+    connection.statements = new StatementCache(
+      connection.db,
+      SQLITE_STATEMENT_CACHE_SIZE,
+    );
+    connection.stale = false;
+    return connection;
+  }
+
   function acquireReadConnection(): ReadConnection | Promise<ReadConnection> {
     if (closed) throw closedError();
     for (let offset = 0; offset < readConnections.length; offset++) {
@@ -264,6 +330,58 @@ export function sqliteAdapter(
     if (next) next.resolve(connection);
     else connection.busy = false;
   }
+
+  // A read on the pool: on a connection reopened first when stale, and
+  // released after, however the read or the reopen ends. A connection
+  // that cannot reopen stays stale and tries again on its next read.
+  async function onReadConnection<T>(
+    fn: (connection: ReadConnection) => T,
+  ): Promise<T> {
+    const connection = await acquireReadConnection();
+    try {
+      if (closed) throw closedError();
+      return fn(current(connection));
+    } finally {
+      releaseReadConnection(connection);
+    }
+  }
+
+  // Planner statistics, kept current: gathered at open (above), after
+  // each schema change, and every `statisticsIntervalMs`. A change
+  // reopens the read pool's connections. Each run takes the write lock
+  // outside any caller's transaction, so its ANALYZE commits alone.
+  let statisticsDue: ReturnType<typeof setTimeout> | undefined;
+  async function refreshStatistics(): Promise<void> {
+    try {
+      const changed = await withConnectionLock(() => gatherStatistics(db));
+      if (changed) {
+        for (const connection of readConnections) connection.stale = true;
+      }
+    } catch (error) {
+      if (!closed) {
+        console.error("[vex] gathering SQLite statistics failed:", error);
+      }
+    }
+  }
+  // Once the schema changes in this turn are done: a migration run
+  // registers its tables one after another.
+  function statisticsAfterSchemaChange(): void {
+    if (statisticsDue || closed) return;
+    statisticsDue = transactionContext.exit(() =>
+      setTimeout(() => {
+        statisticsDue = undefined;
+        void refreshStatistics();
+      }, 0),
+    );
+  }
+  const statisticsTimer = transactionContext.exit(() =>
+    setInterval(
+      () => void refreshStatistics(),
+      opts?.statisticsIntervalMs ?? SQLITE_STATISTICS_INTERVAL_MS,
+    ),
+  );
+  // A timer of the adapter's own never keeps a process alive.
+  statisticsTimer.unref?.();
 
   async function withConnectionLock<T>(fn: () => Promise<T> | T): Promise<T> {
     if (closed) throw closedError();
@@ -303,14 +421,7 @@ export function sqliteAdapter(
   ): Promise<T> {
     if (closed) throw closedError();
     if (readsUseWriter()) return withConnectionLock(() => fn(writer));
-
-    const connection = await acquireReadConnection();
-    try {
-      if (closed) throw closedError();
-      return fn(connection);
-    } finally {
-      releaseReadConnection(connection);
-    }
+    return onReadConnection(fn);
   }
 
   // Shows a statement's compiled program on `connection` without running
@@ -449,6 +560,7 @@ export function sqliteAdapter(
       if (mayChangeSchema(sql)) {
         clearStatementCaches();
         state.schemaChanged();
+        statisticsAfterSchemaChange();
       }
       if (totalChanges() > before) {
         state.markChanged(
@@ -475,13 +587,9 @@ export function sqliteAdapter(
     if (readsUseWriter()) {
       return withConnectionLock(() => analyze(writerIntrospection));
     }
-    const connection = await acquireReadConnection();
-    try {
-      if (closed) throw closedError();
-      return analyze(introspection(connection.db));
-    } finally {
-      releaseReadConnection(connection);
-    }
+    return onReadConnection((connection) =>
+      analyze(introspection(connection.db)),
+    );
   }
 
   return {
@@ -497,6 +605,7 @@ export function sqliteAdapter(
       } finally {
         // Bun caches each statement's column list at prepare time.
         clearStatementCaches();
+        statisticsAfterSchemaChange();
       }
     },
 
@@ -648,6 +757,8 @@ export function sqliteAdapter(
     close() {
       if (closed) return;
       closed = true;
+      clearInterval(statisticsTimer);
+      clearTimeout(statisticsDue);
       rejectQueuedWork();
       writer.statements.clear();
       for (const counter of Object.values(counters)) counter.finalize();

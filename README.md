@@ -109,6 +109,15 @@ Not supported on Workers:
 - `serveDir`, `serveFile`, `scanDirectory` and `config`: they read the local filesystem, which a Worker does not have. Use Workers static assets and bindings instead.
 - D1: it has no interactive transactions, so a mutation's writes could not roll back together.
 
+## Planner statistics
+
+SQLite chooses between indexes by how selective each one is, using statistics it never gathers by itself (`sqlite_stat1`). Without them it can pick an index that reads thousands of rows where another reads one. Both adapters gather them with `PRAGMA optimize=0x10002`, which analyzes the tables never analyzed and those whose row count has moved tenfold since:
+
+- `sqliteAdapter` gathers them when it opens, after schema changes, and every hour (`statisticsIntervalMs`). A connection reads them only as it opens, so when they change the read pool's connections are reopened before their next read.
+- `durableObjectAdapter` gathers them once per wake, after the migrations, and again after a schema change. The next operation on rows outside a transaction runs them, so a change made inside a transaction is analyzed after it commits, and a wake's run of `ensureTable` calls is analyzed once.
+
+A run with nothing to do reads only row counts, and SQLite limits how many rows a run samples: the first run on a 1.5 GB table takes about 0.3 s.
+
 ## Renaming tables and columns
 
 `registerTable` creates and migrates tables on startup: it adds new columns, rebuilds changed ones and reconciles indexes, but never drops anything. A renamed table or column therefore starts out empty unless its previous names are listed in `renamedFrom`:
