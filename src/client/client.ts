@@ -13,16 +13,27 @@
  * Lifecycle
  *   - Lazy connect: the WS opens on the first call. Until it's open,
  *     outgoing frames buffer in `pendingSends` and flush on `open`.
- *   - Reconnect with backoff: on unexpected close (anything other
- *     than a clean `client.close()`), schedule a retry with
+ *   - Reconnect with backoff: any close but `client.close()` is a
+ *     loss. While subscriptions or calls are waiting, retry with
  *     exponential backoff (100ms → 5s, ±25% jitter). Active
  *     subscriptions re-send their `subscribe` frames after the
  *     new connection opens, so the consumer doesn't have to know
  *     a reconnect happened — they just see a fresh `data` frame.
- *   - In-flight one-shots (query/mutate/action) waiting for a `result`
- *     when the socket dies are rejected with `connection lost`.
- *     The caller can retry; we don't auto-retry because mutations
- *     and actions aren't necessarily idempotent.
+ *   - One socket at a time: only the socket in `this.socket` acts.
+ *     Events from one the client has let go of are ignored, and a
+ *     call made while a reconnect waits out its backoff leaves the
+ *     next try to that reconnect.
+ *   - Connection status: `connection()` says where the socket stands
+ *     and `onConnectionChange` reports each change, so an app can say
+ *     once that it is reconnecting rather than each view guessing.
+ *     Listeners hear it on a microtask, never inside a transition, so
+ *     what a listener does cannot interleave with one.
+ *     `reconnectNow()` skips the backoff wait.
+ *   - One-shots (query/mutate/action) waiting for a `result` when the
+ *     socket dies are rejected with `connection lost`, and their
+ *     frames are dropped if they were never sent. The caller can
+ *     retry; we don't auto-retry because mutations and actions
+ *     aren't necessarily idempotent.
  */
 
 /**
@@ -58,6 +69,36 @@ interface ActiveSubscription {
    */
   onError?: (err: Error) => void;
 }
+
+/**
+ * Where the client's connection stands.
+ *
+ *   idle          nothing waits on a connection (or close() ran)
+ *   connecting    the first connection is opening
+ *   open          connected
+ *   reconnecting  the connection was lost, or never opened: retrying
+ *                 with backoff. `since` is when it was lost, or when
+ *                 the first try failed, and stays put across
+ *                 attempts; `attempt` counts the tries; `nextAttemptAt`
+ *                 is when the next try starts, or null while one is
+ *                 under way.
+ */
+export type VexConnectionStatus =
+  | { readonly state: "idle" }
+  | { readonly state: "connecting" }
+  | { readonly state: "open" }
+  | {
+      readonly state: "reconnecting";
+      readonly since: number;
+      readonly attempt: number;
+      readonly nextAttemptAt: number | null;
+    };
+
+const IDLE_STATUS: VexConnectionStatus = Object.freeze({ state: "idle" });
+const CONNECTING_STATUS: VexConnectionStatus = Object.freeze({
+  state: "connecting",
+});
+const OPEN_STATUS: VexConnectionStatus = Object.freeze({ state: "open" });
 
 export interface VexClientOptions {
   /**
@@ -111,11 +152,19 @@ export class VexClient {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** The socket opening or open; null between tries and when idle. */
   private socket: WebSocket | null = null;
-  private state: "idle" | "connecting" | "open" | "closed" = "idle";
   private nextId = 0;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private status: VexConnectionStatus = IDLE_STATUS;
+  /** The status listeners last heard, and whether a delivery is queued. */
+  private statusHeard: VexConnectionStatus = IDLE_STATUS;
+  private statusQueued = false;
+  private readonly statusListeners = new Set<
+    (status: VexConnectionStatus) => void
+  >();
 
   private readonly subscriptions = new Map<string, ActiveSubscription>();
   private readonly pendingResults = new Map<string, PendingResult>();
@@ -157,7 +206,7 @@ export class VexClient {
     // open path would deliver each subscribe twice and the server
     // would reject the duplicate id. So: send immediately if the
     // socket is open, otherwise let `open` handle it.
-    if (this.state === "open" && this.socket) {
+    if (this.status.state === "open") {
       this.rawSend({ type: "subscribe", id, name, args });
     } else {
       this.ensureConnected();
@@ -189,6 +238,37 @@ export class VexClient {
     return this.callOneShot<T>("action", name, args);
   }
 
+  /** Where the connection stands right now. */
+  connection(): VexConnectionStatus {
+    return this.status;
+  }
+
+  /**
+   * Hear every change of `connection()`, on a microtask after it
+   * happens; changes within one turn arrive as the latest. A listener
+   * that throws is logged and the others still hear. Returns the way
+   * to stop listening.
+   */
+  onConnectionChange(
+    listener: (status: VexConnectionStatus) => void,
+  ): () => void {
+    this.statusListeners.add(listener);
+    return () => {
+      this.statusListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Try to reconnect now rather than at the end of the backoff wait.
+   * Does nothing unless a reconnect is waiting.
+   */
+  reconnectNow(): void {
+    if (!this.reconnectTimer) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.attemptReconnect();
+  }
+
   /**
    * Tear down the connection and reject all pending requests. Active
    * subscriptions are dropped silently — their callbacks just stop
@@ -196,27 +276,23 @@ export class VexClient {
    * etc. on it again will reconnect.
    */
   close(): void {
-    this.state = "closed";
     this.stopHeartbeat();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    for (const pending of this.pendingResults.values()) {
-      pending.reject(new Error("VexClient closed"));
-    }
-    this.pendingResults.clear();
+    this.rejectPending(new Error("VexClient closed"));
     this.subscriptions.clear();
-    this.pendingSends.length = 0;
-    if (this.socket) {
-      try {
-        this.socket.close(1000, "client closed");
-      } catch {
-        /* already gone */
-      }
-      this.socket = null;
+    // Let go of the socket before closing it: its close event then
+    // finds it is no longer current and does nothing.
+    const socket = this.socket;
+    this.socket = null;
+    try {
+      socket?.close(1000, "client closed");
+    } catch {
+      /* already gone */
     }
-    this.state = "idle";
+    this.goIdle();
   }
 
   // ─── Internals ──────────────────────────────────────────────────
@@ -248,15 +324,58 @@ export class VexClient {
     // Best-effort: if the socket is open, tell the server. If it's
     // not, the server will drop the subscription on disconnect anyway,
     // so we don't need to queue an unsubscribe frame for later.
-    if (this.state === "open") {
+    if (this.status.state === "open") {
       this.send({ type: "unsubscribe", id });
     }
   }
 
   private ensureConnected(): void {
-    if (this.state === "open" || this.state === "connecting") return;
-    this.state = "connecting";
+    // A socket opening or open serves the call; a reconnect waiting
+    // out its backoff owns the next try.
+    if (this.socket || this.reconnectTimer) return;
+    this.setStatus(CONNECTING_STATUS);
     this.openSocket();
+  }
+
+  /** Whether anything still waits on a connection. */
+  private hasWork(): boolean {
+    return (
+      this.subscriptions.size > 0 ||
+      this.pendingResults.size > 0 ||
+      this.pendingSends.length > 0
+    );
+  }
+
+  /** Reject every waiting one-shot, and drop the frames never sent. */
+  private rejectPending(err: Error): void {
+    for (const pending of this.pendingResults.values()) pending.reject(err);
+    this.pendingResults.clear();
+    this.pendingSends.length = 0;
+  }
+
+  private goIdle(): void {
+    this.reconnectAttempt = 0;
+    this.setStatus(IDLE_STATUS);
+  }
+
+  private setStatus(next: VexConnectionStatus): void {
+    if (next === this.status) return;
+    this.status = next;
+    if (this.statusQueued) return;
+    this.statusQueued = true;
+    queueMicrotask(() => {
+      this.statusQueued = false;
+      const status = this.status;
+      if (status === this.statusHeard) return;
+      this.statusHeard = status;
+      for (const listener of [...this.statusListeners]) {
+        try {
+          listener(status);
+        } catch (err) {
+          console.error("[vex-client] connection listener threw:", err);
+        }
+      }
+    });
   }
 
   private openSocket(): void {
@@ -273,8 +392,9 @@ export class VexClient {
     this.socket = socket;
 
     socket.addEventListener("open", () => {
-      this.state = "open";
+      if (this.socket !== socket) return;
       this.reconnectAttempt = 0;
+      this.setStatus(OPEN_STATUS);
 
       // Auth rides the first frame - before subscription replay and
       // the buffered-send flush, so the server never sees a guarded
@@ -310,27 +430,23 @@ export class VexClient {
     });
 
     socket.addEventListener("message", (ev) => {
+      if (this.socket !== socket) return;
       this.handleFrame(ev.data);
     });
 
-    socket.addEventListener("close", (ev) => {
-      this.stopHeartbeat();
+    socket.addEventListener("close", () => {
+      // close() lets go of its socket first, so a current socket
+      // closing is a loss, whatever its code: a server restarting or
+      // a proxy may close cleanly too.
+      if (this.socket !== socket) return;
       this.socket = null;
+      this.stopHeartbeat();
       // Any caller still waiting on a one-shot loses its transport.
       // We don't auto-retry — mutations aren't always idempotent
       // and the caller is in a better position to decide.
-      for (const pending of this.pendingResults.values()) {
-        pending.reject(new Error("connection lost"));
-      }
-      this.pendingResults.clear();
-
-      if (this.state === "closed") return;
-      // Code 1000 is a clean close from either side; if WE didn't
-      // initiate it the server probably restarted, so reconnect.
-      this.state = "idle";
-      if (ev.code !== 1000) {
-        this.scheduleReconnect();
-      }
+      this.rejectPending(new Error("connection lost"));
+      if (this.hasWork()) this.scheduleReconnect();
+      else this.goIdle();
     });
 
     socket.addEventListener("error", () => {
@@ -354,14 +470,15 @@ export class VexClient {
     this.stopHeartbeat();
     if (this.heartbeatIntervalMs <= 0) return;
     this.heartbeatTimer = setInterval(() => {
-      if (this.state !== "open" || this.socket !== socket) return;
+      if (this.socket !== socket) return;
       this.rawSend({ type: "ping", id: this.allocId("hb") });
       if (this.pongTimer) return;
       this.pongTimer = setTimeout(() => {
         this.pongTimer = null;
         console.warn("[vex-client] heartbeat pong missed; reconnecting");
-        // 4000 (app-defined, not 1000): the close handler treats it
-        // as an unexpected close and schedules the reconnect.
+        // The close handler takes any close of the current socket as
+        // a loss and schedules the reconnect; 4000 (app-defined) tells
+        // the server why.
         try {
           socket.close(4000, "heartbeat timeout");
         } catch {
@@ -383,7 +500,6 @@ export class VexClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.state === "closed") return;
     if (this.reconnectTimer) return;
     const base = Math.min(
       this.maxDelay,
@@ -393,20 +509,28 @@ export class VexClient {
     this.reconnectAttempt += 1;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      // Only reconnect if there's still something to reconnect for.
-      // A bare client with no subs and no pending one-shots can stay
-      // dormant; new calls will trigger ensureConnected() again.
-      if (
-        this.subscriptions.size === 0 &&
-        this.pendingResults.size === 0 &&
-        this.pendingSends.length === 0
-      ) {
-        this.state = "idle";
-        return;
-      }
-      this.state = "connecting";
-      this.openSocket();
+      this.attemptReconnect();
     }, jitter);
+    this.setStatus({
+      state: "reconnecting",
+      since:
+        this.status.state === "reconnecting" ? this.status.since : Date.now(),
+      attempt: this.reconnectAttempt,
+      nextAttemptAt: Date.now() + jitter,
+    });
+  }
+
+  private attemptReconnect(): void {
+    // A client nothing waits on stays dormant; the next call
+    // connects it again.
+    if (!this.hasWork()) {
+      this.goIdle();
+      return;
+    }
+    if (this.status.state === "reconnecting") {
+      this.setStatus({ ...this.status, nextAttemptAt: null });
+    }
+    this.openSocket();
   }
 
   private handleFrame(raw: string | ArrayBuffer | Blob): void {
@@ -445,18 +569,17 @@ export class VexClient {
     } else if (frame.type === "error") {
       // A rejected auth frame is terminal: the server closes the
       // socket right after, and reconnecting with the same dead
-      // credential would just loop. Notify every active subscription
-      // (close() drops them silently), then tear down; the app's
-      // auth layer owns recovery (re-login, re-pair).
+      // credential would just loop. Tear down, then tell every
+      // subscription close() dropped; the app's auth layer owns
+      // recovery (re-login, re-pair).
       if (frame.id === this.authId) {
         const err = new Error(
           `authentication rejected: ${frame.message ?? "Unauthorized"}`,
         );
         console.error(`[vex-client] ${err.message}`);
-        for (const sub of this.subscriptions.values()) {
-          sub.onError?.(err);
-        }
+        const dropped = [...this.subscriptions.values()];
         this.close();
+        for (const sub of dropped) sub.onError?.(err);
         return;
       }
       // Errors target either a one-shot or a subscription. The id
@@ -498,7 +621,7 @@ export class VexClient {
 
   private send(frame: Record<string, unknown>): void {
     const text = JSON.stringify(frame);
-    if (this.state === "open" && this.socket) {
+    if (this.socket && this.status.state === "open") {
       this.socket.send(text);
       return;
     }
