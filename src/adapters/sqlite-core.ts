@@ -58,6 +58,19 @@ interface ExistingColumn {
 
 const SQLITE_INDEX_METADATA_TABLE = "__vex_sqlite_indexes";
 
+/**
+ * Gathers the planner statistics a database lacks or has let go stale:
+ * what lets SQLite choose between indexes by how selective each is
+ * (`sqlite_stat1`), and which it never gathers by itself. Without
+ * them, it can take an index that reads thousands of rows where
+ * another reads one. Checks every table (`0x10000`), not only those
+ * the connection running it read; `0x02` analyzes the tables never
+ * analyzed. A table whose row count has not moved tenfold since it was
+ * is left alone, so a run with nothing to do reads only row counts,
+ * and SQLite bounds the rows a run samples.
+ */
+export const GATHER_STATISTICS = "PRAGMA optimize=0x10002";
+
 function toSqlType(type: TableSchema["columns"][string]["type"]): string {
   switch (type) {
     case "number":
