@@ -1,5 +1,6 @@
 import type {
   AggDef,
+  Condition,
   Filter,
   GroupByBuilder,
   QueryBuilder,
@@ -64,40 +65,55 @@ export function deserializeRow(
   return row;
 }
 
-export function buildWhereClause(filters: Filter[]): {
+/**
+ * One condition's SQL, its parameters appended to `params`: a filter,
+ * or an OR of AND groups (no group matches nothing, an empty group
+ * every row).
+ */
+function conditionSql(condition: Condition, params: any[]): string {
+  if (!("any" in condition)) return filterSql(condition, params);
+  if (condition.any.length === 0) return "0 = 1";
+  const groups = condition.any.map((group) =>
+    group.length === 0
+      ? "1 = 1"
+      : `(${group.map((f) => filterSql(f, params)).join(" AND ")})`,
+  );
+  return `(${groups.join(" OR ")})`;
+}
+
+export function buildWhereClause(filters: readonly Condition[]): {
   sql: string;
   params: any[];
 } {
   if (filters.length === 0) return { sql: "", params: [] };
-  const parts: string[] = [];
   const params: any[] = [];
-  for (const f of filters) {
-    const value = serializeValue(f.value);
-    if (f.operator === "IN") {
-      const arr = Array.isArray(f.value) ? f.value : [f.value];
-      const values = arr.map(serializeValue);
-      const nonNullValues = values.filter((item) => item !== null);
-      const clauses: string[] = [];
-      if (nonNullValues.length > 0) {
-        clauses.push(
-          `${quoteIdent(f.column)} IN (${nonNullValues.map(() => "?").join(", ")})`,
-        );
-        params.push(...nonNullValues);
-      }
-      if (values.some((item) => item === null)) {
-        clauses.push(`${quoteIdent(f.column)} IS NULL`);
-      }
-      parts.push(clauses.length > 0 ? `(${clauses.join(" OR ")})` : "0 = 1");
-    } else if (value === null && f.operator === "=") {
-      parts.push(`${quoteIdent(f.column)} IS NULL`);
-    } else if (value === null && f.operator === "!=") {
-      parts.push(`${quoteIdent(f.column)} IS NOT NULL`);
-    } else {
-      parts.push(`${quoteIdent(f.column)} ${f.operator} ?`);
-      params.push(value);
-    }
-  }
+  const parts = filters.map((condition) => conditionSql(condition, params));
   return { sql: `WHERE ${parts.join(" AND ")}`, params };
+}
+
+/** One filter's SQL, its parameters appended to `params`. */
+function filterSql(f: Filter, params: any[]): string {
+  const column = quoteIdent(f.column);
+  if (f.operator === "IN") {
+    const values = (Array.isArray(f.value) ? f.value : [f.value]).map(
+      serializeValue,
+    );
+    const nonNull = values.filter((item) => item !== null);
+    const clauses: string[] = [];
+    if (nonNull.length > 0) {
+      clauses.push(`${column} IN (${nonNull.map(() => "?").join(", ")})`);
+      params.push(...nonNull);
+    }
+    if (values.some((item) => item === null)) {
+      clauses.push(`${column} IS NULL`);
+    }
+    return clauses.length > 0 ? `(${clauses.join(" OR ")})` : "0 = 1";
+  }
+  const value = serializeValue(f.value);
+  if (value === null && f.operator === "=") return `${column} IS NULL`;
+  if (value === null && f.operator === "!=") return `${column} IS NOT NULL`;
+  params.push(value);
+  return `${column} ${f.operator} ?`;
 }
 
 export interface DbExec {
@@ -108,7 +124,7 @@ export interface DbExec {
 }
 
 export function createQueryBuilder(exec: DbExec, table: string): QueryBuilder {
-  const filters: Filter[] = [];
+  const filters: Condition[] = [];
   let selectCols: string[] | null = null;
   let orderCol: string | null = null;
   let orderDir: "asc" | "desc" = "asc";
@@ -137,8 +153,13 @@ export function createQueryBuilder(exec: DbExec, table: string): QueryBuilder {
       filters.push({ column, operator, value });
       return builder;
     },
+    whereAny(groups) {
+      filters.push({ any: groups });
+      return builder;
+    },
+    // No columns: every column.
     select(...columns: string[]) {
-      selectCols = columns;
+      selectCols = columns.length > 0 ? columns : null;
       return builder;
     },
     order(column, dir = "asc") {
@@ -265,7 +286,7 @@ function buildAggSelect(aggs: Record<string, AggDef>): string[] {
 function createGroupByBuilder(
   exec: DbExec,
   table: string,
-  filters: Filter[],
+  filters: Condition[],
   columns: string | string[],
   aggs: Record<string, AggDef>,
 ): GroupByBuilder {

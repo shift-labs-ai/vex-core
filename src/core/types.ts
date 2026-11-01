@@ -51,8 +51,16 @@ export interface Filter {
   value: any;
 }
 
+/** One WHERE condition: a filter, or an OR of filter groups (`whereAny`). */
+export type Condition = Filter | { any: Filter[][] };
+
 export interface QueryBuilder {
   where(column: string, operator: Filter["operator"], value: any): QueryBuilder;
+  /**
+   * Keep the rows matching every filter of at least one group: an OR
+   * of AND groups. No group matches nothing; an empty group, every row.
+   */
+  whereAny(groups: Filter[][]): QueryBuilder;
   select(...columns: string[]): QueryBuilder;
   order(column: string, dir?: "asc" | "desc"): QueryBuilder;
   limit(n: number): QueryBuilder;
@@ -95,6 +103,8 @@ export interface MutationTable {
     operator: Filter["operator"],
     value: any,
   ): MutationTable;
+  /** {@link QueryBuilder.whereAny}. */
+  whereAny(groups: Filter[][]): MutationTable;
   select(...columns: string[]): MutationTable;
   order(column: string, dir?: "asc" | "desc"): MutationTable;
   limit(n: number): MutationTable;

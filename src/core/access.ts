@@ -27,6 +27,14 @@
  *     re-runs): governed. Restricted terminal reads evaluate in JS
  *     over policy-accepted rows; unrestricted calls delegate to SQL
  *     untouched.
+ *   - A policy that can say which rows it may accept as filters
+ *     (`narrow`) has that said in SQL first: the read fetches only
+ *     those rows, only the columns the caller and `row` need, and
+ *     only as many as the window asks for. `row` still decides every
+ *     row fetched: the narrowing is a superset the database can
+ *     search, as an index is, and the predicate is the recheck. A
+ *     row it lets through that `row` refuses costs a refetch, never
+ *     a leak, and is counted (`narrowingDrift`).
  *   - Raw SQL in a query context (`ctx.db.sql`) that reads a governed
  *     table: refused for EVERY caller. A handler that works for admins
  *     and breaks for members is the bug class this module removes, and
@@ -76,6 +84,48 @@ export interface TableAccessPolicy<P = unknown> {
   ): P | typeof UNRESTRICTED | Promise<P | typeof UNRESTRICTED>;
   /** Pure per-row verdict against the prepared context. */
   row(prepared: P, row: Record<string, any>): boolean;
+  /**
+   * The rows `row` may accept, said as filters SQL can apply, for a
+   * restricted read of `table`; null when it cannot be said. It must
+   * match every row `row` accepts (a row it misses is never seen) and
+   * may match more (`row` refuses those after the fetch). Without it,
+   * a restricted read fetches whole rows in growing windows and
+   * filters them all in JS.
+   */
+  narrow?(prepared: P, table: string): Narrowing | null;
+}
+
+/** What a policy's `narrow` says about its table's rows. */
+export interface Narrowing {
+  /**
+   * An OR of AND groups of filters every row the policy may accept
+   * matches. No group: the caller may see no row.
+   */
+  where: Filter[][];
+  /** The columns `row` reads, fetched beside the caller's. */
+  reads: readonly string[];
+}
+
+/**
+ * Rows a policy's narrowing let through and its `row` then refused, by
+ * table, since the process started: what reads of the table fetched
+ * for nothing. A narrowing that says its rows exactly adds nothing
+ * here; one that grows names a `narrow` saying more than `row` allows.
+ */
+const drift = new Map<string, number>();
+const warnedDrift = new Set<string>();
+
+export function narrowingDrift(): Record<string, number> {
+  return Object.fromEntries(drift);
+}
+
+function noteDrift(table: string, refused: number): void {
+  drift.set(table, (drift.get(table) ?? 0) + refused);
+  if (warnedDrift.has(table)) return;
+  warnedDrift.add(table);
+  console.warn(
+    `[vex] access narrowing on "${table}" fetched ${refused} row(s) its policy then refused: narrow() matched more than row() accepts (counted in narrowingDrift())`,
+  );
 }
 
 /** Resolves the caller's prepared context — {@link UNRESTRICTED} or
@@ -244,17 +294,24 @@ function groupRows(
 /**
  * Wrap a table's query builder with its access policy.
  *
- * Chained `where`/`order` forward to the underlying builder — they
- * narrow SQL identically for every caller. `select`/`limit`/`offset`
- * are held here: a restricted read needs full rows for the predicate
- * and applies the caller's window over the ACCEPTED stream, so none
- * of the three may reach SQL until the caller's standing is known.
+ * Chained `where`/`whereAny`/`order` forward to the underlying
+ * builder: they narrow SQL identically for every caller.
+ * `select`/`limit`/`offset` are held here: a restricted read fetches
+ * the columns its predicate reads too, and applies the caller's
+ * window over the ACCEPTED stream, so none of the three may reach SQL
+ * until the caller's standing is known.
  *
  * Restricted bounded reads drive a refill loop: fetch a prefix,
  * filter, and refetch a longer prefix until the window fills or the
  * table is exhausted. Every answer derives from the final single
  * fetch, so ordering ties across fetches cannot duplicate or drop
  * rows.
+ *
+ * When the policy narrows (`narrow`), the read is first held to the
+ * rows it says and to the columns the answer and `row` need, and the
+ * first prefix is the window itself: a correct narrowing fills it in
+ * one fetch, and the loop only runs when `row` refuses rows the
+ * narrowing let through (counted as drift).
  */
 export function guardQueryBuilder(
   table: string,
@@ -266,21 +323,70 @@ export function guardQueryBuilder(
   let limit: number | null = null;
   let offset: number | null = null;
 
+  // Applied once per builder: a builder read twice (`count()` then
+  // `all()`) narrows its shared underlying query only once.
+  let narrowed: Narrowing | null | undefined;
+  function narrowing(prepared: unknown): Narrowing | null {
+    if (narrowed === undefined) {
+      narrowed = policy.narrow?.(prepared, table) ?? null;
+      if (narrowed) underlying.whereAny(narrowed.where);
+    }
+    return narrowed;
+  }
+
+  /**
+   * The rows the caller may see, in query order, at least `needed` of
+   * them when there are (all of them for null). `columns` are those
+   * the answer is built from; null for whole rows.
+   */
   async function fetchAccepted(
     prepared: unknown,
     needed: number | null,
+    columns: readonly string[] | null,
   ): Promise<Record<string, any>[]> {
-    let attempt = needed === null ? NO_LIMIT : Math.max(needed * 2, MIN_FETCH);
+    const narrow = narrowing(prepared);
+    // Narrowed, the columns `row` reads ride beside the caller's; not,
+    // `row` may read any column, so the rows come whole. Set on every
+    // read: the underlying query is shared by every read of this
+    // builder, and an earlier one's columns must not stick.
+    if (narrow) {
+      underlying.select(
+        ...(columns ? new Set([...columns, ...narrow.reads]) : []),
+      );
+    }
+    // Narrowed, the fetch expects every row to pass: the window it
+    // asks for is the one needed. Not, it expects to refuse some.
+    let attempt =
+      needed === null
+        ? NO_LIMIT
+        : narrow
+          ? Math.max(needed, 1)
+          : Math.max(needed * 2, MIN_FETCH);
     for (;;) {
       underlying.limit(attempt);
       const fetched = await underlying.all<Record<string, any>>();
       const accepted = fetched.filter((row) => policy.row(prepared, row));
       const exhausted = attempt === NO_LIMIT || fetched.length < attempt;
       if (exhausted || (needed !== null && accepted.length >= needed)) {
+        // The answer's own fetch: each refused row counted once.
+        if (narrow && accepted.length < fetched.length) {
+          noteDrift(table, fetched.length - accepted.length);
+        }
         return accepted;
       }
       attempt = attempt * 4;
     }
+  }
+
+  /** The caller's visible rows' non-NULL values of `column`. */
+  async function acceptedValues(
+    prepared: unknown,
+    column: string,
+  ): Promise<any[]> {
+    return aggregateValues(
+      await fetchAccepted(prepared, null, [column]),
+      column,
+    );
   }
 
   async function restrictedWindow(
@@ -288,7 +394,7 @@ export function guardQueryBuilder(
   ): Promise<Record<string, any>[]> {
     const start = offset ?? 0;
     const needed = limit === null ? null : start + limit;
-    const accepted = await fetchAccepted(prepared, needed);
+    const accepted = await fetchAccepted(prepared, needed, select);
     const window =
       limit === null
         ? accepted.slice(start)
@@ -318,6 +424,10 @@ export function guardQueryBuilder(
       underlying.where(column, operator, value);
       return guarded;
     },
+    whereAny(groups) {
+      underlying.whereAny(groups);
+      return guarded;
+    },
     order(column, dir = "asc") {
       underlying.order(column, dir);
       return guarded;
@@ -344,7 +454,7 @@ export function guardQueryBuilder(
         () => release().first<T>(),
         async (prepared) => {
           const start = offset ?? 0;
-          const accepted = await fetchAccepted(prepared, start + 1);
+          const accepted = await fetchAccepted(prepared, start + 1, select);
           const row = accepted[start];
           return row === undefined ? null : (projectRow(row, select) as T);
         },
@@ -352,13 +462,13 @@ export function guardQueryBuilder(
     count: () =>
       terminal(
         () => release().count(),
-        async (prepared) => (await fetchAccepted(prepared, null)).length,
+        async (prepared) => (await fetchAccepted(prepared, null, [])).length,
       ),
     distinct: (column) =>
       terminal(
         () => release().distinct(column),
         async (prepared) => {
-          const accepted = await fetchAccepted(prepared, null);
+          const accepted = await fetchAccepted(prepared, null, [column]);
           const seen = new Set<string>();
           const values: any[] = [];
           for (const row of accepted) {
@@ -378,10 +488,7 @@ export function guardQueryBuilder(
       terminal(
         () => release().countDistinct(column),
         async (prepared) => {
-          const values = aggregateValues(
-            await fetchAccepted(prepared, null),
-            column,
-          );
+          const values = await acceptedValues(prepared, column);
           return new Set(values.map((value) => JSON.stringify(value))).size;
         },
       ),
@@ -391,20 +498,13 @@ export function guardQueryBuilder(
       terminal(
         () => release().sum(column),
         async (prepared) =>
-          Number(
-            sumOf(
-              aggregateValues(await fetchAccepted(prepared, null), column),
-            ) ?? 0,
-          ),
+          Number(sumOf(await acceptedValues(prepared, column)) ?? 0),
       ),
     avg: (column) =>
       terminal(
         () => release().avg(column),
         async (prepared) => {
-          const values = aggregateValues(
-            await fetchAccepted(prepared, null),
-            column,
-          );
+          const values = await acceptedValues(prepared, column);
           const total = sumOf(values);
           return Number(total === null ? 0 : total / values.length);
         },
@@ -413,21 +513,13 @@ export function guardQueryBuilder(
       terminal(
         () => release().min(column),
         async (prepared) =>
-          Number(
-            minOf(
-              aggregateValues(await fetchAccepted(prepared, null), column),
-            ) ?? 0,
-          ),
+          Number(minOf(await acceptedValues(prepared, column)) ?? 0),
       ),
     max: (column) =>
       terminal(
         () => release().max(column),
         async (prepared) =>
-          Number(
-            maxOf(
-              aggregateValues(await fetchAccepted(prepared, null), column),
-            ) ?? 0,
-          ),
+          Number(maxOf(await acceptedValues(prepared, column)) ?? 0),
       ),
     groupBy(columns, aggs) {
       const having: Filter[] = [];
@@ -462,7 +554,12 @@ export function guardQueryBuilder(
           },
           async (prepared) =>
             groupRows(
-              await fetchAccepted(prepared, null),
+              await fetchAccepted(prepared, null, [
+                ...(Array.isArray(columns) ? columns : [columns]),
+                ...Object.values(aggs as AggSpec).flatMap((def) =>
+                  def === "count" ? [] : [def[1]],
+                ),
+              ]),
               columns,
               aggs as AggSpec,
               having,

@@ -166,7 +166,7 @@ SQLite reports what a statement reads and writes: its compiled program, as `EXPL
 - **Writes:** a write marks the tables it writes when it changed any row (counted for free: Bun's `run().changes`, a Durable Object cursor's `rowsWritten`). That covers the query builder and `ctx.db.sql` of any shape (`INSERT`, `UPDATE … FROM`, `REPLACE`, upserts, `WITH … DELETE`, several statements in one string), plus rows written by triggers and foreign-key cascades. Tables created by raw SQL are tracked by name like any other.
 - **Transactions:** writes inside a transaction are reported when it commits, and a rolled-back one reports nothing.
 - **Other connections:** on a file database, a commit by another connection or process (`PRAGMA data_version`) marks every table changed at the next invalidation.
-- **Narrowing:** a subscription over a changed table re-runs unless an equality filter proves it could not have seen the change. Only values every touched row holds both before and after the write count as proof: an insert's row, an upsert's keys, the id of an update or delete. An update's new values do not, since the row may have just left the filtered set. A table changed by raw SQL, or by a write that ran a trigger or foreign-key action, proves nothing, and every subscription over it re-runs; narrowing on other tables is unaffected.
+- **Skipping re-runs:** a subscription over a changed table re-runs unless an equality filter proves it could not have seen the change. Only values every touched row holds both before and after the write count as proof: an insert's row, an upsert's keys, the id of an update or delete. An update's new values do not, since the row may have just left the filtered set. A table changed by raw SQL, or by a write that ran a trigger or foreign-key action, proves nothing, and every subscription over it re-runs; skipping on other tables is unaffected.
 - **Raw reads:** a raw read depends on exactly the tables its program reads, through views, subqueries and covering indexes. A raw read that reads no table re-runs after any write.
 - **Access policies:** raw SQL in a query context (`ctx.db.sql`) is refused when it reads a governed table, in any spelling or through any view. A literal or column that merely shares a governed table's name is not a read. Published SQL has its own rule (below).
 - **Costs:** a statement's first run in a given schema compiles it once more for `EXPLAIN` (a few µs); after that, writes, reads and invalidation cost what they cost without tracking, within measurement noise. The query builder, bulk inserts and mutations run at parity with untracked writes; raw writes and raw reads run faster. On a Durable Object a single-statement write makes no more SQL calls, and bills no more rows, than without tracking; raw SQL of several statements reads `total_changes()` before and after.
@@ -258,6 +258,13 @@ Reads, filters, aggregations — pushed down to SQL.
 ```ts
 ctx.db.table("orders").where("region", "=", "US").all();
 ctx.db.table("orders").where("amount", ">", 100).select("id", "amount").first();
+ctx.db.table("orders").where("status", "IN", ["open", null]).all(); // IN may name NULL
+
+// An OR of AND groups: rows matching every filter of at least one group.
+ctx.db.table("orders").whereAny([
+  [{ column: "region", operator: "=", value: "US" }, { column: "amount", operator: ">", value: 100 }],
+  [{ column: "priority", operator: "=", value: 1 }],
+]).all();
 
 ctx.db.table("orders").count();
 ctx.db.table("orders").sum("amount");
@@ -272,6 +279,36 @@ ctx.db.table("orders")
   .order("revenue", "desc")
   .limit(20);
 ```
+
+### Table access policies
+
+A table can declare who sees its rows. Every query-context read of it (queries, subscriptions, their re-runs) answers a restricted caller exactly as a table holding only the rows they may see would: `.limit(n)` is n rows they may see, `count()` counts those. Raw SQL that reads it is refused in query contexts; mutation contexts are the trusted tier and read every row.
+
+```ts
+api.registerTable("docs", {
+  columns: { ownerId: { type: "string", index: true }, title: { type: "string" } },
+  access: {
+    // Once per operation: UNRESTRICTED, or what `row` decides by.
+    async prepare(user, db) {
+      if (!user || user.isAdmin) return UNRESTRICTED;
+      const grants = await db.table("grants").where("userId", "=", user.id).all();
+      return { userId: user.id, granted: grants.map((g) => g.docId) };
+    },
+    // Per row: the verdict.
+    row: (p, row) => row.ownerId === p.userId || p.granted.includes(row._id),
+    // Optional: the rows `row` may accept, as filters SQL can apply.
+    narrow: (p) => ({
+      where: [
+        [{ column: "ownerId", operator: "=", value: p.userId }],
+        [{ column: "_id", operator: "IN", value: p.granted }],
+      ],
+      reads: ["_id", "ownerId"],
+    }),
+  },
+});
+```
+
+`prepare`'s reads are tracked, so a grant written re-runs the subscriptions it affects. Without `narrow`, a restricted read fetches whole rows in growing windows and decides each in JS. With it, the read asks SQL only for the rows `narrow` names, only for the caller's columns and `reads`, and only for the window it needs. `row` still decides every row fetched, so a narrowing may name more rows than `row` accepts, never fewer: a row it lets through and `row` refuses costs a refetch and is counted in `narrowingDrift()`, never shown.
 
 ## File-based conventions
 
