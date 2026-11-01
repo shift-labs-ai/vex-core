@@ -11,8 +11,12 @@ export type { DurableObjectSqlStorage } from "./adapters/durable-object.js";
 export { durableObjectAdapter } from "./adapters/durable-object.js";
 
 // Core
-export type { AccessReader, TableAccessPolicy } from "./core/access.js";
-export { UNRESTRICTED } from "./core/access.js";
+export type {
+  AccessReader,
+  Narrowing,
+  TableAccessPolicy,
+} from "./core/access.js";
+export { narrowingDrift, UNRESTRICTED } from "./core/access.js";
 export type { PluginFunction, VexPluginAPI } from "./core/api.js";
 export { createPluginAPI, resolvePlugin } from "./core/api.js";
 export type { OperationDescription, VexOptions } from "./core/engine.js";

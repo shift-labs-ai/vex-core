@@ -840,9 +840,17 @@ export class Vex<A = unknown> {
         ];
         return tracked;
       },
+      // An OR of groups is not recorded among the descriptor's
+      // filters: only equality filters let an invalidation skip a
+      // subscription, and leaving this one out only re-runs more.
+      whereAny(groups) {
+        current = current.whereAny(groups);
+        return tracked;
+      },
       select(...columns) {
         current = current.select(...columns);
-        descriptor.select = columns;
+        if (columns.length > 0) descriptor.select = columns;
+        else delete descriptor.select;
         return tracked;
       },
       order(column, dir = "asc") {
@@ -942,6 +950,7 @@ export class Vex<A = unknown> {
           function build(qb: QueryBuilder): MutationTable {
             return {
               where: (col, op, val) => build(qb.where(col, op, val)),
+              whereAny: (groups) => build(qb.whereAny(groups)),
               select: (...cols) => build(qb.select(...cols)),
               order: (col, dir) => build(qb.order(col, dir)),
               limit: (n) => build(qb.limit(n)),
