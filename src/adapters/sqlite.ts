@@ -617,9 +617,10 @@ export function sqliteAdapter(
       table: string,
       keys: Record<string, any>,
       data: Record<string, any>,
+      id?: string,
     ): Promise<void> {
       await withConnectionLock(() =>
-        upsertRow(writerDriver, table, keys, data),
+        upsertRow(writerDriver, table, keys, data, id),
       );
     },
 

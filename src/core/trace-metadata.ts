@@ -3,6 +3,14 @@ import type { Filter } from "./types.js";
 export interface QueryDependency {
   table: string;
   filters?: Filter[];
+  /** Each `whereAny`: an OR of AND groups, every one of which must hold. */
+  any?: Filter[][][];
+  /**
+   * The columns the result is computed from, besides the filters': a
+   * selection, an aggregate's column, a grouping. Absent when the
+   * read returns whole rows.
+   */
+  reads?: string[];
   select?: string[] | null;
   order?: { column: string; dir: "asc" | "desc" } | null;
   limit?: number | null;
@@ -21,6 +29,18 @@ export interface WriteDependency {
   values?: Record<string, unknown>;
   /** The columns the write set, for traces. */
   columns?: string[];
+  /**
+   * Present when every row the write touched exists both before and
+   * after it (an update): the columns whose value it changed. Empty
+   * when it changed nothing.
+   */
+  changed?: string[];
+  /**
+   * For each changed column, what the rows held before and after: a
+   * filter rejecting both never saw them.
+   */
+  before?: Record<string, unknown>;
+  after?: Record<string, unknown>;
   raw?: boolean;
 }
 
@@ -29,6 +49,8 @@ type TraceFilter = Pick<Filter, "column" | "operator">;
 interface TraceQueryDependency {
   table: string;
   filters?: TraceFilter[];
+  any?: TraceFilter[][][];
+  reads?: string[];
   select?: string[];
   order?: { column: string; dir: "asc" | "desc" };
   limit?: number;
@@ -39,6 +61,7 @@ interface TraceQueryDependency {
 interface TraceWrite {
   table: string;
   columns?: string[];
+  changed?: string[];
   raw?: true;
 }
 
@@ -60,6 +83,16 @@ export function describeQueryDependencies(
           })),
         }
       : {}),
+    ...(dependency.any
+      ? {
+          any: dependency.any.map((groups) =>
+            groups.map((group) =>
+              group.map(({ column, operator }) => ({ column, operator })),
+            ),
+          ),
+        }
+      : {}),
+    ...(dependency.reads ? { reads: [...dependency.reads].sort() } : {}),
     ...(dependency.select ? { select: dependency.select } : {}),
     ...(dependency.order ? { order: dependency.order } : {}),
     ...(typeof dependency.limit === "number"
@@ -80,6 +113,7 @@ export function describeWrites(writes: WriteDependency[]): TraceWrite[] {
   return writes.map((write) => ({
     table: write.table,
     ...(write.columns ? { columns: [...write.columns].sort() } : {}),
+    ...(write.changed ? { changed: [...write.changed].sort() } : {}),
     ...(write.raw ? { raw: true as const } : {}),
   }));
 }
