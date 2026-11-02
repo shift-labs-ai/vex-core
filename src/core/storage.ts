@@ -29,10 +29,15 @@ export interface StorageAdapter {
   readonly name: string;
   ensureTable(name: string, schema: TableSchema): Promise<void> | void;
   insert(table: string, row: Record<string, any>): Promise<string>;
+  /**
+   * Updates the row matching `keys` with `data`, or inserts both; a
+   * row inserted gets `id` when given.
+   */
   upsert(
     table: string,
     keys: Record<string, any>,
     data: Record<string, any>,
+    id?: string,
   ): Promise<void>;
   update(table: string, id: string, data: Record<string, any>): Promise<void>;
   delete(table: string, id: string): Promise<boolean>;

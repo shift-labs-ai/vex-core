@@ -7,7 +7,9 @@ import {
 } from "./access.js";
 import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
+import { id as generateId } from "./id.js";
 import { INTERNAL_TABLES } from "./internal.js";
+import { sqlBound, writeMayAffect } from "./invalidation.js";
 import { hashResult, utf8ByteLength } from "./result-measure.js";
 import { statementKind, tablesRead, type ViewDefinition } from "./sql-text.js";
 import { ANY_TABLE, type StorageAdapter } from "./storage.js";
@@ -23,6 +25,7 @@ import type {
   ActionContext,
   ActionDef,
   CallContext,
+  ColumnType,
   DescribedColumn,
   JobDef,
   MiddlewareFn,
@@ -100,6 +103,17 @@ function subscriptionUserKey(user: VexUser | null | undefined): string {
  * and which tables it changed the adapter reports (`takeChanges`).
  */
 const RAW_WRITE: WriteDependency = { table: ANY_TABLE, raw: true };
+
+/**
+ * How many rows a filtered delete reads back to record one by one;
+ * past that, the delete is recorded by its `=` filters alone.
+ */
+const DELETE_ROWS_RECORDED = 200;
+
+const columnTypesBySchema = new WeakMap<
+  TableSchema,
+  Record<string, ColumnType>
+>();
 
 function groupWritesByTable(
   writes: WriteDependency[] | undefined,
@@ -830,7 +844,14 @@ export class Vex<A = unknown> {
     // actually executes — even when callers hold intermediate references.
     let current = builder;
     const descriptor: Omit<QueryDependency, "table"> = {};
-    const record = () => dependencies?.push({ table, ...descriptor });
+    // `reads`: the columns a terminal computes its result from, besides
+    // the filters'; absent for whole rows.
+    const record = (reads?: string[]) =>
+      dependencies?.push({
+        table,
+        ...descriptor,
+        ...(reads ? { reads } : {}),
+      });
     const tracked: QueryBuilder = {
       where(column, operator, value) {
         current = current.where(column, operator, value);
@@ -840,11 +861,19 @@ export class Vex<A = unknown> {
         ];
         return tracked;
       },
-      // An OR of groups is not recorded among the descriptor's
-      // filters: only equality filters let an invalidation skip a
-      // subscription, and leaving this one out only re-runs more.
+      // A single group is an AND of filters like any other; an OR of
+      // several is recorded apart, every group of which a write must
+      // miss to be ruled out.
       whereAny(groups) {
         current = current.whereAny(groups);
+        if (groups.length === 1) {
+          descriptor.filters = [...(descriptor.filters ?? []), ...groups[0]];
+        } else {
+          descriptor.any = [
+            ...(descriptor.any ?? []),
+            groups.map((group) => [...group]),
+          ];
+        }
         return tracked;
       },
       select(...columns) {
@@ -869,43 +898,47 @@ export class Vex<A = unknown> {
         return tracked;
       },
       all: async () => {
-        record();
+        record(descriptor.select ?? undefined);
         return current.all();
       },
       first: async () => {
-        record();
+        record(descriptor.select ?? undefined);
         return current.first();
       },
       distinct: async (col) => {
-        record();
+        record([col]);
         return current.distinct(col);
       },
       count: async () => {
-        record();
+        record([]);
         return current.count();
       },
       countDistinct: async (col) => {
-        record();
+        record([col]);
         return current.countDistinct(col);
       },
       sum: async (col) => {
-        record();
+        record([col]);
         return current.sum(col);
       },
       avg: async (col) => {
-        record();
+        record([col]);
         return current.avg(col);
       },
       min: async (col) => {
-        record();
+        record([col]);
         return current.min(col);
       },
       max: async (col) => {
-        record();
+        record([col]);
         return current.max(col);
       },
       groupBy: (col, aggs) => {
-        record();
+        const reads = new Set(Array.isArray(col) ? col : [col]);
+        for (const agg of Object.values(aggs)) {
+          if (Array.isArray(agg)) reads.add(agg[1]);
+        }
+        record([...reads]);
         return current.groupBy(col, aggs);
       },
       delete: () => current.delete(),
@@ -930,6 +963,13 @@ export class Vex<A = unknown> {
     });
   }
 
+  /**
+   * A mutation's context. With `writes`, each write the handler makes
+   * is recorded there for invalidation to narrow on, with the values
+   * its rows hold; the rows are read first, which is consistent only
+   * inside the transaction the handler runs in, so a caller recording
+   * writes runs the handler in one.
+   */
   private buildMutationContext(
     user?: VexUser | null,
     writes?: WriteDependency[],
@@ -947,14 +987,52 @@ export class Vex<A = unknown> {
         },
         table(name: string): MutationTable {
           const adapter = self.storage;
-          function build(qb: QueryBuilder): MutationTable {
+          const recording = writes !== undefined;
+          const held = (id: string) =>
+            recording
+              ? adapter.query(name).where("_id", "=", id).first()
+              : Promise.resolve(null);
+          /**
+           * An update's write: the row's columns `data` leaves as they
+           * were (its id among them) as `values`, the columns whose
+           * value it changes as `changed`. Without the row, only the id.
+           */
+          const updateWrite = (
+            id: string,
+            row: Record<string, any> | null,
+            data: Record<string, any>,
+          ): WriteDependency => {
+            const columns = Object.keys(data);
+            if (!row) return { table: name, values: { _id: id }, columns };
+            const changed = columns.filter(
+              (column) => sqlBound(data[column]) !== sqlBound(row[column]),
+            );
+            const values: Record<string, unknown> = {};
+            const before: Record<string, unknown> = {};
+            const after: Record<string, unknown> = {};
+            for (const [column, value] of Object.entries(row)) {
+              if (changed.includes(column)) {
+                before[column] = value;
+                after[column] = data[column];
+              } else values[column] = value;
+            }
+            return { table: name, values, before, after, columns, changed };
+          };
+          function build(
+            qb: QueryBuilder,
+            eq: Record<string, unknown>,
+          ): MutationTable {
             return {
-              where: (col, op, val) => build(qb.where(col, op, val)),
-              whereAny: (groups) => build(qb.whereAny(groups)),
-              select: (...cols) => build(qb.select(...cols)),
-              order: (col, dir) => build(qb.order(col, dir)),
-              limit: (n) => build(qb.limit(n)),
-              offset: (n) => build(qb.offset(n)),
+              where: (col, op, val) =>
+                build(
+                  qb.where(col, op, val),
+                  op === "=" ? { ...eq, [col]: val } : eq,
+                ),
+              whereAny: (groups) => build(qb.whereAny(groups), eq),
+              select: (...cols) => build(qb.select(...cols), eq),
+              order: (col, dir) => build(qb.order(col, dir), eq),
+              limit: (n) => build(qb.limit(n), eq),
+              offset: (n) => build(qb.offset(n), eq),
               all: () => qb.all(),
               first: () => qb.first(),
               distinct: (col) => qb.distinct(col),
@@ -966,55 +1044,79 @@ export class Vex<A = unknown> {
               max: (col) => qb.max(col),
               groupBy: (col, aggs) => qb.groupBy(col, aggs),
               // Each write records the values its rows hold before and
-              // after it (WriteDependency.values): an insert's whole row,
-              // an upsert's keys that its data leaves alone, an update's or
-              // delete's id. An update's new values are not among them: the
-              // row may have left a filtered set by taking them.
+              // after it (WriteDependency.values): an insert's whole row
+              // with the id it is given here, an update's or upsert's
+              // columns left as they were, a delete's whole row.
               insert: (row) => {
+                const _id = row._id ?? generateId(12);
+                const full = { ...row, _id };
                 writes?.push({
                   table: name,
-                  values: row,
+                  values: full,
                   columns: Object.keys(row),
                 });
-                return adapter.insert(name, row);
+                return adapter.insert(name, full);
               },
-              upsert: (keys, data) => {
-                writes?.push({
-                  table: name,
-                  values: Object.fromEntries(
-                    Object.entries(keys).filter(
-                      ([column]) => !(column in data),
-                    ),
-                  ),
-                  columns: Object.keys({ ...keys, ...data }),
-                });
-                return adapter.upsert(name, keys, data);
+              upsert: async (keys, data) => {
+                const _id = generateId(12);
+                if (recording) {
+                  let lookup = adapter.query(name);
+                  for (const [column, value] of Object.entries(keys)) {
+                    lookup = lookup.where(column, "=", value);
+                  }
+                  const row = await lookup.first();
+                  writes?.push(
+                    row
+                      ? updateWrite(row._id, row, data)
+                      : {
+                          table: name,
+                          values: { ...keys, ...data, _id },
+                          columns: Object.keys({ ...keys, ...data }),
+                        },
+                  );
+                }
+                return adapter.upsert(name, keys, data, _id);
               },
-              update: (id, data) => {
+              update: async (id, data) => {
                 const target = rowId(name, "update", id);
-                writes?.push({
-                  table: name,
-                  values: { _id: target },
-                  columns: Object.keys(data),
-                });
+                writes?.push(updateWrite(target, await held(target), data));
                 return adapter.update(name, target, data);
               },
               // No argument deletes every row the filters match; an
               // argument is one row's id, which `rowId` holds to a
               // string: read as "no argument", a missing id would empty
               // the table.
-              delete: (...args: [id?: string]) => {
+              delete: async (...args: [id?: string]) => {
                 if (args.length === 0) {
-                  writes?.push({ table: name });
+                  if (recording) {
+                    // The rows about to go, each as it is: every row
+                    // the filters match, which a limit or offset on
+                    // the chain bounds the read of but not the delete.
+                    // Past a bound, or short of them all, only what the
+                    // `=` filters say of them all.
+                    const total = await qb.count();
+                    const rows =
+                      total <= DELETE_ROWS_RECORDED ? await qb.all() : [];
+                    if (rows.length === total) {
+                      for (const row of rows) {
+                        writes?.push({ table: name, values: row });
+                      }
+                    } else {
+                      writes?.push({ table: name, values: { ...eq } });
+                    }
+                  }
                   return qb.delete();
                 }
                 const target = rowId(name, "delete", args[0]);
-                writes?.push({ table: name, values: { _id: target } });
+                writes?.push({
+                  table: name,
+                  values: (await held(target)) ?? { _id: target },
+                });
                 return adapter.delete(name, target);
               },
             };
           }
-          return build(adapter.query(name));
+          return build(adapter.query(name), {});
         },
       },
       runtime: this.runtime(),
@@ -1120,10 +1222,10 @@ export class Vex<A = unknown> {
 
   /**
    * Whether a subscription with `dependencies` may have seen the changes.
-   * Over a changed table, only equality filters that the writes' values
-   * (WriteDependency.values) rule out let it be skipped, and only when
-   * every write to the table is one of those: not over an unattributed
-   * table.
+   * Over a changed table, only filters that the writes' values
+   * (WriteDependency.values) rule out let it be skipped (`writeMayAffect`),
+   * and only when every write to the table is one of those: not over an
+   * unattributed table.
    */
   private dependencyAffected(
     dependencies: QueryDependency[],
@@ -1142,23 +1244,32 @@ export class Vex<A = unknown> {
         tableWrites.some((write) => write.raw || !write.values)
       )
         return true;
-      const eqFilters = (dep.filters ?? []).filter(
-        (filter) => filter.operator === "=",
-      );
-      if (eqFilters.length === 0) return true;
-      if (
-        tableWrites.some((write) =>
-          eqFilters.every(
-            (filter) =>
-              !(filter.column in (write.values ?? {})) ||
-              write.values?.[filter.column] === filter.value,
-          ),
-        )
-      ) {
+      const columns = this.columnTypes(dep.table);
+      if (tableWrites.some((write) => writeMayAffect(dep, write, columns))) {
         return true;
       }
     }
     return false;
+  }
+
+  /**
+   * The declared type of each column of `table`, `_id` included, for
+   * the affinity-aware comparison of a write's values with a filter.
+   * Undefined when the table is not registered: nothing is assumed
+   * then. Held per schema object, which a (re)registration replaces.
+   */
+  private columnTypes(table: string): Record<string, ColumnType> | undefined {
+    const schema = this.storage.getSchema(table);
+    if (!schema) return undefined;
+    let types = columnTypesBySchema.get(schema);
+    if (!types) {
+      types = { _id: "string" };
+      for (const [name, def] of Object.entries(schema.columns)) {
+        types[name] = def.type;
+      }
+      columnTypesBySchema.set(schema, types);
+    }
+    return types;
   }
 
   private async invalidateSubscriptions(
@@ -1468,7 +1579,8 @@ export class Vex<A = unknown> {
             body: { error: "Verification failed" },
           } as WebhookResponse;
         }
-        const ctx = this.buildMutationContext();
+        const writes: WriteDependency[] = [];
+        const ctx = this.buildMutationContext(undefined, writes);
         const info: MiddlewareInfo<any> = {
           type: "webhook",
           name: `${match.plugin}.${match.name}`,
@@ -1482,7 +1594,8 @@ export class Vex<A = unknown> {
             ectx,
           ),
         );
-        await this.invalidateSubscriptions(ectx);
+        if (isTraceRecording(ectx)) meta.writes = describeWrites(writes);
+        await this.invalidateSubscriptions(ectx, writes);
         if (result && typeof result === "object" && "status" in result) {
           meta.status = (result as any).status;
           return result as WebhookResponse;
@@ -1521,10 +1634,16 @@ export class Vex<A = unknown> {
     rows: Record<string, any>[],
   ): Promise<void> {
     return this.trace("bulkInsert", table, null, async (ectx) => {
-      await this.storage.bulkInsert(table, rows);
+      // Each row with the id it is given here, so a read held to ids
+      // can rule the insert out.
+      const full = rows.map((row) => ({
+        ...row,
+        _id: row._id ?? generateId(12),
+      }));
+      await this.storage.bulkInsert(table, full);
       await this.invalidateSubscriptions(
         ectx,
-        rows.map((row) => ({ table, values: row })),
+        full.map((row) => ({ table, values: row })),
       );
     });
   }

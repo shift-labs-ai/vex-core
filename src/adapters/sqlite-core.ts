@@ -4,6 +4,7 @@ import {
   leadingSqlKeyword,
   splitStatements,
 } from "../core/sql-text.js";
+import { serializeValue } from "../core/sql-value.js";
 import { ANY_TABLE, type Changes, type ReadOnlyRead } from "../core/storage.js";
 import type { TableSchema } from "../core/types.js";
 import {
@@ -11,7 +12,6 @@ import {
   buildUpdateSql,
   buildWhereClause,
   quoteIdent,
-  serializeValue,
 } from "./shared.js";
 
 /**
@@ -1077,12 +1077,16 @@ export function deleteRow(db: SqliteDriver, table: string, id: string): number {
   return ownChanges(db, db.prepare(sql).run(id));
 }
 
-/** Updates the row matching `keys` with `data`, or inserts both. */
+/**
+ * Updates the row matching `keys` with `data`, or inserts both; a row
+ * inserted gets `id` when given.
+ */
 export function upsertRow(
   db: SqliteDriver,
   table: string,
   keys: Record<string, any>,
   data: Record<string, any>,
+  id?: string,
 ): void {
   const { sql: where, params } = buildWhereClause(
     Object.entries(keys).map(([column, value]) => ({
@@ -1095,7 +1099,7 @@ export function upsertRow(
     .prepare(`SELECT _id FROM ${quoteIdent(table)} ${where} LIMIT 1`)
     .get(...params) as { _id: string } | null;
   if (row) updateRow(db, table, row._id, data);
-  else insertRow(db, table, { ...keys, ...data });
+  else insertRow(db, table, { ...keys, ...data, ...(id ? { _id: id } : {}) });
 }
 
 /** Inserts `rows` atomically, over the union of their columns. */

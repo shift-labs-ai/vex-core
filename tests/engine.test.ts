@@ -1288,11 +1288,12 @@ describe("trace metadata", () => {
     expect(metadata("mutation", "safe.insert").writes).toEqual([
       { table: "documents", columns: ["content", "workspaceId"] },
     ]);
+    // The upsert found its row and set `content` to what it held.
     expect(metadata("mutation", "safe.upsert").writes).toEqual([
-      { table: "documents", columns: ["content", "workspaceId"] },
+      { table: "documents", columns: ["content"], changed: [] },
     ]);
     expect(metadata("mutation", "safe.update").writes).toEqual([
-      { table: "documents", columns: ["content"] },
+      { table: "documents", columns: ["content"], changed: [] },
     ]);
     expect(metadata("mutation", "safe.delete").writes).toEqual([
       { table: "documents" },

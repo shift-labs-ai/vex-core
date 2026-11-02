@@ -1,3 +1,4 @@
+import { serializeValue } from "../core/sql-value.js";
 import type {
   AggDef,
   Condition,
@@ -9,13 +10,6 @@ import type {
 
 export function quoteIdent(name: string): string {
   return `"${name.replaceAll('"', '""')}"`;
-}
-
-export function serializeValue(v: any): any {
-  if (v === undefined || v === null) return null;
-  if (typeof v === "object") return JSON.stringify(v);
-  if (typeof v === "boolean") return v ? 1 : 0;
-  return v;
 }
 
 interface RowTransform {

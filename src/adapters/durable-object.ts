@@ -203,9 +203,9 @@ export function durableObjectAdapter(
       return insertRow(driver, table, row);
     },
 
-    async upsert(table, keys, data) {
+    async upsert(table, keys, data, id) {
       ready();
-      upsertRow(driver, table, keys, data);
+      upsertRow(driver, table, keys, data, id);
     },
 
     async update(table, id, data) {
