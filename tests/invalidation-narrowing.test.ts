@@ -145,6 +145,15 @@ function plugin(api: VexPluginAPI) {
   counted("governed", (ctx) =>
     ctx.db.table("governed").order("title", "asc").all(),
   );
+  // A sidebar's previews: one raw statement over many sessions' rows,
+  // held to those sessions.
+  counted("previews", (ctx, ids: string[]) =>
+    ctx.db.sqlOver(
+      { sessions: [{ column: "_id", operator: "IN", value: ids }] },
+      `SELECT _id, title FROM sessions WHERE _id IN (${ids.map(() => "?").join(", ")}) ORDER BY title`,
+      ...ids,
+    ),
+  );
 
   api.registerMutation("open", {
     args: { title: "string", platform: "string", n: "any" },
@@ -523,6 +532,49 @@ describe("invalidation narrowing (SHFT-2537)", () => {
     await vex.mutate("s.upsertTitle", { title: "fresh", platform: "web" });
     expect(ran("countWeb")).toBe(countRuns + 1);
     expect(ran("mine")).toBe(mineRuns);
+  });
+
+  test("a raw read held to rows (sqlOver) is skipped like a builder read, and traced as narrowed", async () => {
+    const spans: Span[] = [];
+    const vex = await create({
+      tracer: { onSpan: (span) => spans.push(span) },
+    });
+    const mine = await vex.mutate("s.open", {
+      title: "mine",
+      platform: "web",
+      n: 1,
+    });
+    const other = await vex.mutate("s.open", {
+      title: "other",
+      platform: "web",
+      n: 1,
+    });
+    const seen = await watch(vex, "previews", [mine]);
+    expect(seen).toEqual([[expect.objectContaining({ title: "mine" })]]);
+    const sub = spans.find(
+      (s) => s.type === "subscribe" && s.name === "s.previews",
+    );
+    expect(JSON.parse(sub!.meta!).dependencies).toEqual([
+      { table: "sessions", filters: [{ column: "_id", operator: "IN" }] },
+    ]);
+    const after = ran("previews");
+
+    await vex.mutate("s.touch", {
+      table: "sessions",
+      id: other,
+      data: { title: "other'" },
+    });
+    expect(ran("previews")).toBe(after);
+    await vex.mutate("s.open", { title: "new", platform: "web", n: 1 });
+    expect(ran("previews")).toBe(after);
+
+    await vex.mutate("s.touch", {
+      table: "sessions",
+      id: mine,
+      data: { title: "mine'" },
+    });
+    expect(ran("previews")).toBe(after + 1);
+    expect(seen.at(-1)).toEqual([expect.objectContaining({ title: "mine'" })]);
   });
 
   test("SQL affinity, not ===, decides a miss: NULL spellings and numeric text", async () => {

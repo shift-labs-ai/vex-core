@@ -192,6 +192,19 @@ export interface QueryContext {
     table(name: string): QueryBuilder;
     sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
     /**
+     * A raw read held to the rows `over` names: of each table there,
+     * the statement reads no row outside its filters (an AND of them),
+     * so a write to other rows does not re-run a subscription that
+     * made it. Every other table it reads it depends on whole, as
+     * `sql` does. The handler vouches for the filters: a statement
+     * reading past them leaves its subscription stale.
+     */
+    sqlOver<T = Record<string, any>>(
+      over: Record<string, Filter[]>,
+      sql: string,
+      ...params: any[]
+    ): Promise<T[]>;
+    /**
      * Runs SQL someone other than the app wrote: one statement that
      * SQLite's compiled program shows writes nothing and opens only
      * published tables (`TableSchema.published`), directly or through a

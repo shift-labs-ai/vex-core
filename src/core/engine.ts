@@ -35,6 +35,7 @@ import type {
   CallContext,
   ColumnType,
   DescribedColumn,
+  Filter,
   JobDef,
   MiddlewareFn,
   MiddlewareInfo,
@@ -814,15 +815,41 @@ export class Vex<A = unknown> {
       return prepared;
     }
     // A raw read depends on every table it reads, any of whose changes
-    // re-runs it; one that reads no table, on any change at all.
-    function trackRaw(tables: readonly string[]): void {
+    // re-runs it, but for a table it is held to rows of (`over`), whose
+    // filters narrow it like a builder read's; one that reads no
+    // table, on any change at all.
+    function trackRaw(
+      tables: readonly string[],
+      over?: Record<string, Filter[]>,
+    ): void {
       if (!touchedTables && !dependencies) return;
       for (const table of tables) {
         touchedTables?.add(table);
-        dependencies?.push({ table, raw: true });
+        const filters = over?.[table];
+        dependencies?.push(filters ? { table, filters } : { table, raw: true });
       }
       if (tables.length === 0)
         dependencies?.push({ table: ANY_TABLE, raw: true });
+    }
+    // A raw read as the caller, refused over a governed table.
+    function rawRead<T>(
+      sql: string,
+      params: any[],
+      over?: Record<string, Filter[]>,
+    ): Promise<T[]> {
+      const read = (tables: string[]): Promise<T[]> => {
+        const governed = tables.filter((table) =>
+          self.accessPolicies.has(table),
+        );
+        if (governed.length > 0) {
+          return Promise.reject(governedRawSqlError(governed));
+        }
+        trackRaw(tables, over);
+        return self.storage.rawQuery<T>(sql, ...params);
+      };
+      // Known tables are answered at once, without a microtask hop.
+      const tables = self.rawReadTables(sql);
+      return Array.isArray(tables) ? read(tables) : tables.then(read);
     }
     ctx = {
       db: {
@@ -833,24 +860,13 @@ export class Vex<A = unknown> {
             resolvePrepared(name, policy),
           );
         },
-        sql<T = Record<string, any>>(
+        sql: <T = Record<string, any>>(sql: string, ...params: any[]) =>
+          rawRead<T>(sql, params),
+        sqlOver: <T = Record<string, any>>(
+          over: Record<string, Filter[]>,
           sql: string,
           ...params: any[]
-        ): Promise<T[]> {
-          const read = (tables: string[]): Promise<T[]> => {
-            const governed = tables.filter((table) =>
-              self.accessPolicies.has(table),
-            );
-            if (governed.length > 0) {
-              return Promise.reject(governedRawSqlError(governed));
-            }
-            trackRaw(tables);
-            return self.storage.rawQuery<T>(sql, ...params);
-          };
-          // Known tables are answered at once, without a microtask hop.
-          const tables = self.rawReadTables(sql);
-          return Array.isArray(tables) ? read(tables) : tables.then(read);
-        },
+        ) => rawRead<T>(sql, params, over),
         async publishedSql<T = Record<string, any>>(
           sql: string,
           ...params: any[]
