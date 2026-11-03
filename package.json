@@ -48,6 +48,7 @@
     "test": "bun test",
     "test:workers": "tsc && tsc -p tests/workers && vitest run --config tests/workers/vitest.config.ts",
     "bench:sqlite-read": "bun benchmarks/sqlite-read-contention.ts",
+    "bench:invalidation": "bun benchmarks/invalidation.ts",
     "format": "bunx biome format --write src/",
     "lint": "bunx biome lint src/",
     "check": "bunx biome check src/",
