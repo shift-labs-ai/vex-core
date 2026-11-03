@@ -577,6 +577,61 @@ describe("invalidation narrowing (SHFT-2537)", () => {
     expect(seen.at(-1)).toEqual([expect.objectContaining({ title: "mine'" })]);
   });
 
+  test("a write to one row is judged against the views filed under it, not every view", async () => {
+    const spans: Span[] = [];
+    const vex = await create({
+      tracer: { onSpan: (span) => spans.push(span) },
+    });
+    const ids: string[] = [];
+    for (let i = 0; i < 50; i++) {
+      ids.push(
+        await vex.mutate("s.open", { title: `t${i}`, platform: "web", n: 1 }),
+      );
+    }
+    // Fifty views each held to one session, one wide view, one raw.
+    for (const id of ids) await watch(vex, "mine", [id]);
+    await watch(vex, "notHeadless");
+    await watch(vex, "all");
+    const pass = () =>
+      JSON.parse(spans.filter((s) => s.type === "invalidation").at(-1)!.meta!);
+
+    await vex.mutate("s.touch", {
+      table: "sessions",
+      id: ids[7],
+      data: { title: "x" },
+    });
+    // The touched row's view, plus the two filed wide on `sessions`.
+    expect(pass().judged).toBe(3);
+    expect(pass().reEvaluated.sort()).toEqual([
+      "s.all",
+      "s.mine",
+      "s.notHeadless",
+    ]);
+
+    // A filtered delete of many rows is recorded by its filter alone,
+    // naming no row: every view on the table is judged.
+    await vex.unsafeBulkInsert(
+      "sessions",
+      Array.from({ length: 250 }, (_, i) => ({
+        title: `i${i}`,
+        platform: "ios",
+        n: 1,
+      })),
+    );
+    await vex.mutate("s.closePlatform", { platform: "ios" });
+    expect(pass().judged).toBe(52);
+
+    // Unsubscribed, a view is judged no more.
+    const off = await vex.subscribe("s.mine", { arg: [ids[7]] }, () => {});
+    off();
+    await vex.mutate("s.touch", {
+      table: "sessions",
+      id: ids[7],
+      data: { title: "y" },
+    });
+    expect(pass().judged).toBe(3);
+  });
+
   test("SQL affinity, not ===, decides a miss: NULL spellings and numeric text", async () => {
     const vex = await create();
     await watch(vex, "small"); // n < 10

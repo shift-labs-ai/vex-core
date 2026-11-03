@@ -107,6 +107,9 @@ interface Subscription {
   /** Its runs go to the evaluation pool: there is one, and its caller
    *  can cross to a worker. */
   offThread: boolean;
+  /** Where it is filed (`indexSubscription`): each table, and the row
+   *  ids under it, or null for wide. */
+  filed: Array<{ table: string; ids: string[] | null }>;
 }
 
 function subscriptionGroupKey(subscription: Subscription): string {
@@ -133,6 +136,40 @@ const columnTypesBySchema = new WeakMap<
   TableSchema,
   Record<string, ColumnType>
 >();
+
+/**
+ * Where a subscription is found when a table changes: under each row
+ * id a dependency on the table holds it to (`_id =`, `_id IN`), or
+ * under `wide` when one dependency on the table names no id. A write
+ * carrying its row's id judges the subscriptions under that id and
+ * the wide ones; a write without one, every subscription on the table.
+ */
+interface TableIndex {
+  wide: Set<Subscription>;
+  byId: Map<string, Set<Subscription>>;
+  all: Set<Subscription>;
+}
+
+/**
+ * The row ids a dependency's filters hold it to; null for none, or
+ * for one said in anything but strings, which the column's affinity
+ * may still match.
+ */
+function rowIdsOf(dep: QueryDependency): string[] | null {
+  if (dep.raw) return null;
+  for (const filter of dep.filters ?? []) {
+    if (filter.column !== "_id") continue;
+    const ids =
+      filter.operator === "="
+        ? [filter.value]
+        : filter.operator === "IN" && Array.isArray(filter.value)
+          ? filter.value
+          : null;
+    if (ids?.every((id) => typeof id === "string")) return ids as string[];
+    return null;
+  }
+  return null;
+}
 
 function groupWritesByTable(
   writes: WriteDependency[] | undefined,
@@ -260,6 +297,11 @@ export class Vex<A = unknown> {
   private mutations: Map<string, RegisteredMutation> = new Map();
   private actions: Map<string, RegisteredAction> = new Map();
   private subscriptions: Map<string, Subscription> = new Map();
+  // Each subscription by the tables and row ids its last run read
+  // (`indexSubscription`); a run still open is judged whole instead.
+  private subscriptionIndex: Map<string, TableIndex> = new Map();
+  private anyTableSubscriptions: Set<Subscription> = new Set();
+  private runningSubscriptions: Set<Subscription> = new Set();
   private tables: Set<string> = new Set();
   private middleware: MiddlewareFn<any>[] = [];
   // Row-level access policies by table (core/access.ts). Applied to
@@ -1363,6 +1405,113 @@ export class Vex<A = unknown> {
   }
 
   /**
+   * Files `sub` under the tables and row ids its dependencies name,
+   * replacing where it was filed. A dependency held to ids files it
+   * under each; one naming no id files it wide; one on any table, or
+   * none at all, files it among those judged on every pass.
+   */
+  private indexSubscription(sub: Subscription): void {
+    this.unindexSubscription(sub);
+    // Reading no table, it is judged on every pass, as a raw read of
+    // no table is: nothing says what it depends on.
+    if (sub.dependencies.length === 0) this.anyTableSubscriptions.add(sub);
+    for (const dep of sub.dependencies) {
+      if (dep.table === ANY_TABLE) {
+        this.anyTableSubscriptions.add(sub);
+        continue;
+      }
+      const index = this.tableIndex(dep.table);
+      index.all.add(sub);
+      const ids = rowIdsOf(dep);
+      sub.filed.push({ table: dep.table, ids });
+      if (ids === null) {
+        index.wide.add(sub);
+        continue;
+      }
+      for (const id of ids) {
+        let set = index.byId.get(id);
+        if (!set) {
+          set = new Set();
+          index.byId.set(id, set);
+        }
+        set.add(sub);
+      }
+    }
+  }
+
+  private dropSubscription(sub: Subscription): void {
+    this.subscriptions.delete(sub.id);
+    this.unindexSubscription(sub);
+  }
+
+  private unindexSubscription(sub: Subscription): void {
+    this.anyTableSubscriptions.delete(sub);
+    this.runningSubscriptions.delete(sub);
+    for (const { table, ids } of sub.filed) {
+      const index = this.subscriptionIndex.get(table);
+      if (!index) continue;
+      index.all.delete(sub);
+      if (ids === null) index.wide.delete(sub);
+      for (const id of ids ?? []) {
+        const set = index.byId.get(id);
+        if (set?.delete(sub) && set.size === 0) index.byId.delete(id);
+      }
+      if (index.all.size === 0) this.subscriptionIndex.delete(table);
+    }
+    sub.filed = [];
+  }
+
+  private tableIndex(table: string): TableIndex {
+    let index = this.subscriptionIndex.get(table);
+    if (!index) {
+      index = { wide: new Set(), byId: new Map(), all: new Set() };
+      this.subscriptionIndex.set(table, index);
+    }
+    return index;
+  }
+
+  /**
+   * The subscriptions a pass judges: every one when any table may
+   * have changed; else those with a run open (their dependencies are
+   * still being recorded), those depending on any table, and on each
+   * changed table, every one when a write there names no row or the
+   * change is unattributed, else those filed wide and those filed
+   * under the rows written.
+   */
+  private candidates(
+    everything: boolean,
+    changed: Set<string>,
+    unattributed: Set<string>,
+    writesByTable: Map<string, WriteDependency[]> | undefined,
+  ): Set<Subscription> {
+    if (everything) return new Set(this.subscriptions.values());
+    const found = new Set<Subscription>(this.runningSubscriptions);
+    for (const sub of this.anyTableSubscriptions) found.add(sub);
+    for (const table of changed) {
+      const index = this.subscriptionIndex.get(table);
+      if (!index) continue;
+      const writes = writesByTable?.get(table);
+      const rowsKnown =
+        !unattributed.has(table) &&
+        writes !== undefined &&
+        writes.length > 0 &&
+        writes.every(
+          (write) => !write.raw && typeof write.values?._id === "string",
+        );
+      if (!rowsKnown) {
+        for (const sub of index.all) found.add(sub);
+        continue;
+      }
+      for (const sub of index.wide) found.add(sub);
+      for (const write of writes) {
+        const set = index.byId.get(write.values!._id as string);
+        if (set) for (const sub of set) found.add(sub);
+      }
+    }
+    return found;
+  }
+
+  /**
    * One run of the query `subs` share (one group: a query, its args,
    * its caller), repeated until no write that affects it commits
    * while it is open. Each member's dependencies are the run's as it
@@ -1383,7 +1532,10 @@ export class Vex<A = unknown> {
       args: first.args,
       access: reg.def.access,
     };
-    for (const sub of subs) sub.running = true;
+    for (const sub of subs) {
+      sub.running = true;
+      this.runningSubscriptions.add(sub);
+    }
     try {
       if (this.evaluation && first.offThread) {
         return await this.runSubscriptionsOffThread(subs, this.evaluation);
@@ -1407,7 +1559,11 @@ export class Vex<A = unknown> {
       } while (subs.some((sub) => sub.stale));
       return { result, measurement: this.measureReactiveResult(result) };
     } finally {
-      for (const sub of subs) sub.running = false;
+      for (const sub of subs) {
+        sub.running = false;
+        this.runningSubscriptions.delete(sub);
+        if (this.subscriptions.has(sub.id)) this.indexSubscription(sub);
+      }
     }
   }
 
@@ -1543,7 +1699,13 @@ export class Vex<A = unknown> {
       ectx,
       async (_invEctx, meta) => {
         const groups = new Map<string, Subscription[]>();
-        for (const sub of this.subscriptions.values()) {
+        const judged = this.candidates(
+          everything,
+          changedSet,
+          unattributed,
+          writesByTable,
+        );
+        for (const sub of judged) {
           // A running subscription's dependencies are its open run's
           // so far, each recorded before its read runs: a read they
           // rule out could not have seen the write, and a read not yet
@@ -1573,6 +1735,7 @@ export class Vex<A = unknown> {
 
         meta.changedTables = [...changedSet];
         meta.commits = commits;
+        meta.judged = judged.size;
         meta.affectedGroups = groups.size;
         if (this.evaluation) {
           meta.offThread = [...groups.values()].filter(
@@ -1598,7 +1761,7 @@ export class Vex<A = unknown> {
             if (!reg) return;
             const budget = this.resolveReactive(reg.def);
             if (budget === false) {
-              for (const sub of subs) this.subscriptions.delete(sub.id);
+              for (const sub of subs) this.dropSubscription(sub);
               meta.disabledSubscriptions =
                 (meta.disabledSubscriptions ?? 0) + subs.length;
               return;
@@ -1617,7 +1780,7 @@ export class Vex<A = unknown> {
               meta.resultRows = measurement.resultRows;
               meta.resultBytes = measurement.resultBytes;
               meta.budget = budget;
-              for (const sub of subs) this.subscriptions.delete(sub.id);
+              for (const sub of subs) this.dropSubscription(sub);
               return;
             }
             for (const sub of subs) {
@@ -1782,6 +1945,7 @@ export class Vex<A = unknown> {
         running: false,
         stale: false,
         offThread: this.evaluation !== null && transferable(user),
+        filed: [],
       };
       this.subscriptions.set(subId, sub);
       try {
@@ -1806,7 +1970,7 @@ export class Vex<A = unknown> {
         sub.lastHash = measurement.hash;
         deliverSubscriptionResult(callback, result, measurement.serialized);
       } catch (err) {
-        this.subscriptions.delete(subId);
+        this.dropSubscription(sub);
         throw err;
       }
       if (recording) {
@@ -1818,7 +1982,7 @@ export class Vex<A = unknown> {
       }
 
       return () => {
-        this.subscriptions.delete(subId);
+        this.dropSubscription(sub);
         this.trace("unsubscribe", name, null, (_ectx, umeta) => {
           umeta.subId = subId;
           umeta.totalSubs = this.subscriptions.size;
@@ -2048,6 +2212,9 @@ export class Vex<A = unknown> {
     await Promise.allSettled([...this.jobChanges.values()]);
     await Promise.allSettled([...this.runningJobs.values()]);
     this.subscriptions.clear();
+    this.subscriptionIndex.clear();
+    this.anyTableSubscriptions.clear();
+    this.runningSubscriptions.clear();
     this.evaluation?.close();
     await this.storage.close();
   }
