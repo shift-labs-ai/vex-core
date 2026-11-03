@@ -192,12 +192,13 @@ export interface QueryContext {
     table(name: string): QueryBuilder;
     sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
     /**
-     * A raw read held to the rows `over` names: of each table there,
-     * the statement reads no row outside its filters (an AND of them),
-     * so a write to other rows does not re-run a subscription that
-     * made it. Every other table it reads it depends on whole, as
-     * `sql` does. The handler vouches for the filters: a statement
-     * reading past them leaves its subscription stale.
+     * A raw read held to the rows `over` names: inside the statement,
+     * each table there is the rows its filters match (an AND of
+     * them) and nothing else, so a write to other rows does not
+     * re-run a subscription that made it. Every other table it reads
+     * it depends on whole, as `sql` does. The hold is the engine's,
+     * not the handler's word: a statement cannot read past it. One
+     * naming a held table under its schema (`main.t`) is refused.
      */
     sqlOver<T = Record<string, any>>(
       over: Record<string, Filter[]>,

@@ -15,6 +15,7 @@ import {
   transferable,
   workersAvailable,
 } from "./evaluation.js";
+import { holdStatement } from "./held-read.js";
 import { id as generateId } from "./id.js";
 import { INTERNAL_TABLES } from "./internal.js";
 import { equalityKey, sqlBound, writeMayAffect } from "./invalidation.js";
@@ -984,9 +985,9 @@ export class Vex<A = unknown> {
       return prepared;
     }
     // A raw read depends on every table it reads, any of whose changes
-    // re-runs it, but for a table it is held to rows of (`over`), whose
-    // filters narrow it like a builder read's; one that reads no
-    // table, on any change at all.
+    // re-runs it, but for a table it is held to rows of (`over`,
+    // `holdStatement`), whose filters narrow it like a builder read's;
+    // one that reads no table, on any change at all.
     function trackRaw(
       tables: readonly string[],
       over?: Record<string, Filter[]>,
@@ -1000,12 +1001,14 @@ export class Vex<A = unknown> {
       if (tables.length === 0)
         dependencies?.push({ table: ANY_TABLE, raw: true });
     }
-    // A raw read as the caller, refused over a governed table.
+    // A raw read as the caller, refused over a governed table; held
+    // to the rows `over` names, when given, by the statement itself.
     function rawRead<T>(
       sql: string,
       params: any[],
       over?: Record<string, Filter[]>,
     ): Promise<T[]> {
+      const held = over ? holdStatement(sql, over, params) : { sql, params };
       const read = (tables: string[]): Promise<T[]> => {
         const governed = tables.filter((table) =>
           self.accessPolicies.has(table),
@@ -1014,10 +1017,10 @@ export class Vex<A = unknown> {
           return Promise.reject(governedRawSqlError(governed));
         }
         trackRaw(tables, over);
-        return self.storage.rawQuery<T>(sql, ...params);
+        return self.storage.rawQuery<T>(held.sql, ...held.params);
       };
       // Known tables are answered at once, without a microtask hop.
-      const tables = self.rawReadTables(sql);
+      const tables = self.rawReadTables(held.sql);
       return Array.isArray(tables) ? read(tables) : tables.then(read);
     }
     ctx = {
