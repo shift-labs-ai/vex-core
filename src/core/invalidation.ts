@@ -75,11 +75,13 @@ export function writeMayAffect(
 }
 
 /**
- * A value as the database holds it, before any column affinity: what
- * an update compares to tell a column it changes from one it leaves.
+ * Whether a column of `type` holds the same under `a` as under `b`:
+ * what an update compares to tell a column it changes from one it
+ * leaves. Certain equality only: a doubt counts as a change.
  */
-export function sqlBound(v: unknown): string | number | null {
-  return bound(v, "unknown");
+export function sameValue(a: unknown, b: unknown, type?: ColumnType): boolean {
+  const affinity = affinityOf(type);
+  return certainlyEqual(bound(a, affinity), bound(b, affinity), affinity);
 }
 
 /**

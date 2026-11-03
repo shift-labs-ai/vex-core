@@ -81,6 +81,42 @@ function plugin(api: VexPluginAPI) {
         "SELECT COUNT(*) AS n FROM main.messages",
       ),
   });
+  // Held to a session's rows and to two columns of them.
+  api.registerQuery("texts", {
+    args: { sessionId: "string" },
+    handler: (ctx, args) =>
+      ctx.db.sqlOver(
+        {
+          messages: {
+            where: [
+              { column: "sessionId", operator: "=", value: args.sessionId },
+            ],
+            reads: ["text"],
+          },
+        },
+        "SELECT text FROM messages ORDER BY text",
+      ),
+  });
+  api.registerQuery("pastColumns", {
+    args: { sessionId: "string" },
+    handler: (ctx, args) =>
+      ctx.db.sqlOver(
+        {
+          messages: {
+            where: [
+              { column: "sessionId", operator: "=", value: args.sessionId },
+            ],
+            reads: ["text"],
+          },
+        },
+        "SELECT at FROM messages",
+      ),
+  });
+  api.registerMutation("retime", {
+    args: { id: "string", at: "number" },
+    handler: (ctx, args) =>
+      ctx.db.table("messages").update(args.id, { at: args.at }),
+  });
   api.registerQuery("twoTables", {
     args: { sessionId: "string" },
     handler: (ctx, args) =>
@@ -206,6 +242,30 @@ describe("a raw read held to rows", () => {
     await expect(vex.unsafeSql(own.sql, ...own.params)).rejects.toThrow(
       "duplicate WITH table name",
     );
+  });
+
+  test("a hold on columns: the statement sees those alone, and a write to others is skipped", async () => {
+    const vex = await create();
+    expect(await vex.query("h.texts", { sessionId: "a" })).toEqual([
+      { text: "a1" },
+      { text: "a2" },
+    ]);
+    await expect(
+      vex.query("h.pastColumns", { sessionId: "a" }),
+    ).rejects.toThrow("no such column: at");
+    let runs = 0;
+    await vex.subscribe("h.texts", { sessionId: "a" }, () => {
+      runs++;
+    });
+    const ids = (await vex.unsafeSql(
+      "SELECT _id FROM messages WHERE sessionId = 'a'",
+    )) as Array<{
+      _id: string;
+    }>;
+    await vex.mutate("h.retime", { id: ids[0]._id, at: 99 });
+    expect(runs).toBe(1);
+    await vex.mutate("h.say", { sessionId: "a", text: "a0", at: 100 });
+    expect(runs).toBe(2);
   });
 
   test("only a read is held", () => {

@@ -1,17 +1,18 @@
 import { leadingSqlKeyword, sqlAfterLeadingComments } from "./sql-text.js";
 import { buildWhereClause, quoteIdent } from "./sql-where.js";
-import type { Filter } from "./types.js";
+import type { Hold } from "./types.js";
 
 /**
  * A raw read held to rows: the statement rewritten so that, inside
  * it, each table named in `over` is the rows its filters match and
- * nothing else. A common table expression of the table's own name,
- * selecting from the base table under its schema (`main`) with the
- * filters as its WHERE, shadows the table for the statement; it is
- * not materialized, so each reference keeps the base table's indexes.
+ * nothing else, and only the columns its `reads` name when given. A
+ * common table expression of the table's own name, selecting from
+ * the base table under its schema (`main`) with the filters as its
+ * WHERE, shadows the table for the statement; it is not
+ * materialized, so each reference keeps the base table's indexes.
  *
  *   WITH "messages" AS NOT MATERIALIZED
- *     (SELECT * FROM main."messages" WHERE "sessionId" IN (?, ?))
+ *     (SELECT "_id", "text" FROM main."messages" WHERE "sessionId" IN (?, ?))
  *   <the statement>
  *
  * The declaration is thus enforced, never trusted: a statement cannot
@@ -22,7 +23,7 @@ import type { Filter } from "./types.js";
  */
 export function holdStatement(
   sql: string,
-  over: Record<string, Filter[]>,
+  over: Record<string, Hold>,
   params: any[],
 ): { sql: string; params: any[] } {
   const statement = sqlAfterLeadingComments(sql);
@@ -32,15 +33,22 @@ export function holdStatement(
   }
   const expressions: string[] = [];
   const bound: any[] = [];
-  for (const [table, filters] of Object.entries(over)) {
+  for (const [table, hold] of Object.entries(over)) {
     if (qualified(table).test(statement)) {
       throw new Error(
         `sqlOver cannot hold ${JSON.stringify(table)}: the statement names it under its schema`,
       );
     }
+    const { where: filters, reads } = Array.isArray(hold)
+      ? { where: hold, reads: null }
+      : hold;
     const where = buildWhereClause(filters);
+    // The row id rides along: what a result is told apart by.
+    const columns = reads
+      ? [...new Set(["_id", ...reads])].map(quoteIdent).join(", ")
+      : "*";
     expressions.push(
-      `${quoteIdent(table)} AS NOT MATERIALIZED (SELECT * FROM main.${quoteIdent(table)} ${where.sql})`,
+      `${quoteIdent(table)} AS NOT MATERIALIZED (SELECT ${columns} FROM main.${quoteIdent(table)} ${where.sql})`,
     );
     bound.push(...where.params);
   }

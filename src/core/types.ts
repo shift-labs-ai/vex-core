@@ -187,6 +187,13 @@ export interface PublishedTable {
   columns: Record<string, DescribedColumn>;
 }
 
+/**
+ * How a raw read is held to a table (`QueryContext.db.sqlOver`): the
+ * rows its filters match, and, when `reads` is given, those columns
+ * of them alone.
+ */
+export type Hold = Filter[] | { where: Filter[]; reads: string[] };
+
 export interface QueryContext {
   db: {
     table(name: string): QueryBuilder;
@@ -194,14 +201,16 @@ export interface QueryContext {
     /**
      * A raw read held to the rows `over` names: inside the statement,
      * each table there is the rows its filters match (an AND of
-     * them) and nothing else, so a write to other rows does not
-     * re-run a subscription that made it. Every other table it reads
-     * it depends on whole, as `sql` does. The hold is the engine's,
-     * not the handler's word: a statement cannot read past it. One
-     * naming a held table under its schema (`main.t`) is refused.
+     * them) and nothing else, and only the columns `reads` names
+     * when given, so a write to other rows, or to other columns of
+     * them, does not re-run a subscription that made it. Every other
+     * table it reads it depends on whole, as `sql` does. The hold is
+     * the engine's, not the handler's word: a statement cannot read
+     * past it. One naming a held table under its schema (`main.t`)
+     * is refused.
      */
     sqlOver<T = Record<string, any>>(
-      over: Record<string, Filter[]>,
+      over: Record<string, Hold>,
       sql: string,
       ...params: any[]
     ): Promise<T[]>;

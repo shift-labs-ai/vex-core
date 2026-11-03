@@ -18,7 +18,7 @@ import {
 import { holdStatement } from "./held-read.js";
 import { id as generateId } from "./id.js";
 import { INTERNAL_TABLES } from "./internal.js";
-import { equalityKey, sqlBound, writeMayAffect } from "./invalidation.js";
+import { equalityKey, sameValue, writeMayAffect } from "./invalidation.js";
 import { hashResult, utf8ByteLength } from "./result-measure.js";
 import { statementKind, tablesRead, type ViewDefinition } from "./sql-text.js";
 import { ANY_TABLE, type StorageAdapter } from "./storage.js";
@@ -36,7 +36,7 @@ import type {
   CallContext,
   ColumnType,
   DescribedColumn,
-  Filter,
+  Hold,
   JobDef,
   MiddlewareFn,
   MiddlewareInfo,
@@ -990,13 +990,19 @@ export class Vex<A = unknown> {
     // one that reads no table, on any change at all.
     function trackRaw(
       tables: readonly string[],
-      over?: Record<string, Filter[]>,
+      over?: Record<string, Hold>,
     ): void {
       if (!touchedTables && !dependencies) return;
       for (const table of tables) {
         touchedTables?.add(table);
-        const filters = over?.[table];
-        dependencies?.push(filters ? { table, filters } : { table, raw: true });
+        const hold = over?.[table];
+        dependencies?.push(
+          hold === undefined
+            ? { table, raw: true }
+            : Array.isArray(hold)
+              ? { table, filters: hold }
+              : { table, filters: hold.where, reads: hold.reads },
+        );
       }
       if (tables.length === 0)
         dependencies?.push({ table: ANY_TABLE, raw: true });
@@ -1006,7 +1012,7 @@ export class Vex<A = unknown> {
     function rawRead<T>(
       sql: string,
       params: any[],
-      over?: Record<string, Filter[]>,
+      over?: Record<string, Hold>,
     ): Promise<T[]> {
       const held = over ? holdStatement(sql, over, params) : { sql, params };
       const read = (tables: string[]): Promise<T[]> => {
@@ -1035,7 +1041,7 @@ export class Vex<A = unknown> {
         sql: <T = Record<string, any>>(sql: string, ...params: any[]) =>
           rawRead<T>(sql, params),
         sqlOver: <T = Record<string, any>>(
-          over: Record<string, Filter[]>,
+          over: Record<string, Hold>,
           sql: string,
           ...params: any[]
         ) => rawRead<T>(sql, params, over),
@@ -1265,8 +1271,10 @@ export class Vex<A = unknown> {
           ): WriteDependency => {
             const columns = Object.keys(data);
             if (!row) return { table: name, values: { _id: id }, columns };
+            const types = self.columnTypes(name);
             const changed = columns.filter(
-              (column) => sqlBound(data[column]) !== sqlBound(row[column]),
+              (column) =>
+                !sameValue(data[column], row[column], types?.[column]),
             );
             const values: Record<string, unknown> = {};
             const before: Record<string, unknown> = {};

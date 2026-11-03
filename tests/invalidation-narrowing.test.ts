@@ -632,6 +632,22 @@ describe("invalidation narrowing (SHFT-2537)", () => {
     expect(pass().judged).toBe(3);
   });
 
+  test("an update writing a value's affinity twin changes nothing", async () => {
+    const vex = await create();
+    const id = await vex.mutate("s.open", {
+      title: "a",
+      platform: "web",
+      n: 5,
+    });
+    await watch(vex, "all");
+    const all = ran("all");
+    // `"5"` in a number column is 5: the row is as it was.
+    await vex.mutate("s.touch", { table: "sessions", id, data: { n: "5" } });
+    expect(ran("all")).toBe(all);
+    await vex.mutate("s.touch", { table: "sessions", id, data: { n: "5.5" } });
+    expect(ran("all")).toBe(all + 1);
+  });
+
   test("SQL affinity, not ===, decides a miss: NULL spellings and numeric text", async () => {
     const vex = await create();
     await watch(vex, "small"); // n < 10

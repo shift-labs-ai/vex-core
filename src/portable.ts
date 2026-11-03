@@ -61,6 +61,7 @@ export type {
   DescribedColumn,
   Filter,
   GroupByBuilder,
+  Hold,
   JobDef,
   MiddlewareFn,
   MiddlewareInfo,
