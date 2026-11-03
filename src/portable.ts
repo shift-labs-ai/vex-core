@@ -21,6 +21,10 @@ export type { PluginFunction, VexPluginAPI } from "./core/api.js";
 export { createPluginAPI, resolvePlugin } from "./core/api.js";
 export type { OperationDescription, VexOptions } from "./core/engine.js";
 export { Vex } from "./core/engine.js";
+export type {
+  EvaluationOptions,
+  EvaluationSetup,
+} from "./core/evaluation.js";
 export { id } from "./core/id.js";
 // Rate limiting
 export type {

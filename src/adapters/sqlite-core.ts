@@ -169,7 +169,10 @@ function validateTableName(name: string): void {
 
 // SQLite matches table names case-insensitively; this returns the stored
 // spelling of the table a name refers to.
-function existingTableName(db: SqliteDriver, name: string): string | undefined {
+export function existingTableName(
+  db: SqliteDriver,
+  name: string,
+): string | undefined {
   const row = db
     .prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(?) LIMIT 1",

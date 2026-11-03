@@ -7,6 +7,14 @@ import {
 } from "./access.js";
 import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
+import {
+  type Evaluation,
+  type EvaluationOptions,
+  EvaluationPool,
+  type EvaluationRequest,
+  transferable,
+  workersAvailable,
+} from "./evaluation.js";
 import { id as generateId } from "./id.js";
 import { INTERNAL_TABLES } from "./internal.js";
 import { sqlBound, writeMayAffect } from "./invalidation.js";
@@ -95,6 +103,9 @@ interface Subscription {
    */
   running: boolean;
   stale: boolean;
+  /** Its runs go to the evaluation pool: there is one, and its caller
+   *  can cross to a worker. */
+  offThread: boolean;
 }
 
 function subscriptionGroupKey(subscription: Subscription): string {
@@ -223,6 +234,13 @@ export interface VexOptions<A = undefined> {
    * starts no timers.
    */
   jobScheduler?: "timers" | "external";
+  /**
+   * Evaluate subscriptions off the main thread, in workers each running
+   * a read-only engine over the same database (`EvaluationOptions`).
+   * Where the runtime has no workers, or for a caller that cannot
+   * cross to one, evaluation stays on the main thread.
+   */
+  evaluation?: EvaluationOptions;
 }
 
 /**
@@ -258,6 +276,7 @@ export class Vex<A = unknown> {
   // The invalidation pass the commits of this turn of the event loop
   // share (`invalidateAfter`).
   private pendingInvalidation: PendingInvalidation | null = null;
+  private evaluation: EvaluationPool | null = null;
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
   private appId: string = "unknown";
@@ -345,6 +364,25 @@ export class Vex<A = unknown> {
     for (const plugin of plugins) {
       vex.plugins.push(plugin);
       await vex.registerPlugin(plugin);
+    }
+
+    // After every table is ensured: a worker's read-only engine
+    // registers the tables it finds, and refuses one it does not.
+    if (
+      options.evaluation &&
+      options.evaluation.workers > 0 &&
+      workersAvailable()
+    ) {
+      vex.evaluation = new EvaluationPool(
+        new URL("./evaluation-worker.js", import.meta.url),
+        options.evaluation.workers,
+        {
+          module: String(options.evaluation.module),
+          setup: options.evaluation.setup,
+          handlerTimeoutMs: vex.handlerTimeoutMs,
+          reactive: vex.reactiveDefaults,
+        },
+      );
     }
 
     return vex;
@@ -1325,6 +1363,9 @@ export class Vex<A = unknown> {
     };
     for (const sub of subs) sub.running = true;
     try {
+      if (this.evaluation && first.offThread) {
+        return await this.runSubscriptionsOffThread(subs, this.evaluation);
+      }
       let result: unknown;
       do {
         const tables = new Set<string>();
@@ -1346,6 +1387,75 @@ export class Vex<A = unknown> {
     } finally {
       for (const sub of subs) sub.running = false;
     }
+  }
+
+  /**
+   * `runSubscriptions` in a worker. What the run reads is known only
+   * when it answers, so meanwhile the members are judged by their
+   * last run's dependencies, the same query's for the same caller
+   * (a write those rule out cannot reach this run either), or by any
+   * write at all before a first run.
+   */
+  private async runSubscriptionsOffThread(
+    subs: Subscription[],
+    pool: EvaluationPool,
+  ): Promise<{ result: unknown; measurement: ReactiveMeasurement }> {
+    const first = subs[0];
+    const request: EvaluationRequest = {
+      name: first.queryName,
+      args: first.args,
+      user: first.user,
+    };
+    let evaluation: Evaluation;
+    do {
+      const dependencies =
+        first.dependencies.length > 0
+          ? first.dependencies
+          : [{ table: ANY_TABLE, raw: true }];
+      for (const sub of subs) {
+        sub.stale = false;
+        sub.dependencies = dependencies;
+      }
+      evaluation = await pool.run(request);
+      const tables = new Set(evaluation.tables);
+      for (const sub of subs) {
+        sub.tables = tables;
+        sub.dependencies = evaluation.dependencies;
+      }
+    } while (subs.some((sub) => sub.stale));
+    return { result: evaluation.result, measurement: evaluation };
+  }
+
+  /**
+   * @internal A subscription's query run here for another engine's
+   * subscription (`EvaluationPool`): its result, measured, and what
+   * it read.
+   */
+  async evaluate(request: EvaluationRequest): Promise<Evaluation> {
+    const reg = this.queries.get(request.name);
+    if (!reg) throw new Error(`Query not found: ${request.name}`);
+    const tables = new Set<string>();
+    const dependencies: QueryDependency[] = [];
+    const ctx = this.buildQueryContext(tables, request.user, dependencies);
+    const result = await this.trace("evaluate", request.name, null, (ectx) =>
+      this.runMiddleware(
+        ctx,
+        {
+          type: "query",
+          name: request.name,
+          args: request.args,
+          access: reg.def.access,
+        },
+        () => reg.def.handler(ctx, request.args),
+        ectx,
+      ),
+    );
+    return {
+      result,
+      ...this.measureReactiveResult(result),
+      tables: [...tables],
+      dependencies,
+    };
   }
 
   /**
@@ -1394,6 +1504,8 @@ export class Vex<A = unknown> {
     writes?: WriteDependency[],
     commits = 1,
   ): Promise<void> {
+    // A pass that begins after close() has no subscription to serve.
+    if (this.closing) return;
     const changes = this.storage.takeChanges();
     if (changes.tables.length === 0) return;
 
@@ -1440,26 +1552,34 @@ export class Vex<A = unknown> {
         meta.changedTables = [...changedSet];
         meta.commits = commits;
         meta.affectedGroups = groups.size;
+        if (this.evaluation) {
+          meta.offThread = [...groups.values()].filter(
+            (subs) => subs[0].offThread,
+          ).length;
+        }
         meta.activeSubs = this.subscriptions.size;
         meta.reEvaluated = [...groups.values()].map((s) => s[0].queryName);
 
-        for (const [, subs] of groups) {
+        // Groups run together: each is one query for one caller, with
+        // nothing shared but the pool that bounds how many evaluate at
+        // once off the main thread.
+        const reEvaluate = async (subs: Subscription[]) => {
           const first = subs[0];
           // Another invalidation, since this one chose its groups, may
           // have opened a run of this one: that run repeats instead.
           if (subs.some((sub) => sub.running)) {
             for (const sub of subs) sub.stale = true;
-            continue;
+            return;
           }
           try {
             const reg = this.queries.get(first.queryName);
-            if (!reg) continue;
+            if (!reg) return;
             const budget = this.resolveReactive(reg.def);
             if (budget === false) {
               for (const sub of subs) this.subscriptions.delete(sub.id);
               meta.disabledSubscriptions =
                 (meta.disabledSubscriptions ?? 0) + subs.length;
-              continue;
+              return;
             }
             const { result, measurement } = await this.runSubscriptions(
               subs,
@@ -1476,7 +1596,7 @@ export class Vex<A = unknown> {
               meta.resultBytes = measurement.resultBytes;
               meta.budget = budget;
               for (const sub of subs) this.subscriptions.delete(sub.id);
-              continue;
+              return;
             }
             for (const sub of subs) {
               // Unsubscribed, or the engine closed, while the run was
@@ -1501,7 +1621,8 @@ export class Vex<A = unknown> {
           } catch (err) {
             console.error(`[vex] subscription ${first.queryName} failed:`, err);
           }
-        }
+        };
+        await Promise.all([...groups.values()].map(reEvaluate));
       },
     );
   }
@@ -1638,6 +1759,7 @@ export class Vex<A = unknown> {
         user,
         running: false,
         stale: false,
+        offThread: this.evaluation !== null && transferable(user),
       };
       this.subscriptions.set(subId, sub);
       try {
@@ -1667,6 +1789,7 @@ export class Vex<A = unknown> {
       }
       if (recording) {
         meta.subId = subId;
+        if (this.evaluation) meta.offThread = sub.offThread;
         meta.tables = [...sub.tables];
         meta.dependencies = describeQueryDependencies(sub.dependencies);
         meta.totalSubs = this.subscriptions.size;
@@ -1903,6 +2026,7 @@ export class Vex<A = unknown> {
     await Promise.allSettled([...this.jobChanges.values()]);
     await Promise.allSettled([...this.runningJobs.values()]);
     this.subscriptions.clear();
+    this.evaluation?.close();
     await this.storage.close();
   }
 }
