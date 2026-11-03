@@ -51,6 +51,7 @@
     "bench:invalidation": "bun benchmarks/invalidation.ts",
     "bench:compare": "bun benchmarks/compare.ts",
     "bench:scale": "bun benchmarks/scale.ts",
+    "bench:mmo": "bun benchmarks/mmo.ts",
     "format": "bunx biome format --write src/",
     "lint": "bunx biome lint src/",
     "check": "bunx biome check src/",

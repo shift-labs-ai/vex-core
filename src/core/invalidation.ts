@@ -83,6 +83,20 @@ export function sqlBound(v: unknown): string | number | null {
 }
 
 /**
+ * The key two values share when SQL `=` may hold between them under
+ * any affinity: numbers and numeric text under the number they name,
+ * other text under itself, NULL under its own. Over-inclusive where
+ * the column's affinity would keep `'5.0'` and `5` apart, never
+ * exclusive where it would not.
+ */
+export function equalityKey(v: unknown): string {
+  const value = bound(v, "unknown");
+  if (value === null) return "null";
+  if (typeof value === "number") return `n:${value}`;
+  return numeric(value) ? `n:${Number(value)}` : `s:${value}`;
+}
+
+/**
  * Whether a row holding `value` in the filter's column is certainly
  * outside the filter. False means "may match": this never claims a
  * miss it cannot prove, so a doubt re-runs the subscription rather

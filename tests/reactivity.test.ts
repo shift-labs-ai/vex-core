@@ -871,8 +871,9 @@ describe("reactive subscription bedrock", () => {
       { userId: "u1", rows: 0 },
       { userId: "u1", rows: 1 },
     ]);
+    // The second subscriber joins the first's group and hears its
+    // answer: one run serves both, before and after the write.
     expect(seen).toEqual([
-      "query:rx.viewer:u1",
       "query:rx.viewer:u1",
       "mutation:rx.add:none",
       "query:rx.viewer:u1",

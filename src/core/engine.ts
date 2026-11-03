@@ -17,7 +17,7 @@ import {
 } from "./evaluation.js";
 import { id as generateId } from "./id.js";
 import { INTERNAL_TABLES } from "./internal.js";
-import { sqlBound, writeMayAffect } from "./invalidation.js";
+import { equalityKey, sqlBound, writeMayAffect } from "./invalidation.js";
 import { hashResult, utf8ByteLength } from "./result-measure.js";
 import { statementKind, tablesRead, type ViewDefinition } from "./sql-text.js";
 import { ANY_TABLE, type StorageAdapter } from "./storage.js";
@@ -86,34 +86,57 @@ function deliverSubscriptionResult(
 // contain arbitrarily large files, imports, prompts, messages, or
 // credentials, so they are never captured here by default.
 
-interface Subscription {
-  id: string;
+/**
+ * One query, with one set of args, for one caller, held live: what a
+ * run computes once for every subscriber holding it. The group is
+ * what a pass judges, what the index files, and what runs; its
+ * members hear the result, each against what it last heard.
+ */
+interface SubscriptionGroup {
+  key: string;
   queryName: string;
   args: Record<string, any>;
-  argsKey: string;
-  userKey: string;
-  callback: SubscriptionCallback;
-  lastHash: number;
+  user?: VexUser | null;
+  members: Set<Subscription>;
   tables: Set<string>;
   dependencies: QueryDependency[];
-  user?: VexUser | null;
+  /** Its last run's answer, measured, which a member joining hears
+   *  at once, as serialized. */
+  last: ReactiveMeasurement | null;
   /**
-   * While a run of its query is open (`runSubscriptions`): an
-   * invalidation that affects it marks it `stale` for that run to
-   * repeat, rather than opening another.
+   * While a run is open (`runGroup`): an invalidation that affects
+   * the group marks it `stale` for that run to repeat, rather than
+   * opening another; `run` is that run, for a joiner to await.
    */
-  running: boolean;
+  run: Promise<{ result: unknown; measurement: ReactiveMeasurement }> | null;
   stale: boolean;
   /** Its runs go to the evaluation pool: there is one, and its caller
    *  can cross to a worker. */
   offThread: boolean;
-  /** Where it is filed (`indexSubscription`): each table, and the row
-   *  ids under it, or null for wide. */
-  filed: Array<{ table: string; ids: string[] | null }>;
+  /** Filed in the index by its dependencies (`indexGroup`). */
+  filed: boolean;
 }
 
-function subscriptionGroupKey(subscription: Subscription): string {
-  return `${subscription.queryName}\0${subscription.argsKey}\0${subscription.userKey}`;
+interface Subscription {
+  id: string;
+  group: SubscriptionGroup;
+  callback: SubscriptionCallback;
+  lastHash: number;
+}
+
+function groupKey(
+  queryName: string,
+  args: Record<string, any>,
+  user: VexUser | null | undefined,
+): string {
+  return `${queryName}\0${JSON.stringify(args)}\0${subscriptionUserKey(user)}`;
+}
+
+/** A measured result as a joiner hears it: its serialized form, read. */
+function parsed(measurement: ReactiveMeasurement): unknown {
+  return measurement.serialized === undefined
+    ? undefined
+    : JSON.parse(measurement.serialized);
 }
 
 function subscriptionUserKey(user: VexUser | null | undefined): string {
@@ -138,37 +161,134 @@ const columnTypesBySchema = new WeakMap<
 >();
 
 /**
- * Where a subscription is found when a table changes: under each row
- * id a dependency on the table holds it to (`_id =`, `_id IN`), or
- * under `wide` when one dependency on the table names no id. A write
- * carrying its row's id judges the subscriptions under that id and
- * the wide ones; a write without one, every subscription on the table.
+ * Where a group is found when a table changes: by shape (the columns
+ * a dependency holds equal to values, `=` or `IN`), under each
+ * combination of those values' keys; or under `wide` when a
+ * dependency on the table holds no column so. A write that knows a
+ * row's value of every column of a shape judges the groups filed
+ * under that combination (and, for a column it changes, under the
+ * combinations with the value it leaves too) and the wide ones; a
+ * write that does not know one, every group of the shape.
  */
 interface TableIndex {
-  wide: Set<Subscription>;
-  byId: Map<string, Set<Subscription>>;
-  all: Set<Subscription>;
+  wide: Set<SubscriptionGroup>;
+  byShape: Map<string, Shape>;
+  all: Set<SubscriptionGroup>;
+}
+
+/** The groups under one key: one, as it is, or a set from the second. */
+type Slot = SubscriptionGroup | Set<SubscriptionGroup>;
+
+interface Shape {
+  columns: string[];
+  byKeys: Map<string, Slot>;
+}
+
+function slotAdd(
+  byKeys: Map<string, Slot>,
+  key: string,
+  group: SubscriptionGroup,
+) {
+  const slot = byKeys.get(key);
+  if (slot === undefined) byKeys.set(key, group);
+  else if (slot instanceof Set) slot.add(group);
+  else if (slot !== group) byKeys.set(key, new Set([slot, group]));
+}
+
+function slotDelete(
+  byKeys: Map<string, Slot>,
+  key: string,
+  group: SubscriptionGroup,
+) {
+  const slot = byKeys.get(key);
+  if (slot === undefined) return;
+  if (slot instanceof Set) {
+    slot.delete(group);
+    if (slot.size === 1) byKeys.set(key, slot.values().next().value!);
+  } else if (slot === group) byKeys.delete(key);
+}
+
+function slotEach(slot: Slot, into: Set<SubscriptionGroup>) {
+  if (slot instanceof Set) for (const group of slot) into.add(group);
+  else into.add(slot);
 }
 
 /**
- * The row ids a dependency's filters hold it to; null for none, or
- * for one said in anything but strings, which the column's affinity
- * may still match.
+ * The columns a dependency holds equal to values (`=`, `IN`), sorted,
+ * each with the keys of those values; a column held twice keeps the
+ * keys both allow. Empty for a raw read or one holding none so.
  */
-function rowIdsOf(dep: QueryDependency): string[] | null {
-  if (dep.raw) return null;
+function equalitiesOf(dep: QueryDependency): Map<string, Set<string>> {
+  const equalities = new Map<string, Set<string>>();
+  if (dep.raw) return equalities;
   for (const filter of dep.filters ?? []) {
-    if (filter.column !== "_id") continue;
-    const ids =
+    const values =
       filter.operator === "="
         ? [filter.value]
         : filter.operator === "IN" && Array.isArray(filter.value)
           ? filter.value
           : null;
-    if (ids?.every((id) => typeof id === "string")) return ids as string[];
-    return null;
+    if (!values) continue;
+    const keys = new Set(values.map(equalityKey));
+    const held = equalities.get(filter.column);
+    equalities.set(
+      filter.column,
+      held ? new Set([...held].filter((key) => keys.has(key))) : keys,
+    );
   }
-  return null;
+  return new Map([...equalities].sort(([a], [b]) => (a < b ? -1 : 1)));
+}
+
+/** Every combination of one key per column, joined; empty for none. */
+function combinations(keysByColumn: Iterable<Iterable<string>>): string[] {
+  let combos = [""];
+  for (const keys of keysByColumn) {
+    const next: string[] = [];
+    for (const combo of combos) {
+      for (const key of keys) next.push(combo ? `${combo}\0${key}` : key);
+    }
+    combos = next;
+  }
+  return combos;
+}
+
+/**
+ * The keys a write's rows may hold under a shape's columns: one per
+ * column it holds, both the value left and taken for one it changes;
+ * null when it does not know a column.
+ */
+function writeKeys(write: WriteDependency, columns: string[]): string[] | null {
+  const values = write.values ?? {};
+  const keysByColumn: string[][] = [];
+  for (const column of columns) {
+    if (column in values) keysByColumn.push([equalityKey(values[column])]);
+    else if (write.before && column in write.before && write.after) {
+      keysByColumn.push([
+        equalityKey(write.before[column]),
+        equalityKey(write.after[column]),
+      ]);
+    } else return null;
+  }
+  return combinations(keysByColumn);
+}
+
+/** How many value combinations a dependency may file under; past it, wide. */
+const FILING_KEYS = 1000;
+
+/**
+ * Where a dependency files its group: under a shape, the columns it
+ * holds equal to values (sorted, joined), at each combination of
+ * those values' keys; or wide, under no shape, when it holds none so
+ * or the combinations are too many.
+ */
+function filingOf(
+  dep: QueryDependency,
+): { shape: string; keys: string[] } | null {
+  const equalities = equalitiesOf(dep);
+  if (equalities.size === 0) return null;
+  const keys = combinations(equalities.values());
+  if (keys.length > FILING_KEYS) return null;
+  return { shape: [...equalities.keys()].join(","), keys };
 }
 
 function groupWritesByTable(
@@ -297,11 +417,12 @@ export class Vex<A = unknown> {
   private mutations: Map<string, RegisteredMutation> = new Map();
   private actions: Map<string, RegisteredAction> = new Map();
   private subscriptions: Map<string, Subscription> = new Map();
-  // Each subscription by the tables and row ids its last run read
-  // (`indexSubscription`); a run still open is judged whole instead.
-  private subscriptionIndex: Map<string, TableIndex> = new Map();
-  private anyTableSubscriptions: Set<Subscription> = new Set();
-  private runningSubscriptions: Set<Subscription> = new Set();
+  private groups: Map<string, SubscriptionGroup> = new Map();
+  // Each group by the tables and values its last run read
+  // (`indexGroup`); a group with a run open is judged regardless.
+  private groupIndex: Map<string, TableIndex> = new Map();
+  private anyTableGroups: Set<SubscriptionGroup> = new Set();
+  private runningGroups: Set<SubscriptionGroup> = new Set();
   private tables: Set<string> = new Set();
   private middleware: MiddlewareFn<any>[] = [];
   // Row-level access policies by table (core/access.ts). Applied to
@@ -1405,202 +1526,227 @@ export class Vex<A = unknown> {
   }
 
   /**
-   * Files `sub` under the tables and row ids its dependencies name,
-   * replacing where it was filed. A dependency held to ids files it
-   * under each; one naming no id files it wide; one on any table, or
-   * none at all, files it among those judged on every pass.
+   * Files `group` under the tables and values its dependencies name.
+   * A dependency held to values files it under each combination; one
+   * naming none files it wide; one on any table, or none at all,
+   * files it among those judged on every pass. What a group is filed
+   * by is its dependencies, so it is unfiled (`unindexGroup`) before
+   * they change.
    */
-  private indexSubscription(sub: Subscription): void {
-    this.unindexSubscription(sub);
+  private indexGroup(group: SubscriptionGroup): void {
+    this.unindexGroup(group);
+    group.filed = true;
     // Reading no table, it is judged on every pass, as a raw read of
     // no table is: nothing says what it depends on.
-    if (sub.dependencies.length === 0) this.anyTableSubscriptions.add(sub);
-    for (const dep of sub.dependencies) {
+    if (group.dependencies.length === 0) this.anyTableGroups.add(group);
+    for (const dep of group.dependencies) {
       if (dep.table === ANY_TABLE) {
-        this.anyTableSubscriptions.add(sub);
+        this.anyTableGroups.add(group);
         continue;
       }
       const index = this.tableIndex(dep.table);
-      index.all.add(sub);
-      const ids = rowIdsOf(dep);
-      sub.filed.push({ table: dep.table, ids });
-      if (ids === null) {
-        index.wide.add(sub);
+      index.all.add(group);
+      const filing = filingOf(dep);
+      if (filing === null) {
+        index.wide.add(group);
         continue;
       }
-      for (const id of ids) {
-        let set = index.byId.get(id);
-        if (!set) {
-          set = new Set();
-          index.byId.set(id, set);
-        }
-        set.add(sub);
+      let shape = index.byShape.get(filing.shape);
+      if (!shape) {
+        shape = { columns: filing.shape.split(","), byKeys: new Map() };
+        index.byShape.set(filing.shape, shape);
       }
+      for (const key of filing.keys) slotAdd(shape.byKeys, key, group);
     }
   }
 
-  private dropSubscription(sub: Subscription): void {
-    this.subscriptions.delete(sub.id);
-    this.unindexSubscription(sub);
-  }
-
-  private unindexSubscription(sub: Subscription): void {
-    this.anyTableSubscriptions.delete(sub);
-    this.runningSubscriptions.delete(sub);
-    for (const { table, ids } of sub.filed) {
-      const index = this.subscriptionIndex.get(table);
+  /** Unfiles `group` from where its dependencies filed it. */
+  private unindexGroup(group: SubscriptionGroup): void {
+    if (!group.filed) return;
+    group.filed = false;
+    this.anyTableGroups.delete(group);
+    for (const dep of group.dependencies) {
+      const index = this.groupIndex.get(dep.table);
       if (!index) continue;
-      index.all.delete(sub);
-      if (ids === null) index.wide.delete(sub);
-      for (const id of ids ?? []) {
-        const set = index.byId.get(id);
-        if (set?.delete(sub) && set.size === 0) index.byId.delete(id);
+      index.all.delete(group);
+      const filing = filingOf(dep);
+      if (filing === null) {
+        index.wide.delete(group);
+      } else {
+        const shape = index.byShape.get(filing.shape);
+        if (shape) {
+          for (const key of filing.keys) slotDelete(shape.byKeys, key, group);
+          if (shape.byKeys.size === 0) index.byShape.delete(filing.shape);
+        }
       }
-      if (index.all.size === 0) this.subscriptionIndex.delete(table);
+      if (index.all.size === 0) this.groupIndex.delete(dep.table);
     }
-    sub.filed = [];
   }
 
   private tableIndex(table: string): TableIndex {
-    let index = this.subscriptionIndex.get(table);
+    let index = this.groupIndex.get(table);
     if (!index) {
-      index = { wide: new Set(), byId: new Map(), all: new Set() };
-      this.subscriptionIndex.set(table, index);
+      index = { wide: new Set(), byShape: new Map(), all: new Set() };
+      this.groupIndex.set(table, index);
     }
     return index;
   }
 
+  /** A subscription leaves; its group goes with its last member. */
+  private dropSubscription(sub: Subscription): void {
+    this.subscriptions.delete(sub.id);
+    const group = sub.group;
+    group.members.delete(sub);
+    if (group.members.size === 0) {
+      this.groups.delete(group.key);
+      this.runningGroups.delete(group);
+      this.unindexGroup(group);
+    }
+  }
+
   /**
-   * The subscriptions a pass judges: every one when any table may
-   * have changed; else those with a run open (their dependencies are
-   * still being recorded), those depending on any table, and on each
-   * changed table, every one when a write there names no row or the
-   * change is unattributed, else those filed wide and those filed
-   * under the rows written.
+   * The groups a pass judges: every one when any table may have
+   * changed; else those with a run open (their dependencies are still
+   * being recorded), those depending on any table, and on each
+   * changed table, every one when a write there names no rows or the
+   * change is unattributed, else those filed wide and, under each
+   * shape, those under the keys the written rows may hold
+   * (`writeKeys`), or every group of a shape whose columns a write
+   * does not all know.
    */
   private candidates(
     everything: boolean,
     changed: Set<string>,
     unattributed: Set<string>,
     writesByTable: Map<string, WriteDependency[]> | undefined,
-  ): Set<Subscription> {
-    if (everything) return new Set(this.subscriptions.values());
-    const found = new Set<Subscription>(this.runningSubscriptions);
-    for (const sub of this.anyTableSubscriptions) found.add(sub);
+  ): Set<SubscriptionGroup> {
+    if (everything) return new Set(this.groups.values());
+    const found = new Set<SubscriptionGroup>(this.runningGroups);
+    for (const group of this.anyTableGroups) found.add(group);
     for (const table of changed) {
-      const index = this.subscriptionIndex.get(table);
+      const index = this.groupIndex.get(table);
       if (!index) continue;
       const writes = writesByTable?.get(table);
       const rowsKnown =
         !unattributed.has(table) &&
         writes !== undefined &&
         writes.length > 0 &&
-        writes.every(
-          (write) => !write.raw && typeof write.values?._id === "string",
-        );
+        writes.every((write) => !write.raw && write.values !== undefined);
       if (!rowsKnown) {
-        for (const sub of index.all) found.add(sub);
+        for (const group of index.all) found.add(group);
         continue;
       }
-      for (const sub of index.wide) found.add(sub);
-      for (const write of writes) {
-        const set = index.byId.get(write.values!._id as string);
-        if (set) for (const sub of set) found.add(sub);
+      for (const group of index.wide) found.add(group);
+      for (const shape of index.byShape.values()) {
+        for (const write of writes) {
+          const keys = writeKeys(write, shape.columns);
+          if (keys === null) {
+            for (const slot of shape.byKeys.values()) slotEach(slot, found);
+            continue;
+          }
+          for (const key of keys) {
+            const slot = shape.byKeys.get(key);
+            if (slot) slotEach(slot, found);
+          }
+        }
       }
     }
     return found;
   }
 
   /**
-   * One run of the query `subs` share (one group: a query, its args,
-   * its caller), repeated until no write that affects it commits
-   * while it is open. Each member's dependencies are the run's as it
-   * records them, so an invalidation meanwhile judges what the run
-   * has read so far and marks the members stale rather than running
-   * them again; the flag clears before the result is handed back, so
-   * nothing lands unseen between a run and its delivery.
+   * One run of a group's query, repeated until no write that affects
+   * it commits while it is open. The group's dependencies are the
+   * run's as it records them, so an invalidation meanwhile judges
+   * what the run has read so far and marks the group stale rather
+   * than running it again; the run closes before the result is handed
+   * back, so nothing lands unseen between a run and its delivery. A
+   * group already running answers with that run.
    */
-  private async runSubscriptions(
-    subs: Subscription[],
+  private runGroup(
+    group: SubscriptionGroup,
     reg: RegisteredQuery,
     ectx: ExecContext,
   ): Promise<{ result: unknown; measurement: ReactiveMeasurement }> {
-    const first = subs[0];
+    if (group.run) return group.run;
+    // Judged whole while it runs (`runningGroups`), the group leaves
+    // the index before its dependencies change, and returns after.
+    this.unindexGroup(group);
+    this.runningGroups.add(group);
+    const run = (async () => {
+      try {
+        const answer =
+          this.evaluation && group.offThread
+            ? await this.runGroupOffThread(group, this.evaluation)
+            : await this.runGroupHere(group, reg, ectx);
+        group.last = answer.measurement;
+        return answer;
+      } finally {
+        group.run = null;
+        this.runningGroups.delete(group);
+        if (this.groups.get(group.key) === group) this.indexGroup(group);
+      }
+    })();
+    group.run = run;
+    return run;
+  }
+
+  private async runGroupHere(
+    group: SubscriptionGroup,
+    reg: RegisteredQuery,
+    ectx: ExecContext,
+  ): Promise<{ result: unknown; measurement: ReactiveMeasurement }> {
     const info: MiddlewareInfo<any> = {
       type: "query",
-      name: first.queryName,
-      args: first.args,
+      name: group.queryName,
+      args: group.args,
       access: reg.def.access,
     };
-    for (const sub of subs) {
-      sub.running = true;
-      this.runningSubscriptions.add(sub);
-    }
-    try {
-      if (this.evaluation && first.offThread) {
-        return await this.runSubscriptionsOffThread(subs, this.evaluation);
-      }
-      let result: unknown;
-      do {
-        const tables = new Set<string>();
-        const dependencies: QueryDependency[] = [];
-        for (const sub of subs) {
-          sub.stale = false;
-          sub.tables = tables;
-          sub.dependencies = dependencies;
-        }
-        const ctx = this.buildQueryContext(tables, first.user, dependencies);
-        result = await this.runMiddleware(
-          ctx,
-          info,
-          () => reg.def.handler(ctx, first.args),
-          ectx,
-        );
-      } while (subs.some((sub) => sub.stale));
-      return { result, measurement: this.measureReactiveResult(result) };
-    } finally {
-      for (const sub of subs) {
-        sub.running = false;
-        this.runningSubscriptions.delete(sub);
-        if (this.subscriptions.has(sub.id)) this.indexSubscription(sub);
-      }
-    }
+    let result: unknown;
+    do {
+      group.stale = false;
+      group.tables = new Set();
+      group.dependencies = [];
+      const ctx = this.buildQueryContext(
+        group.tables,
+        group.user,
+        group.dependencies,
+      );
+      result = await this.runMiddleware(
+        ctx,
+        info,
+        () => reg.def.handler(ctx, group.args),
+        ectx,
+      );
+    } while (group.stale);
+    return { result, measurement: this.measureReactiveResult(result) };
   }
 
   /**
-   * `runSubscriptions` in a worker. What the run reads is known only
-   * when it answers, so meanwhile the members are judged by their
-   * last run's dependencies, the same query's for the same caller
-   * (a write those rule out cannot reach this run either), or by any
-   * write at all before a first run.
+   * `runGroup` in a worker. What the run reads is known only when it
+   * answers, so meanwhile the group is judged by its last run's
+   * dependencies (a write those rule out cannot reach this run
+   * either), or by any write at all before a first run.
    */
-  private async runSubscriptionsOffThread(
-    subs: Subscription[],
+  private async runGroupOffThread(
+    group: SubscriptionGroup,
     pool: EvaluationPool,
   ): Promise<{ result: unknown; measurement: ReactiveMeasurement }> {
-    const first = subs[0];
     const request: EvaluationRequest = {
-      name: first.queryName,
-      args: first.args,
-      user: first.user,
+      name: group.queryName,
+      args: group.args,
+      user: group.user,
     };
     let evaluation: Evaluation;
     do {
-      const dependencies =
-        first.dependencies.length > 0
-          ? first.dependencies
-          : [{ table: ANY_TABLE, raw: true }];
-      for (const sub of subs) {
-        sub.stale = false;
-        sub.dependencies = dependencies;
+      group.stale = false;
+      if (group.dependencies.length === 0) {
+        group.dependencies = [{ table: ANY_TABLE, raw: true }];
       }
       evaluation = await pool.run(request);
-      const tables = new Set(evaluation.tables);
-      for (const sub of subs) {
-        sub.tables = tables;
-        sub.dependencies = evaluation.dependencies;
-      }
-    } while (subs.some((sub) => sub.stale));
+      group.tables = new Set(evaluation.tables);
+      group.dependencies = evaluation.dependencies;
+    } while (group.stale);
     return { result: evaluation.result, measurement: evaluation };
   }
 
@@ -1645,7 +1791,7 @@ export class Vex<A = unknown> {
    * them. Otherwise it begins at once. The pass is a child of the
    * first commit's span, and every commit that joined it awaits it. A
    * pass already begun is not waited for: its runs repeat for what
-   * lands meanwhile (`runSubscriptions`).
+   * lands meanwhile (`runGroup`).
    */
   private invalidateAfter(
     ectx: ExecContext,
@@ -1698,76 +1844,65 @@ export class Vex<A = unknown> {
       "subscriptions",
       ectx,
       async (_invEctx, meta) => {
-        const groups = new Map<string, Subscription[]>();
         const judged = this.candidates(
           everything,
           changedSet,
           unattributed,
           writesByTable,
         );
-        for (const sub of judged) {
-          // A running subscription's dependencies are its open run's
-          // so far, each recorded before its read runs: a read they
-          // rule out could not have seen the write, and a read not yet
-          // made sees it. Before any, nothing was missed.
-          if (sub.running && sub.dependencies.length === 0) continue;
-          const affected =
-            everything ||
-            this.dependencyAffected(
-              sub.dependencies,
+        const affected: SubscriptionGroup[] = [];
+        for (const group of judged) {
+          // A running group's dependencies are its open run's so far,
+          // each recorded before its read runs: a read they rule out
+          // could not have seen the write, and a read not yet made
+          // sees it. Before any, nothing was missed.
+          if (group.run && group.dependencies.length === 0) continue;
+          if (
+            !everything &&
+            !this.dependencyAffected(
+              group.dependencies,
               changedSet,
               unattributed,
               writesByTable,
-            );
-          if (!affected) continue;
-          if (sub.running) {
-            sub.stale = true;
+            )
+          )
             continue;
-          }
-          const key = subscriptionGroupKey(sub);
-          let group = groups.get(key);
-          if (!group) {
-            group = [];
-            groups.set(key, group);
-          }
-          group.push(sub);
+          if (group.run) group.stale = true;
+          else affected.push(group);
         }
 
         meta.changedTables = [...changedSet];
         meta.commits = commits;
         meta.judged = judged.size;
-        meta.affectedGroups = groups.size;
+        meta.affectedGroups = affected.length;
         if (this.evaluation) {
-          meta.offThread = [...groups.values()].filter(
-            (subs) => subs[0].offThread,
-          ).length;
+          meta.offThread = affected.filter((group) => group.offThread).length;
         }
         meta.activeSubs = this.subscriptions.size;
-        meta.reEvaluated = [...groups.values()].map((s) => s[0].queryName);
+        meta.reEvaluated = affected.map((group) => group.queryName);
 
         // Groups run together: each is one query for one caller, with
         // nothing shared but the pool that bounds how many evaluate at
         // once off the main thread.
-        const reEvaluate = async (subs: Subscription[]) => {
-          const first = subs[0];
+        const reEvaluate = async (group: SubscriptionGroup) => {
           // Another invalidation, since this one chose its groups, may
           // have opened a run of this one: that run repeats instead.
-          if (subs.some((sub) => sub.running)) {
-            for (const sub of subs) sub.stale = true;
+          if (group.run) {
+            group.stale = true;
             return;
           }
           try {
-            const reg = this.queries.get(first.queryName);
+            const reg = this.queries.get(group.queryName);
             if (!reg) return;
             const budget = this.resolveReactive(reg.def);
             if (budget === false) {
-              for (const sub of subs) this.dropSubscription(sub);
               meta.disabledSubscriptions =
-                (meta.disabledSubscriptions ?? 0) + subs.length;
+                (meta.disabledSubscriptions ?? 0) + group.members.size;
+              this.dropGroup(group);
               return;
             }
-            const { result, measurement } = await this.runSubscriptions(
-              subs,
+            const { result, measurement } = await this.runGroup(
+              group,
               reg,
               _invEctx,
             );
@@ -1776,40 +1911,46 @@ export class Vex<A = unknown> {
             } catch {
               meta.budgetExceeded = true;
               meta.disabledSubscriptions =
-                (meta.disabledSubscriptions ?? 0) + subs.length;
+                (meta.disabledSubscriptions ?? 0) + group.members.size;
               meta.resultRows = measurement.resultRows;
               meta.resultBytes = measurement.resultBytes;
               meta.budget = budget;
-              for (const sub of subs) this.dropSubscription(sub);
+              this.dropGroup(group);
               return;
             }
-            for (const sub of subs) {
-              // Unsubscribed, or the engine closed, while the run was
-              // open: it hears nothing more.
-              if (!this.subscriptions.has(sub.id)) continue;
-              if (measurement.hash !== sub.lastHash) {
-                sub.lastHash = measurement.hash;
-                try {
-                  deliverSubscriptionResult(
-                    sub.callback,
-                    result,
-                    measurement.serialized,
-                  );
-                } catch (err) {
-                  console.error(
-                    `[vex] subscription ${sub.queryName} callback failed:`,
-                    err,
-                  );
-                }
-              }
-            }
+            this.deliver(group, result, measurement);
           } catch (err) {
-            console.error(`[vex] subscription ${first.queryName} failed:`, err);
+            console.error(`[vex] subscription ${group.queryName} failed:`, err);
           }
         };
-        await Promise.all([...groups.values()].map(reEvaluate));
+        await Promise.all(affected.map(reEvaluate));
       },
     );
+  }
+
+  /** Hands a run's result to each member that has not heard it. */
+  private deliver(
+    group: SubscriptionGroup,
+    result: unknown,
+    measurement: ReactiveMeasurement,
+  ): void {
+    for (const sub of group.members) {
+      if (measurement.hash === sub.lastHash) continue;
+      sub.lastHash = measurement.hash;
+      try {
+        deliverSubscriptionResult(sub.callback, result, measurement.serialized);
+      } catch (err) {
+        console.error(
+          `[vex] subscription ${group.queryName} callback failed:`,
+          err,
+        );
+      }
+    }
+  }
+
+  /** Every member of `group` leaves. */
+  private dropGroup(group: SubscriptionGroup): void {
+    for (const sub of [...group.members]) this.dropSubscription(sub);
   }
 
   // ─── Public API ───
@@ -1929,34 +2070,40 @@ export class Vex<A = unknown> {
       if (recording) meta.reactive = budget !== false;
       if (budget === false) throw new Error(`Query ${name} is not reactive`);
       if (recording) meta.budget = budget;
-      // Registered before its first run, so a write committing during
-      // the run finds it (`runSubscriptions`).
-      const sub: Subscription = {
-        id: subId,
-        queryName: name,
-        args,
-        argsKey: JSON.stringify(args),
-        userKey: subscriptionUserKey(user),
-        callback,
-        lastHash: 0,
-        tables: new Set(),
-        dependencies: [],
-        user,
-        running: false,
-        stale: false,
-        offThread: this.evaluation !== null && transferable(user),
-        filed: [],
-      };
+      // A member of the group holding this query for this caller,
+      // made and registered before its first run, so a write
+      // committing during the run finds it (`runGroup`). A group with
+      // an answer already hands it over without a run.
+      const key = groupKey(name, args, user);
+      let group = this.groups.get(key);
+      if (!group) {
+        group = {
+          key,
+          queryName: name,
+          args,
+          user,
+          members: new Set(),
+          tables: new Set(),
+          dependencies: [],
+          last: null,
+          run: null,
+          stale: false,
+          offThread: this.evaluation !== null && transferable(user),
+          filed: false,
+        };
+        this.groups.set(key, group);
+      }
+      const sub: Subscription = { id: subId, group, callback, lastHash: 0 };
+      group.members.add(sub);
       this.subscriptions.set(subId, sub);
       try {
-        const { result, measurement } = await this.runSubscriptions(
-          [sub],
-          reg,
-          _ectx,
-        );
+        const { result, measurement } = group.last
+          ? { result: parsed(group.last), measurement: group.last }
+          : await this.runGroup(group, reg, _ectx);
         if (recording) {
           meta.resultRows = measurement.resultRows;
           meta.resultBytes = measurement.resultBytes;
+          meta.shared = group.members.size > 1;
         }
         try {
           this.assertReactiveBudget(measurement, budget);
@@ -1975,9 +2122,9 @@ export class Vex<A = unknown> {
       }
       if (recording) {
         meta.subId = subId;
-        if (this.evaluation) meta.offThread = sub.offThread;
-        meta.tables = [...sub.tables];
-        meta.dependencies = describeQueryDependencies(sub.dependencies);
+        if (this.evaluation) meta.offThread = group.offThread;
+        meta.tables = [...group.tables];
+        meta.dependencies = describeQueryDependencies(group.dependencies);
         meta.totalSubs = this.subscriptions.size;
       }
 
@@ -2104,32 +2251,15 @@ export class Vex<A = unknown> {
   }
 
   describeSubscriptions() {
-    const byQuery = new Map<
-      string,
-      { args: string; count: number; tables: string[] }
-    >();
-    for (const sub of this.subscriptions.values()) {
-      const key = subscriptionGroupKey(sub);
-      const existing = byQuery.get(key);
-      if (existing) {
-        existing.count++;
-      } else {
-        byQuery.set(key, {
-          args: sub.argsKey,
-          count: 1,
-          tables: [...sub.tables],
-        });
-      }
-    }
     return {
       total: this.subscriptions.size,
-      unique: byQuery.size,
-      queries: [...byQuery.entries()]
-        .map(([key, v]) => ({
-          name: key.split("\0")[0],
-          args: v.args,
-          count: v.count,
-          tables: v.tables,
+      unique: this.groups.size,
+      queries: [...this.groups.values()]
+        .map((group) => ({
+          name: group.queryName,
+          args: JSON.stringify(group.args),
+          count: group.members.size,
+          tables: [...group.tables],
         }))
         .sort((a, b) => b.count - a.count),
     };
@@ -2212,9 +2342,10 @@ export class Vex<A = unknown> {
     await Promise.allSettled([...this.jobChanges.values()]);
     await Promise.allSettled([...this.runningJobs.values()]);
     this.subscriptions.clear();
-    this.subscriptionIndex.clear();
-    this.anyTableSubscriptions.clear();
-    this.runningSubscriptions.clear();
+    this.groups.clear();
+    this.groupIndex.clear();
+    this.anyTableGroups.clear();
+    this.runningGroups.clear();
     this.evaluation?.close();
     await this.storage.close();
   }
