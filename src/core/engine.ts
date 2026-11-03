@@ -232,9 +232,11 @@ export interface VexOptions<A = undefined> {
    * What runs jobs when they come due. "timers" (default): the engine,
    * on in-process timers. "external": the host calls `runDueJobs()` at
    * `nextJobRun()`, e.g. from a Durable Object alarm, and the engine
-   * starts no timers.
+   * starts no timers. "none": the engine takes no job on, storing and
+   * running none: an engine that only reads, as an evaluation
+   * worker's.
    */
-  jobScheduler?: "timers" | "external";
+  jobScheduler?: "timers" | "external" | "none";
   /**
    * Evaluate subscriptions off the main thread, in workers each running
    * a read-only engine over the same database (`EvaluationOptions`).
@@ -270,7 +272,7 @@ export class Vex<A = unknown> {
   // Each job's registration, removal and enabling, in call order per
   // name: the last call for a name decides its row and its timer.
   private jobChanges: Map<string, Promise<void>> = new Map();
-  private jobScheduler: "timers" | "external" = "timers";
+  private jobScheduler: "timers" | "external" | "none" = "timers";
   // Set by close(): a closed engine refuses job changes, job runs and
   // subscriptions.
   private closing: Promise<void> | null = null;
@@ -419,6 +421,7 @@ export class Vex<A = unknown> {
       this.actions.set(key, { plugin: plugin.name, def });
     }
 
+    if (this.jobScheduler === "none") return;
     for (const [name, job] of Object.entries(plugin.jobs ?? {})) {
       const cronName = `${plugin.name}.${name}`;
       await this.addJob(cronName, job, plugin.name);
@@ -482,6 +485,9 @@ export class Vex<A = unknown> {
 
   async addJob(name: string, job: JobDef, plugin = "_dynamic") {
     this.assertOpen();
+    if (this.jobScheduler === "none") {
+      throw new Error(`Job ${name} cannot be added: this engine runs no jobs`);
+    }
     const ms = parseSchedule(job.schedule);
     if (ms <= 0) throw new Error(`Invalid schedule: ${job.schedule}`);
 

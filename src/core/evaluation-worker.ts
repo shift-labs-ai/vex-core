@@ -28,7 +28,7 @@ self.addEventListener("message", (event: MessageEvent) => {
         storage: setup.storage,
         handlerTimeoutMs: message.init.handlerTimeoutMs,
         reactive: message.init.reactive,
-        jobScheduler: "external",
+        jobScheduler: "none",
       });
     })();
     engine.then(
