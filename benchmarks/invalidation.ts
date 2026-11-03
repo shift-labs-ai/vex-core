@@ -33,6 +33,8 @@ const BURST = Number(process.env.BENCH_BURST ?? 6);
 const MEMORY = process.env.BENCH_MEMORY === "1";
 /** Evaluation workers; none evaluates on the main thread. */
 const WORKERS = Number(process.env.BENCH_WORKERS ?? 0);
+/** Print each scenario as one JSON line instead of a table row. */
+const JSON_LINES = process.env.BENCH_JSON === "1";
 
 interface Pass {
   duration: number;
@@ -135,6 +137,22 @@ async function main() {
       wall.sort((a, b) => a - b);
       const reruns = passes.reduce((sum, p) => sum + p.reEvaluated, 0);
       const invalidationMs = passes.reduce((sum, p) => sum + p.duration, 0);
+      if (JSON_LINES) {
+        console.log(
+          JSON.stringify({
+            scenario: label,
+            writes,
+            passes: passes.length / ROUNDS,
+            reruns: reruns / ROUNDS,
+            deliveries: deliveries.count / ROUNDS,
+            invalidationMs: invalidationMs / ROUNDS,
+            wallP50: percentile(wall, 0.5),
+            wallMax: wall.at(-1) ?? 0,
+            stallMs: stall / ROUNDS,
+          }),
+        );
+        return;
+      }
       console.log(
         [
           label.padEnd(28),
@@ -150,9 +168,10 @@ async function main() {
       );
     };
 
-    console.log(
-      `users ${USERS}, conversations/user ${CONVERSATIONS}, open/user ${OPEN}, subscriptions ${subs}, rounds ${ROUNDS}, handler ${HANDLER_MS} ms, workers ${WORKERS}, storage ${MEMORY ? "memory" : "file"}`,
-    );
+    if (!JSON_LINES)
+      console.log(
+        `users ${USERS}, conversations/user ${CONVERSATIONS}, open/user ${OPEN}, subscriptions ${subs}, rounds ${ROUNDS}, handler ${HANDLER_MS} ms, workers ${WORKERS}, storage ${MEMORY ? "memory" : "file"}`,
+      );
     let at = 1_000_000;
     // One inbound message to one conversation: its session touched.
     await scenario("touch one session", 1, async (round) => {
