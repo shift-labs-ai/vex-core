@@ -88,6 +88,13 @@ interface Subscription {
   tables: Set<string>;
   dependencies: QueryDependency[];
   user?: VexUser | null;
+  /**
+   * While a run of its query is open (`runSubscriptions`): an
+   * invalidation that affects it marks it `stale` for that run to
+   * repeat, rather than opening another.
+   */
+  running: boolean;
+  stale: boolean;
 }
 
 function subscriptionGroupKey(subscription: Subscription): string {
@@ -164,6 +171,14 @@ function describeOperation<A>(
     args: registered.def.args,
     access: registered.def.access,
   };
+}
+
+/** A reactive result as subscriptions compare and budget it. */
+interface ReactiveMeasurement {
+  hash: number;
+  resultRows: number | undefined;
+  resultBytes: number;
+  serialized: string | undefined;
 }
 
 interface JobRunResult {
@@ -1179,12 +1194,7 @@ export class Vex<A = unknown> {
     };
   }
 
-  private measureReactiveResult(result: any): {
-    hash: number;
-    resultRows: number | undefined;
-    resultBytes: number;
-    serialized: string | undefined;
-  } {
+  private measureReactiveResult(result: any): ReactiveMeasurement {
     const serialized = JSON.stringify(result);
     // An undefined result measures as the literal "undefined".
     const measured = serialized ?? "undefined";
@@ -1272,6 +1282,52 @@ export class Vex<A = unknown> {
     return types;
   }
 
+  /**
+   * One run of the query `subs` share (one group: a query, its args,
+   * its caller), repeated until no write that affects it commits
+   * while it is open. Each member's dependencies are the run's as it
+   * records them, so an invalidation meanwhile judges what the run
+   * has read so far and marks the members stale rather than running
+   * them again; the flag clears before the result is handed back, so
+   * nothing lands unseen between a run and its delivery.
+   */
+  private async runSubscriptions(
+    subs: Subscription[],
+    reg: RegisteredQuery,
+    ectx: ExecContext,
+  ): Promise<{ result: unknown; measurement: ReactiveMeasurement }> {
+    const first = subs[0];
+    const info: MiddlewareInfo<any> = {
+      type: "query",
+      name: first.queryName,
+      args: first.args,
+      access: reg.def.access,
+    };
+    for (const sub of subs) sub.running = true;
+    try {
+      let result: unknown;
+      do {
+        const tables = new Set<string>();
+        const dependencies: QueryDependency[] = [];
+        for (const sub of subs) {
+          sub.stale = false;
+          sub.tables = tables;
+          sub.dependencies = dependencies;
+        }
+        const ctx = this.buildQueryContext(tables, first.user, dependencies);
+        result = await this.runMiddleware(
+          ctx,
+          info,
+          () => reg.def.handler(ctx, first.args),
+          ectx,
+        );
+      } while (subs.some((sub) => sub.stale));
+      return { result, measurement: this.measureReactiveResult(result) };
+    } finally {
+      for (const sub of subs) sub.running = false;
+    }
+  }
+
   private async invalidateSubscriptions(
     ectx: ExecContext,
     writes?: WriteDependency[],
@@ -1292,6 +1348,11 @@ export class Vex<A = unknown> {
       async (_invEctx, meta) => {
         const groups = new Map<string, Subscription[]>();
         for (const sub of this.subscriptions.values()) {
+          // A running subscription's dependencies are its open run's
+          // so far, each recorded before its read runs: a read they
+          // rule out could not have seen the write, and a read not yet
+          // made sees it. Before any, nothing was missed.
+          if (sub.running && sub.dependencies.length === 0) continue;
           const affected =
             everything ||
             this.dependencyAffected(
@@ -1301,6 +1362,10 @@ export class Vex<A = unknown> {
               writesByTable,
             );
           if (!affected) continue;
+          if (sub.running) {
+            sub.stale = true;
+            continue;
+          }
           const key = subscriptionGroupKey(sub);
           let group = groups.get(key);
           if (!group) {
@@ -1317,9 +1382,13 @@ export class Vex<A = unknown> {
 
         for (const [, subs] of groups) {
           const first = subs[0];
+          // Another invalidation, since this one chose its groups, may
+          // have opened a run of this one: that run repeats instead.
+          if (subs.some((sub) => sub.running)) {
+            for (const sub of subs) sub.stale = true;
+            continue;
+          }
           try {
-            const tables = new Set<string>();
-            const dependencies: QueryDependency[] = [];
             const reg = this.queries.get(first.queryName);
             if (!reg) continue;
             const budget = this.resolveReactive(reg.def);
@@ -1329,23 +1398,11 @@ export class Vex<A = unknown> {
                 (meta.disabledSubscriptions ?? 0) + subs.length;
               continue;
             }
-            const ctx = this.buildQueryContext(
-              tables,
-              first.user,
-              dependencies,
-            );
-            const result = await this.runMiddleware(
-              ctx,
-              {
-                type: "query",
-                name: first.queryName,
-                args: first.args,
-                access: reg.def.access,
-              },
-              () => reg.def.handler(ctx, first.args),
+            const { result, measurement } = await this.runSubscriptions(
+              subs,
+              reg,
               _invEctx,
             );
-            const measurement = this.measureReactiveResult(result);
             try {
               this.assertReactiveBudget(measurement, budget);
             } catch {
@@ -1359,8 +1416,9 @@ export class Vex<A = unknown> {
               continue;
             }
             for (const sub of subs) {
-              sub.tables = tables;
-              sub.dependencies = dependencies;
+              // Unsubscribed, or the engine closed, while the run was
+              // open: it hears nothing more.
+              if (!this.subscriptions.has(sub.id)) continue;
               if (measurement.hash !== sub.lastHash) {
                 sub.lastHash = measurement.hash;
                 try {
@@ -1502,26 +1560,8 @@ export class Vex<A = unknown> {
       if (recording) meta.reactive = budget !== false;
       if (budget === false) throw new Error(`Query ${name} is not reactive`);
       if (recording) meta.budget = budget;
-      const tables = new Set<string>();
-      const dependencies: QueryDependency[] = [];
-      const ctx = this.buildQueryContext(tables, user, dependencies);
-      const result = await this.runMiddleware(
-        ctx,
-        { type: "query", name, args, access: reg.def.access },
-        () => reg.def.handler(ctx, args),
-        _ectx,
-      );
-      const measurement = this.measureReactiveResult(result);
-      if (recording) {
-        meta.resultRows = measurement.resultRows;
-        meta.resultBytes = measurement.resultBytes;
-      }
-      try {
-        this.assertReactiveBudget(measurement, budget);
-      } catch (err) {
-        if (recording) meta.budgetExceeded = true;
-        throw err;
-      }
+      // Registered before its first run, so a write committing during
+      // the run finds it (`runSubscriptions`).
       const sub: Subscription = {
         id: subId,
         queryName: name,
@@ -1529,16 +1569,34 @@ export class Vex<A = unknown> {
         argsKey: JSON.stringify(args),
         userKey: subscriptionUserKey(user),
         callback,
-        lastHash: measurement.hash,
-        tables,
-        dependencies,
+        lastHash: 0,
+        tables: new Set(),
+        dependencies: [],
         user,
+        running: false,
+        stale: false,
       };
-      // A close() during the first run has already dropped every
-      // subscription; this one must not outlive it.
-      this.assertOpen();
       this.subscriptions.set(subId, sub);
       try {
+        const { result, measurement } = await this.runSubscriptions(
+          [sub],
+          reg,
+          _ectx,
+        );
+        if (recording) {
+          meta.resultRows = measurement.resultRows;
+          meta.resultBytes = measurement.resultBytes;
+        }
+        try {
+          this.assertReactiveBudget(measurement, budget);
+        } catch (err) {
+          if (recording) meta.budgetExceeded = true;
+          throw err;
+        }
+        // A close() during the first run has already dropped every
+        // subscription; this one must not outlive it.
+        this.assertOpen();
+        sub.lastHash = measurement.hash;
         deliverSubscriptionResult(callback, result, measurement.serialized);
       } catch (err) {
         this.subscriptions.delete(subId);
@@ -1546,8 +1604,8 @@ export class Vex<A = unknown> {
       }
       if (recording) {
         meta.subId = subId;
-        meta.tables = [...tables];
-        meta.dependencies = describeQueryDependencies(dependencies);
+        meta.tables = [...sub.tables];
+        meta.dependencies = describeQueryDependencies(sub.dependencies);
         meta.totalSubs = this.subscriptions.size;
       }
 
