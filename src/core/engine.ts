@@ -181,6 +181,23 @@ interface ReactiveMeasurement {
   serialized: string | undefined;
 }
 
+/**
+ * An invalidation pass not yet begun, which every write committing
+ * before it begins joins: their recorded writes together, or nothing
+ * when one of them recorded none.
+ */
+interface PendingInvalidation {
+  writes: WriteDependency[] | undefined;
+  commits: number;
+  pass: Promise<void>;
+}
+
+/** Resolves once the current turn's microtasks have drained. */
+const nextTurn: () => Promise<void> =
+  typeof setImmediate === "function"
+    ? () => new Promise((resolve) => setImmediate(resolve))
+    : () => new Promise((resolve) => setTimeout(resolve, 0));
+
 interface JobRunResult {
   status: "ok" | "error";
   error: string | null;
@@ -238,6 +255,9 @@ export class Vex<A = unknown> {
   // Set by close(): a closed engine refuses job changes, job runs and
   // subscriptions.
   private closing: Promise<void> | null = null;
+  // The invalidation pass the commits of this turn of the event loop
+  // share (`invalidateAfter`).
+  private pendingInvalidation: PendingInvalidation | null = null;
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
   private appId: string = "unknown";
@@ -575,7 +595,7 @@ export class Vex<A = unknown> {
             meta.attempt = attempt;
             const ctx = this.buildMutationContext();
             await job.handler(ctx);
-            await this.invalidateSubscriptions(ectx);
+            await this.invalidateAfter(ectx);
           },
         );
 
@@ -1328,9 +1348,51 @@ export class Vex<A = unknown> {
     }
   }
 
+  /**
+   * Invalidates after a commit, in one pass with every other commit
+   * that lands before the pass begins. When another write holds or
+   * waits for the storage's write lock, the pass waits a turn of the
+   * event loop for it: a burst of writes, which serialize on the lock
+   * within a turn, re-evaluates each subscription once for all of
+   * them. Otherwise it begins at once. The pass is a child of the
+   * first commit's span, and every commit that joined it awaits it. A
+   * pass already begun is not waited for: its runs repeat for what
+   * lands meanwhile (`runSubscriptions`).
+   */
+  private invalidateAfter(
+    ectx: ExecContext,
+    writes?: WriteDependency[],
+  ): Promise<void> {
+    const pending = this.pendingInvalidation;
+    if (pending) {
+      pending.commits++;
+      if (pending.writes && writes) pending.writes.push(...writes);
+      else pending.writes = undefined;
+      return pending.pass;
+    }
+    const wait = this.storage.writesPending?.()
+      ? nextTurn()
+      : Promise.resolve();
+    const joined: PendingInvalidation = {
+      writes: writes && [...writes],
+      commits: 1,
+      pass: wait.then(() => {
+        this.pendingInvalidation = null;
+        return this.invalidateSubscriptions(
+          ectx,
+          joined.writes,
+          joined.commits,
+        );
+      }),
+    };
+    this.pendingInvalidation = joined;
+    return joined.pass;
+  }
+
   private async invalidateSubscriptions(
     ectx: ExecContext,
     writes?: WriteDependency[],
+    commits = 1,
   ): Promise<void> {
     const changes = this.storage.takeChanges();
     if (changes.tables.length === 0) return;
@@ -1376,6 +1438,7 @@ export class Vex<A = unknown> {
         }
 
         meta.changedTables = [...changedSet];
+        meta.commits = commits;
         meta.affectedGroups = groups.size;
         meta.activeSubs = this.subscriptions.size;
         meta.reEvaluated = [...groups.values()].map((s) => s[0].queryName);
@@ -1510,7 +1573,7 @@ export class Vex<A = unknown> {
         meta.plugin = reg.plugin;
         meta.writes = describeWrites(writes);
       }
-      await this.invalidateSubscriptions(ectx, writes);
+      await this.invalidateAfter(ectx, writes);
       return result as T;
     });
   }
@@ -1653,7 +1716,7 @@ export class Vex<A = unknown> {
           ),
         );
         if (isTraceRecording(ectx)) meta.writes = describeWrites(writes);
-        await this.invalidateSubscriptions(ectx, writes);
+        await this.invalidateAfter(ectx, writes);
         if (result && typeof result === "object" && "status" in result) {
           meta.status = (result as any).status;
           return result as WebhookResponse;
@@ -1699,7 +1762,7 @@ export class Vex<A = unknown> {
         _id: row._id ?? generateId(12),
       }));
       await this.storage.bulkInsert(table, full);
-      await this.invalidateSubscriptions(
+      await this.invalidateAfter(
         ectx,
         full.map((row) => ({ table, values: row })),
       );

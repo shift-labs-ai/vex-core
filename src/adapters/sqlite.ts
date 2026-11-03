@@ -741,6 +741,10 @@ export function sqliteAdapter(
       return state.takeChanges(dataVersion());
     },
 
+    writesPending() {
+      return writeLocked || writeWaiters.length > 0;
+    },
+
     tablesRead(sql: string) {
       const cached = state.cachedTablesRead(sql);
       if (cached !== undefined) return cached ?? undefined;

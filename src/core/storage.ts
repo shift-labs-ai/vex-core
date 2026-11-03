@@ -52,6 +52,12 @@ export interface StorageAdapter {
   /** What changed since the last call; committed writes only. */
   takeChanges(): Changes;
   /**
+   * Whether another write holds or waits for the storage's write lock:
+   * a commit's invalidation then waits a turn for those to join it.
+   * Absent where writes never queue in the adapter.
+   */
+  writesPending?(): boolean;
+  /**
    * The tables a raw statement reads, exactly, from how the database
    * would run it; undefined when the adapter cannot tell. Without it the
    * engine falls back to every registered table the statement names.
