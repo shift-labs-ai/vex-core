@@ -24,13 +24,15 @@ interface Config {
   users: number;
   handlerMs: number;
   burst: number;
+  /** Engines this scale is not worth the hour on (every view re-run × its cost). */
+  skip?: string[];
 }
 const CONFIGS: Config[] = [
   { users: 10, handlerMs: 0, burst: 6 },
   { users: 35, handlerMs: 0, burst: 6 },
   { users: 35, handlerMs: 20, burst: 6 },
   { users: 100, handlerMs: 0, burst: 6 },
-  { users: 100, handlerMs: 20, burst: 24 },
+  { users: 100, handlerMs: 20, burst: 24, skip: ["v0.21.0"] },
 ];
 
 interface Row {
@@ -120,10 +122,9 @@ function main() {
         `## ${config.users} people, ${config.handlerMs} ms handlers, bursts of ${config.burst}`,
         "",
       );
-      const results = engines.map((engine) => ({
-        engine,
-        rows: run(engine, config),
-      }));
+      const results = engines
+        .filter((engine) => !config.skip?.includes(engine.label))
+        .map((engine) => ({ engine, rows: run(engine, config) }));
       const scenarios = results[0].rows.map((row) => row.scenario);
       lines.push(
         `| engine | ${scenarios.map((s) => `${s}: passes / re-runs / wall p50 / stall`).join(" | ")} |`,
@@ -143,10 +144,10 @@ function main() {
         );
       }
       lines.push("");
+      // Written as each scale completes: a long run shows its progress.
+      if (OUT) writeFileSync(OUT, lines.join("\n"));
     }
-    const report = lines.join("\n");
-    if (OUT) writeFileSync(OUT, report);
-    else console.log(report);
+    if (!OUT) console.log(lines.join("\n"));
   } finally {
     for (const engine of engines) {
       if (engine.dir !== ROOT) git("worktree", "remove", "--force", engine.dir);
