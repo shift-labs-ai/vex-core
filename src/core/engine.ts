@@ -5,6 +5,7 @@ import {
   publishedGovernedError,
   UNRESTRICTED,
 } from "./access.js";
+import * as ambient from "./ambient.js";
 import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
 import {
@@ -21,7 +22,7 @@ import { INTERNAL_TABLES } from "./internal.js";
 import { equalityKey, sameValue, writeMayAffect } from "./invalidation.js";
 import { hashResult, utf8ByteLength } from "./result-measure.js";
 import { statementKind, tablesRead, type ViewDefinition } from "./sql-text.js";
-import { ANY_TABLE, type StorageAdapter } from "./storage.js";
+import { ANY_TABLE, CLOCK, type StorageAdapter } from "./storage.js";
 import {
   describeQueryDependencies,
   describeWrites,
@@ -121,6 +122,8 @@ interface SubscriptionGroup {
   /** Its runs go to the evaluation pool: there is one, and its caller
    *  can cross to a worker. */
   offThread: boolean;
+  /** When its last run's answer stops holding (`QueryContext.now`). */
+  clockUntil?: number;
   /** Filed in the index by its dependencies (`indexGroup`). */
   filed: boolean;
 }
@@ -508,6 +511,11 @@ export class Vex<A = unknown> {
   private pendingInvalidation: PendingInvalidation | null = null;
   private evaluation: EvaluationPool | null = null;
   private announcingStorage: StorageAdapter | null = null;
+  // Groups whose answers hold until a time (`clockUntil`), and the one
+  // timer that wakes at the soonest.
+  private readonly clockGroups = new Set<SubscriptionGroup>();
+  private clockTimer: ReturnType<typeof setTimeout> | null = null;
+  private clockAt = Number.POSITIVE_INFINITY;
   private callerKey: (user: VexUser | null | undefined) => string =
     defaultCallerKey;
   private subIdCounter = 0;
@@ -1194,7 +1202,16 @@ export class Vex<A = unknown> {
           });
         },
       },
-      runtime: this.runtime(),
+      now(resolutionMs: number): number {
+        if (!Number.isInteger(resolutionMs) || resolutionMs < 1000) {
+          throw new TypeError(
+            "ctx.now(resolutionMs): a whole number of milliseconds, at least 1000",
+          );
+        }
+        const at = Math.floor(ambient.now() / resolutionMs) * resolutionMs;
+        dependencies?.push({ table: CLOCK, until: at + resolutionMs });
+        return at;
+      },
       user: user ?? undefined,
     };
     return ctx;
@@ -1355,7 +1372,17 @@ export class Vex<A = unknown> {
     writes?: WriteDependency[],
   ): MutationContext {
     const self = this;
+    const began = ambient.now();
     return {
+      now: () => began,
+      id: () => generateId(),
+      random: () => {
+        const bytes = ambient.randomBytes(7);
+        // 53 random bits over 2^53.
+        let n = bytes[0]! & 0x1f;
+        for (let i = 1; i < 7; i++) n = n * 256 + bytes[i]!;
+        return n / 2 ** 53;
+      },
       db: {
         sql<T = Record<string, any>>(
           sql: string,
@@ -1501,7 +1528,6 @@ export class Vex<A = unknown> {
           return build(adapter.query(name), {});
         },
       },
-      runtime: this.runtime(),
       user: user ?? undefined,
     };
   }
@@ -1732,6 +1758,7 @@ export class Vex<A = unknown> {
       this.groups.delete(group.key);
       this.runningGroups.delete(group);
       this.unindexGroup(group);
+      this.clockGroups.delete(group);
     }
   }
 
@@ -1815,7 +1842,10 @@ export class Vex<A = unknown> {
       } finally {
         group.run = null;
         this.runningGroups.delete(group);
-        if (this.groups.get(group.key) === group) this.indexGroup(group);
+        if (this.groups.get(group.key) === group) {
+          this.indexGroup(group);
+          this.timeGroup(group);
+        }
       }
     })();
     group.run = run;
@@ -2019,53 +2049,110 @@ export class Vex<A = unknown> {
         // Groups run together: each is one query for one caller, with
         // nothing shared but the pool that bounds how many evaluate at
         // once off the main thread.
-        const reEvaluate = async (group: SubscriptionGroup) => {
-          // Another invalidation, since this one chose its groups, may
-          // have opened a run of this one: that run repeats instead.
-          if (group.run) {
-            group.stale = true;
-            return;
-          }
-          try {
-            const reg = this.queries.get(group.queryName);
-            if (!reg) return;
-            // A group exists only for a reactive query (`subscribe`).
-            const budget = this.resolveReactive(
-              reg.def,
-            ) as Required<ReactiveBudget>;
-            const { result, measurement } = await this.runGroup(
-              group,
-              reg,
-              _invEctx,
-            );
-            try {
-              this.assertReactiveBudget(measurement, budget);
-            } catch (err) {
-              meta.budgetExceeded = true;
-              meta.disabledSubscriptions =
-                (meta.disabledSubscriptions ?? 0) + group.members.size;
-              meta.resultRows = measurement.resultRows;
-              meta.resultBytes = measurement.resultBytes;
-              meta.budget = budget;
-              // It cannot be answered within its budget: it ends, and
-              // each member is told why.
-              const members = [...group.members];
-              this.dropGroup(group);
-              for (const sub of members) this.notify(sub, err as Error, true);
-              return;
-            }
-            this.deliver(group, result, measurement);
-          } catch (err) {
-            // A failed run keeps the last answer and runs again on the
-            // next write that reaches it; each member is told meanwhile.
-            console.error(`[vex] subscription ${group.queryName} failed:`, err);
-            for (const sub of group.members)
-              this.notify(sub, err as Error, false);
-          }
-        };
-        await Promise.all(affected.map(reEvaluate));
+        await Promise.all(
+          affected.map((group) => this.rerunGroup(group, _invEctx, meta)),
+        );
       },
     );
+  }
+
+  /**
+   * Runs `group` again and hands its members the answer: ended, each
+   * told why, when it outgrows its budget; on failure, its last answer
+   * kept and each member told. A group with a run open repeats that
+   * run instead.
+   */
+  private async rerunGroup(
+    group: SubscriptionGroup,
+    ectx: ExecContext,
+    meta: Record<string, any>,
+  ): Promise<void> {
+    if (group.run) {
+      group.stale = true;
+      return;
+    }
+    try {
+      const reg = this.queries.get(group.queryName);
+      if (!reg) return;
+      // A group exists only for a reactive query (`subscribe`).
+      const budget = this.resolveReactive(reg.def) as Required<ReactiveBudget>;
+      const { result, measurement } = await this.runGroup(group, reg, ectx);
+      try {
+        this.assertReactiveBudget(measurement, budget);
+      } catch (err) {
+        meta.budgetExceeded = true;
+        meta.disabledSubscriptions =
+          (meta.disabledSubscriptions ?? 0) + group.members.size;
+        meta.resultRows = measurement.resultRows;
+        meta.resultBytes = measurement.resultBytes;
+        meta.budget = budget;
+        // It cannot be answered within its budget: it ends, and each
+        // member is told why.
+        const members = [...group.members];
+        this.dropGroup(group);
+        for (const sub of members) this.notify(sub, err as Error, true);
+        return;
+      }
+      this.deliver(group, result, measurement);
+    } catch (err) {
+      // A failed run keeps the last answer and runs again on the next
+      // write or clock boundary that reaches it; each member is told.
+      console.error(`[vex] subscription ${group.queryName} failed:`, err);
+      for (const sub of group.members) this.notify(sub, err as Error, false);
+    }
+  }
+
+  /** Files `group` under the clock when its answer holds until a time. */
+  private timeGroup(group: SubscriptionGroup): void {
+    let until: number | undefined;
+    for (const dep of group.dependencies) {
+      if (dep.table === CLOCK && dep.until !== undefined) {
+        until = until === undefined ? dep.until : Math.min(until, dep.until);
+      }
+    }
+    group.clockUntil = until;
+    if (until === undefined) this.clockGroups.delete(group);
+    else this.clockGroups.add(group);
+    this.armClock();
+  }
+
+  /** Sets the one clock timer for the soonest boundary any group holds. */
+  private armClock(): void {
+    let soonest = Number.POSITIVE_INFINITY;
+    for (const group of this.clockGroups) {
+      if (group.clockUntil !== undefined && group.clockUntil < soonest) {
+        soonest = group.clockUntil;
+      }
+    }
+    if (soonest === this.clockAt && this.clockTimer) return;
+    if (this.clockTimer) clearTimeout(this.clockTimer);
+    this.clockTimer = null;
+    this.clockAt = soonest;
+    if (this.closing || soonest === Number.POSITIVE_INFINITY) return;
+    this.clockTimer = setTimeout(
+      () => void this.clockTick(),
+      Math.max(0, soonest - ambient.now()),
+    );
+  }
+
+  /** Re-runs every group whose answer has stopped holding. */
+  private async clockTick(): Promise<void> {
+    this.clockTimer = null;
+    this.clockAt = Number.POSITIVE_INFINITY;
+    if (this.closing) return;
+    const at = ambient.now();
+    const due = [...this.clockGroups].filter(
+      (group) => group.clockUntil !== undefined && group.clockUntil <= at,
+    );
+    // Not due again until a run says when: each run re-times its group.
+    for (const group of due) this.clockGroups.delete(group);
+    this.armClock();
+    if (due.length === 0) return;
+    await this.trace("invalidation", "clock", null, async (ectx, meta) => {
+      meta.affectedGroups = due.length;
+      meta.reEvaluated = due.map((group) => group.queryName);
+      await Promise.all(due.map((group) => this.rerunGroup(group, ectx, meta)));
+    });
   }
 
   /** Hands a run's result to each member that has not heard it. */
@@ -2556,6 +2643,8 @@ export class Vex<A = unknown> {
    */
   close(): Promise<void> {
     if (!this.closing) {
+      if (this.clockTimer) clearTimeout(this.clockTimer);
+      this.clockTimer = null;
       for (const timer of this.cronTimers.values()) clearTimeout(timer);
       this.cronTimers.clear();
       this.closing = this.shutDown();

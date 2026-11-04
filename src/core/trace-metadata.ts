@@ -1,3 +1,4 @@
+import { CLOCK } from "./storage.js";
 import type { Filter } from "./types.js";
 
 export interface QueryDependency {
@@ -16,6 +17,8 @@ export interface QueryDependency {
   limit?: number | null;
   offset?: number | null;
   raw?: boolean;
+  /** On the clock (`CLOCK`): the time the answer holds until. */
+  until?: number;
 }
 
 export interface WriteDependency {
@@ -74,7 +77,7 @@ export function describeQueryDependencies(
   dependencies: QueryDependency[],
 ): TraceQueryDependency[] {
   return dependencies.map((dependency) => ({
-    table: dependency.table,
+    table: dependency.table === CLOCK ? "(clock)" : dependency.table,
     ...(dependency.filters
       ? {
           filters: dependency.filters.map(({ column, operator }) => ({

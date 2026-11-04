@@ -93,6 +93,16 @@ describe("evaluation workers", () => {
     for (const answer of seen) expect("missing" in answer).toBe(false);
   });
 
+  test("a run in a worker that read the time is re-run by the main thread's clock", async () => {
+    const vex = await create();
+    const heard: number[] = [];
+    await vex.subscribe("ev.second", {}, (r: any) => heard.push(r.at));
+    expect(meta("subscribe").at(-1)?.offThread).toBe(true);
+    await Bun.sleep(1100);
+    expect(heard.length).toBeGreaterThanOrEqual(2);
+    expect(heard[1]! - heard[0]!).toBeGreaterThanOrEqual(1000);
+  });
+
   test("the worker's dependencies narrow the next write like the main thread's", async () => {
     const vex = await create();
     let runs = 0;

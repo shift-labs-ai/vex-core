@@ -67,15 +67,11 @@ export function checkArgs(
   if (!isPlainObject(given)) {
     throw new ArgsError(`${kind} ${name} takes an object of args`);
   }
+  // Every problem, so a caller fixes them in one go.
+  const problems: string[] = [];
   for (const key of Object.keys(given)) {
     if (!(key in decl) && given[key] !== undefined) {
-      throw new ArgsError(
-        `${kind} ${name} takes no arg ${JSON.stringify(key)}: it takes ${
-          Object.keys(decl)
-            .map((k) => JSON.stringify(k))
-            .join(", ") || "none"
-        }`,
-      );
+      problems.push(`takes no arg ${JSON.stringify(key)}`);
     }
   }
   const checked: Record<string, any> = {};
@@ -86,11 +82,10 @@ export function checkArgs(
     if (value === undefined || value === null) {
       if (optional) {
         if (value === null) checked[key] = null;
-        continue;
+      } else {
+        problems.push(`needs arg ${JSON.stringify(key)} (${type})`);
       }
-      throw new ArgsError(
-        `${kind} ${name} needs arg ${JSON.stringify(key)} (${type})`,
-      );
+      continue;
     }
     const ok =
       type === "string"
@@ -101,14 +96,28 @@ export function checkArgs(
             ? typeof value === "boolean"
             : true;
     if (!ok) {
-      throw new ArgsError(
-        `${kind} ${name} takes arg ${JSON.stringify(key)} as ${type}; got ${describe(value)}`,
+      problems.push(
+        `takes arg ${JSON.stringify(key)} as ${type}; got ${describe(value)}`,
       );
+      continue;
     }
-    checked[key] =
-      type === "json"
-        ? jsonCopy(value, `${kind} ${name} arg ${JSON.stringify(key)}`)
-        : value;
+    if (type !== "json") {
+      checked[key] = value;
+      continue;
+    }
+    try {
+      checked[key] = jsonCopy(value, `arg ${JSON.stringify(key)}`);
+    } catch (error) {
+      problems.push((error as Error).message);
+    }
+  }
+  if (problems.length > 0) {
+    const takes = Object.entries(decl)
+      .map(([k, t]) => `${k}: ${t}`)
+      .join(", ");
+    throw new ArgsError(
+      `${kind} ${name} ${problems.join("; ")} (it takes { ${takes} })`,
+    );
   }
   return deepFreeze(checked);
 }

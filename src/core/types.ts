@@ -250,7 +250,13 @@ export interface QueryContext {
     /** The published dataset: every table `publishedSql` may read. */
     publishedTables(): PublishedTable[];
   };
-  runtime: VexRuntime;
+  /**
+   * The time, to `resolutionMs` (a whole number, at least 1000): the
+   * start of the current interval of that length. The query depends
+   * on it: a subscription re-runs when the next interval begins. The
+   * clock is read only here; `Date.now` and its kin are refused.
+   */
+  now(resolutionMs: number): number;
   user?: VexUser | null;
 }
 
@@ -259,7 +265,12 @@ export interface MutationContext {
     table(name: string): MutationTable;
     sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
   };
-  runtime: VexRuntime;
+  /** The time this call began: one value for every write it makes. */
+  now(): number;
+  /** A new id, as rows are given. */
+  id(): string;
+  /** A uniform float in [0, 1). */
+  random(): number;
   user?: VexUser | null;
 }
 

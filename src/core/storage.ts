@@ -7,6 +7,12 @@ import type { QueryBuilder, TableSchema } from "./types.js";
  */
 export const ANY_TABLE = "*";
 
+/**
+ * The clock, as a query depends on it (`QueryContext.now`): no write
+ * changes it; the boundary a dependency names passing re-runs it.
+ */
+export const CLOCK = "\0clock";
+
 /** What changed since the engine last asked. */
 export interface Changes {
   /** The tables changed; `ANY_TABLE` among them when any may have. */

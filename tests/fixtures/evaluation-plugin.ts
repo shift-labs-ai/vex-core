@@ -76,6 +76,11 @@ export function evaluationPlugin(api: VexPluginAPI) {
     reactive: { maxRows: 2, maxBytes: 10_000 },
     handler: (ctx) => ctx.db.table("items").all(),
   });
+  // The time to the second: re-run by the clock.
+  api.registerQuery("second", {
+    args: {},
+    handler: (ctx) => ({ at: ctx.now(1000) }),
+  });
   // An answer that is not its own JSON reading: an undefined field.
   api.registerQuery("sparse", {
     args: { scope: "string" },

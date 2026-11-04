@@ -523,3 +523,109 @@ describe("an answer is JSON, and every reader hears the same one", () => {
     expect(joiner[1]).toEqual(first[1]);
   });
 });
+
+describe("time and chance are the context's, and a query's time is reactive", () => {
+  const timed = (api: VexPluginAPI) => {
+    api.setName("tm");
+    api.registerQuery("second", {
+      args: {},
+      handler: (ctx) => ({ at: ctx.now(1000) }),
+    });
+    api.registerQuery("badResolution", {
+      args: { r: "number" },
+      handler: (ctx, args) => ctx.now(args.r),
+    });
+    api.registerMutation("stamp", {
+      args: {},
+      handler: async (ctx) => {
+        const a = ctx.now();
+        await ctx.db.table("items").insert({ scope: "t", n: a });
+        const b = ctx.now();
+        return { same: a === b, id: ctx.id(), r: ctx.random() };
+      },
+    });
+  };
+
+  test("a query and a mutation have no job controls", async () => {
+    let seen: unknown[] = [];
+    const vex = await create({
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("rt");
+          api.registerQuery("q", {
+            args: {},
+            handler: (ctx) => {
+              seen.push((ctx as any).runtime);
+              return null;
+            },
+          });
+          api.registerMutation("m", {
+            args: {},
+            handler: (ctx) => {
+              seen.push((ctx as any).runtime);
+              return null;
+            },
+          });
+          api.registerAction("a", {
+            args: {},
+            handler: (ctx) => {
+              seen.push(typeof ctx.runtime.triggerJob);
+              return null;
+            },
+          });
+        },
+      ],
+    });
+    seen = [];
+    await vex.query("rt.q");
+    await vex.mutate("rt.m");
+    await vex.action("rt.a");
+    expect(seen).toEqual([undefined, undefined, "function"]);
+  });
+
+  test("a mutation's now is one time for the whole call; ids and chance are the context's", async () => {
+    const vex = await create({ plugins: [plugin, timed] });
+    const first = await vex.mutate("tm.stamp");
+    const second = await vex.mutate("tm.stamp");
+    expect(first.same).toBe(true);
+    expect(first.id).not.toBe(second.id);
+    expect(first.r).toBeGreaterThanOrEqual(0);
+    expect(first.r).toBeLessThan(1);
+  });
+
+  test("a query's now is floored to its resolution, which is whole and at least a second", async () => {
+    const vex = await create({ plugins: [plugin, timed] });
+    const { at } = await vex.query("tm.second");
+    expect(at % 1000).toBe(0);
+    expect(Date.now() - at).toBeLessThan(1000);
+    for (const r of [999, 1500.5, 0, -1000]) {
+      await expect(vex.query("tm.badResolution", { r })).rejects.toThrow(
+        "a whole number of milliseconds, at least 1000",
+      );
+    }
+  });
+
+  test("a subscription that read the time re-runs when the next interval begins, and not before", async () => {
+    const vex = await create({ plugins: [plugin, timed] });
+    const heard: number[] = [];
+    await vex.subscribe("tm.second", {}, (r: any) => heard.push(r.at));
+    expect(heard).toHaveLength(1);
+    // A write it did not read leaves it alone.
+    await vex.mutate("bp.add", { scope: "x", n: 1 });
+    expect(heard).toHaveLength(1);
+    await Bun.sleep(1100);
+    expect(heard.length).toBeGreaterThanOrEqual(2);
+    expect(heard[1]! - heard[0]!).toBeGreaterThanOrEqual(1000);
+  });
+
+  test("a group that leaves stops the clock for it", async () => {
+    const vex = await create({ plugins: [plugin, timed] });
+    const heard: number[] = [];
+    const stop = await vex.subscribe("tm.second", {}, (r: any) =>
+      heard.push(r.at),
+    );
+    stop();
+    await Bun.sleep(1100);
+    expect(heard).toHaveLength(1);
+  });
+});
