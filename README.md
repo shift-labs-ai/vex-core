@@ -82,9 +82,15 @@ api.registerMutation("rename", {
 });
 ```
 
-- A call with an undeclared arg, a missing one, or one of the wrong type is refused, with every problem named (HTTP answers 400). `Type.Optional` means the arg may be absent; `null` is a value its schema must allow (`Type.Union([Type.String(), Type.Null()])`).
+- A call with an undeclared arg, a missing one, or one of the wrong type is refused with an `ArgsError`, every problem named (HTTP answers 400). `Type.Optional` means the arg may be absent; `null` is a value its schema must allow (`Type.Union([Type.String(), Type.Null()])`).
 - Args and answers are JSON values: plain objects, arrays, strings, finite numbers, booleans, null. A `Date`, `Map`, class instance or function is refused, since a client could not receive it. An answer against a declared `returns` is refused too; a refused mutation commits nothing. Every caller, in process or over the wire, a call or a subscription, is handed the answer as JSON reads it back (an `undefined` property gone, `-0` as `0`).
 - A declaration is a schema `Type` builds: a plain object such as `{ type: "string" }` is refused as the engine starts, and does not compile.
+
+## Handlers
+
+A handler reaches the engine only through its context: a query reads through `ctx.db` and composes queries with `ctx.query`, a mutation reads and writes through `ctx.db` and schedules with `ctx.scheduler`, and an action calls through `ctx.query`, `ctx.mutate` and `ctx.action`. A handler calling a captured `Vex` directly is refused with a `ReentryError` naming the context call to use, so every read is tracked, every call is decided by middleware, and no mutation waits on another's transaction. Middleware is not a handler: it runs outside the frame and may call the engine.
+
+A query answers from what its context reads. One that reads anything else (a module's variable, `Date.now()`) goes stale, since no write announces a change to it. `purityCheck` finds such a query: with `"always"` (in tests) or a share of runs (`0.01`), a run is repeated on the same data, and a subscription a write skipped is run again, and a query whose answers differ is refused or ended with a `PurityError` naming it. Read the clock through `ctx.now(resolutionMs)`, which a subscription re-runs on.
 
 ## Cloudflare Durable Objects
 
@@ -731,7 +737,7 @@ Age retention alone is not a hard volume bound. Production sinks should also cap
 
 | Entry | Contents |
 |-------|----------|
-| `vex-core` | `Vex`, `sqliteAdapter`, `durableObjectAdapter`, `id`, core types, tracer, `RateLimiter`. Under the `workerd` condition, everything but `sqliteAdapter` and `config` |
+| `vex-core` | `Vex`, `Type` and `Static` (TypeBox), `sqliteAdapter`, `durableObjectAdapter`, `id`, the errors a caller handles (`ArgsError`, `ReentryError`, `PurityError`, `RateLimitExceededError`), core types, tracer, `RateLimiter`. Under the `workerd` condition, everything but `sqliteAdapter` and `config` |
 | `vex-core/framework` | `table`, `query`, `mutation`, `action`, `webhook`, `job`, `middleware`, `scanDirectory`, `Type` |
 | `vex-core/http` | `Router`, `createRouter`, `HttpError`, `compose`, `vexHandler`, static handlers (`serveDir`, `serveFile`), plus middleware (`cors`, `bearerAuth`, `bodyParser`, `accessLog`, `requestId`, `rateLimit`, `errorBoundary`, `sessions`) |
 | `vex-core/client` | `VexProvider`, `useQuery`, `useMutation` |

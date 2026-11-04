@@ -44,6 +44,10 @@ test("a handler calling a captured engine is refused; an action's ctx calls are 
           args: {},
           handler: () => holder.vex!.query("re.count"),
         });
+        api.registerAction("sub", {
+          args: {},
+          handler: () => holder.vex!.subscribe("re.count", {}, () => {}),
+        });
         api.registerAction("viaCtx", {
           args: {},
           handler: async (ctx) => {
@@ -60,10 +64,13 @@ test("a handler calling a captured engine is refused; an action's ctx calls are 
     "vex.query is refused inside query re.q",
   );
   await expect(vex.mutate("re.m")).rejects.toThrow(
-    "vex.mutate is refused inside mutation re.m",
+    "vex.mutate is refused inside mutation re.m: call through the handler's context (ctx.db)",
   );
   await expect(vex.action("re.a")).rejects.toThrow(
     "vex.query is refused inside action re.a: call through the handler's context (ctx.query)",
+  );
+  await expect(vex.action("re.sub")).rejects.toThrow(
+    "vex.subscribe is refused inside action re.sub: a handler subscribes to nothing",
   );
   expect(await vex.action("re.viaCtx")).toBe(1);
 });
@@ -84,6 +91,10 @@ test("middleware may ask the engine how to decide; the handler it lets through m
           args: {},
           handler: () => holder.vex!.query("gate.allowed"),
         });
+        api.registerQuery("composed", {
+          args: {},
+          handler: (ctx) => ctx.query("gate.open"),
+        });
         api.use(async (_ctx, info, next) => {
           if (info.name === "gate.allowed") return next();
           if (!(await holder.vex!.query("gate.allowed"))) throw new Error("no");
@@ -95,7 +106,10 @@ test("middleware may ask the engine how to decide; the handler it lets through m
   open.push(vex);
   holder.vex = vex;
   expect(await vex.query("gate.open")).toBe("opened");
+  // A query composed through ctx.query is decided by the same
+  // middleware, outside the calling handler's frame.
+  expect(await vex.query("gate.composed")).toBe("opened");
   await expect(vex.query("gate.reentrant")).rejects.toThrow(
-    "vex.query is refused inside query gate.reentrant",
+    "vex.query is refused inside query gate.reentrant: call through the handler's context (ctx.query)",
   );
 });

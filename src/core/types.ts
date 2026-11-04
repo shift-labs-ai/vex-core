@@ -322,6 +322,12 @@ export interface Scheduler {
 export interface MutationContext {
   db: {
     table(name: string): MutationTable;
+    /**
+     * Raw SQL in the mutation's transaction: statements that read or
+     * change rows. A schema change, a PRAGMA, an attached database or
+     * a transaction statement is refused (schema changes are
+     * migrations), and so is a write to a table the engine keeps.
+     */
     sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
   };
   /** The time this call began: one value for every write it makes. */

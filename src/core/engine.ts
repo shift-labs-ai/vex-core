@@ -1453,7 +1453,7 @@ export class Vex<A = unknown> {
         }
         // A view reads its base tables by their own names, past the
         // expressions that hold them: a held read names no view.
-        const named = held.length > 0 ? namesIn(sql, views) : NO_VIEWS;
+        const named = held.length > 0 ? namesIn(sql, views) : NONE;
         if (named.length > 0) {
           return Promise.reject(
             new Error(
@@ -1475,7 +1475,7 @@ export class Vex<A = unknown> {
       // Known tables and views are answered at once, without a
       // microtask hop.
       const tables = self.rawReadTables(statement.sql);
-      const views = held.length > 0 ? self.viewNames() : NO_VIEWS;
+      const views = held.length > 0 ? self.viewNames() : NONE;
       if (Array.isArray(tables) && Array.isArray(views)) {
         return read(tables, views);
       }
@@ -1554,10 +1554,14 @@ export class Vex<A = unknown> {
         // names another, which is plain data as any caller is.
         if (as?.user != null) serializeJson(as.user, "a caller");
         const caller = as ? as.user : ctx.user;
-        return self.composedQuery(name, args, caller, ectx, {
-          tables: touchedTables,
-          dependencies,
-        }) as Promise<T>;
+        // Its middleware runs outside the calling handler's frame, as
+        // every call's does; its handler, in a frame of its own.
+        return outsideFrame(() =>
+          self.composedQuery(name, args, caller, ectx, {
+            tables: touchedTables,
+            dependencies,
+          }),
+        ) as Promise<T>;
       },
       now(resolutionMs: number): number {
         if (!Number.isInteger(resolutionMs) || resolutionMs < 1000) {
@@ -3343,7 +3347,7 @@ function parseSchedule(schedule: string): number {
   }
 }
 
-const NO_VIEWS: string[] = [];
+const NONE: string[] = [];
 const WORD = /[\w$]/;
 
 // The tables the engine writes itself, and of them the one no handler
@@ -3409,7 +3413,7 @@ function rawWriteRefusal(sql: string): string | null {
  * be refused.
  */
 function namesIn(sql: string, names: string[]): string[] {
-  if (names.length === 0) return NO_VIEWS;
+  if (names.length === 0) return NONE;
   const text = sql.toLowerCase();
   return names.filter((candidate) => {
     const name = candidate.toLowerCase();
