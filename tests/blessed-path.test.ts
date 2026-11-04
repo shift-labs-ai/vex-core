@@ -692,6 +692,11 @@ describe("a mutation's raw SQL reads and changes rows, nothing else", () => {
     await expect(
       vex.mutate("rw.run", { sql: "DELETE FROM _jobs" }),
     ).rejects.toThrow("writes no table the engine keeps (_jobs)");
+    await expect(
+      vex.mutate("rw.run", { sql: "DELETE FROM _migrations" }),
+    ).rejects.toThrow("writes no table the engine keeps (_migrations)");
+    // The span table is the app's tracer's to keep.
+    await vex.mutate("rw.run", { sql: "DELETE FROM _spans" });
     expect(await vex.query("bp.count", { scope: "a", extra: null })).toBe(0);
   });
 });

@@ -3065,7 +3065,9 @@ function parseSchedule(schedule: string): number {
 const NO_VIEWS: string[] = [];
 const WORD = /[\w$]/;
 
-const ENGINE_TABLES = Object.keys(INTERNAL_TABLES);
+// The tables the engine writes itself. `_spans` is provided for an
+// app's tracer to keep, and is the app's to write.
+const ENGINE_TABLES = ["_jobs", "_migrations"];
 
 /**
  * Why a mutation's raw SQL is refused, or null: each statement reads
