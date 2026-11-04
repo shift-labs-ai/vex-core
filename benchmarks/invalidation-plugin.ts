@@ -1,7 +1,7 @@
 /**
- * The plugin `invalidation.ts` measures, shared with its evaluation
- * workers (`invalidation-setup.ts`): a governed `sessions` table and
- * the views a dashboard keeps open on it.
+ * The plugin `invalidation.ts` measures: a governed `sessions` table
+ * and the views a dashboard keeps open on it. Passed by module, so
+ * each evaluation worker imports it too.
  */
 
 import { performance } from "node:perf_hooks";
@@ -160,3 +160,6 @@ export function benchmarkPlugin(api: VexPluginAPI) {
     },
   });
 }
+
+/** Given by module, as evaluation workers import it. */
+export default benchmarkPlugin;

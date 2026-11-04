@@ -26,12 +26,11 @@ import type { Span } from "../src/core/tracer.js";
 import type { Filter, VexUser } from "../src/core/types.js";
 import {
   COLUMNS,
-  equivalencePlugin,
   type Spec,
   type Terminal,
 } from "./fixtures/equivalence-plugin.js";
 
-const SETUP = new URL("./fixtures/equivalence-setup.ts", import.meta.url);
+const PLUGIN = new URL("./fixtures/equivalence-plugin.ts", import.meta.url);
 const SEEDS = Number(process.env.EQ_SEEDS ?? 8);
 const MODES = ["memory", "file", "workers"] as const;
 type Mode = (typeof MODES)[number];
@@ -190,7 +189,7 @@ async function create(mode: Mode) {
   const path = mode === "memory" ? ":memory:" : join(dir, "db.sqlite");
   const passes: Array<{ groups: number }> = [];
   const vex = await Vex.create({
-    plugins: [equivalencePlugin],
+    plugins: [PLUGIN],
     storage: sqliteAdapter(path),
     reactive: { maxRows: 1000, maxBytes: 1024 * 1024 },
     purityCheck: PURITY ? "always" : "off",
@@ -202,7 +201,7 @@ async function create(mode: Mode) {
       },
     },
     ...(mode === "workers"
-      ? { evaluation: { workers: 2, module: SETUP, setup: { path } } }
+      ? { evaluation: { workers: 2, offloadAboveMs: 0 } }
       : {}),
   });
   engines.push(vex);

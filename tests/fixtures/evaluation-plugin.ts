@@ -1,11 +1,12 @@
 /**
- * The plugin the evaluation tests subscribe through, shared by the
- * main engine and each worker's (`evaluation-setup.ts`).
+ * The plugin the evaluation tests read through. The tests pass it by
+ * module, so each evaluation worker imports this same plugin.
  */
 
 import type { TableAccessPolicy } from "../../src/core/access.js";
 import { UNRESTRICTED } from "../../src/core/access.js";
 import type { VexPluginAPI } from "../../src/core/api.js";
+import { HttpError } from "../../src/http/error.js";
 import { Type } from "../../src/portable.js";
 
 /** A person sees the items granted to them, said to SQL as `_id IN`. */
@@ -90,6 +91,27 @@ export function evaluationPlugin(api: VexPluginAPI) {
       missing: undefined,
     }),
   });
+  // The app's settings, as the thread that runs it reads them.
+  api.registerQuery("env", {
+    args: {},
+    handler: (ctx) => ctx.env,
+  });
+  // A read that costs `ms` of CPU: what the pool takes.
+  api.registerQuery("slow", {
+    args: { ms: Type.Number() },
+    handler: async (ctx, args) => {
+      const until = performance.now() + args.ms;
+      while (performance.now() < until) {}
+      return ctx.db.table("items").count();
+    },
+  });
+  // A refusal with an HTTP meaning, as a gate throws one.
+  api.registerQuery("forbidden", {
+    args: {},
+    handler: () => {
+      throw new HttpError(403, "not yours", { body: { code: "NOT_YOURS" } });
+    },
+  });
   api.registerMutation("add", {
     args: { scope: Type.String(), name: Type.String() },
     handler: (ctx, args) => ctx.db.table("items").insert(args),
@@ -106,3 +128,6 @@ export function evaluationPlugin(api: VexPluginAPI) {
       ctx.db.table("items").update(args.id, { name: args.name }),
   });
 }
+
+/** Given by module, as evaluation workers import it. */
+export default evaluationPlugin;

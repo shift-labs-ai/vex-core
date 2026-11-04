@@ -1,6 +1,6 @@
 /**
- * The plugin the scaling matrix drives, shared by the main engine and
- * each worker's (`scaling-setup.ts`). Every result carries `version`,
+ * The plugin the scaling matrix drives, passed by module so each
+ * evaluation worker imports it too. Every result carries `version`,
  * the highest write version it reflects, so deliveries can be judged
  * for going backwards.
  */
@@ -247,3 +247,6 @@ export function scalingPlugin(api: VexPluginAPI) {
     },
   });
 }
+
+/** Given by module, as evaluation workers import it. */
+export default scalingPlugin;

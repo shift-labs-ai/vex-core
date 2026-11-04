@@ -3,8 +3,8 @@
  * spec (any filter, any OR group, any selection, order, window and
  * terminal; as a builder read, a raw read, or a raw read held to rows
  * and columns; of a plain table or a governed one), and a mutation
- * for every way a row can be written. Shared with evaluation workers
- * (`equivalence-setup.ts`).
+ * for every way a row can be written. Passed by module, so each
+ * evaluation worker imports it too.
  */
 
 import type { TableAccessPolicy } from "../../src/core/access.js";
@@ -266,3 +266,6 @@ export function equivalencePlugin(api: VexPluginAPI) {
         .delete(),
   });
 }
+
+/** Given by module, as evaluation workers import it. */
+export default equivalencePlugin;

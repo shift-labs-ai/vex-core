@@ -43,6 +43,11 @@ const PLAYERS = (process.env.BENCH_PLAYERS ?? "1000,10000")
 const BURST = Number(process.env.BENCH_BURST ?? 100);
 const SECONDS = Number(process.env.BENCH_SECONDS ?? 5);
 const WORKERS = Number(process.env.BENCH_WORKERS ?? 0);
+/** The run time past which a read goes to the pool; the engine's default unless set. */
+const OFFLOAD_MS =
+  process.env.BENCH_OFFLOAD_MS === undefined
+    ? undefined
+    : Number(process.env.BENCH_OFFLOAD_MS);
 const JSON_LINES = process.env.BENCH_JSON === "1";
 
 function percentile(sorted: number[], fraction: number): number {
@@ -76,7 +81,7 @@ async function tier(players: number) {
   const path = join(dir, "world.db");
   const passes: Pass[] = [];
   const vex = await Vex.create({
-    plugins: [mmoPlugin],
+    plugins: [new URL("./mmo-plugin.ts", import.meta.url)],
     storage: sqliteAdapter(path),
     reactive: { maxRows: 10_000, maxBytes: 16 * 1024 * 1024 },
     tracer: {
@@ -95,8 +100,7 @@ async function tier(players: number) {
       ? {
           evaluation: {
             workers: WORKERS,
-            module: new URL("./mmo-setup.ts", import.meta.url),
-            setup: { path },
+            ...(OFFLOAD_MS !== undefined ? { offloadAboveMs: OFFLOAD_MS } : {}),
           },
         }
       : {}),

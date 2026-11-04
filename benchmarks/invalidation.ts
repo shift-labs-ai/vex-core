@@ -33,6 +33,11 @@ const BURST = Number(process.env.BENCH_BURST ?? 6);
 const MEMORY = process.env.BENCH_MEMORY === "1";
 /** Evaluation workers; none evaluates on the main thread. */
 const WORKERS = Number(process.env.BENCH_WORKERS ?? 0);
+/** The run time past which a read goes to the pool; the engine's default unless set. */
+const OFFLOAD_MS =
+  process.env.BENCH_OFFLOAD_MS === undefined
+    ? undefined
+    : Number(process.env.BENCH_OFFLOAD_MS);
 /** Print each scenario as one JSON line instead of a table row. */
 const JSON_LINES = process.env.BENCH_JSON === "1";
 
@@ -65,7 +70,7 @@ async function main() {
     },
   };
   const vex = await Vex.create({
-    plugins: [benchmarkPlugin],
+    plugins: [new URL("./invalidation-plugin.ts", import.meta.url)],
     storage: sqliteAdapter(path),
     tracer,
     reactive: { maxRows: 10_000, maxBytes: 16 * 1024 * 1024 },
@@ -73,8 +78,7 @@ async function main() {
       ? {
           evaluation: {
             workers: WORKERS,
-            module: new URL("./invalidation-setup.ts", import.meta.url),
-            setup: { path },
+            ...(OFFLOAD_MS !== undefined ? { offloadAboveMs: OFFLOAD_MS } : {}),
           },
         }
       : {}),

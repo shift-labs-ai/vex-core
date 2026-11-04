@@ -32,7 +32,12 @@ import {
   tablesRead,
   type ViewDefinition,
 } from "./sql-text.js";
-import { ANY_TABLE, CLOCK, type StorageAdapter } from "./storage.js";
+import {
+  ANY_TABLE,
+  CLOCK,
+  type StorageAdapter,
+  type StorageReader,
+} from "./storage.js";
 import { type RowChecks, rowChecks, storedTable } from "./tables.js";
 import {
   describeQueryDependencies,
@@ -138,7 +143,7 @@ interface SubscriptionGroup {
    */
   run: Promise<{ result: unknown; measurement: ReactiveMeasurement }> | null;
   stale: boolean;
-  /** Its runs go to the evaluation pool: the engine has one. */
+  /** Its last run went to the evaluation pool (`poolFor`). */
   offThread: boolean;
   /** Its query and args (`Vex.families`). */
   family: string;
@@ -541,8 +546,20 @@ type HostOptions = (Partial<VexEnv> extends VexEnv
 
 export type VexOptions<A = undefined> = EngineOptions<A> & HostOptions;
 
+/**
+ * A plugin by module: a `URL` (`new URL("./plugins/a.ts",
+ * import.meta.url)`), an absolute path or a package name, whose default
+ * export is a plugin, a plugin's definition, or an array of them. The
+ * engine imports it itself, so another thread can import the same.
+ */
+export type PluginModule = URL | string;
+
 interface EngineOptions<A> {
-  plugins: Array<PluginFunction<A> | PluginDef<A>>;
+  /**
+   * The app's plugins, each by value (a function or a definition) or
+   * by module (`PluginModule`), registered in the order given.
+   */
+  plugins: Array<PluginFunction<A> | PluginDef<A> | PluginModule>;
   storage: StorageAdapter;
   /**
    * The app's settings (`VexEnv`): an object of plain data, checked
@@ -589,10 +606,12 @@ interface EngineOptions<A> {
    */
   purityCheck?: "always" | "off" | number;
   /**
-   * Evaluate subscriptions off the main thread, in workers each running
-   * a read-only engine over the same database (`EvaluationOptions`).
-   * Where the runtime has no workers, or for a caller that cannot
-   * cross to one, evaluation stays on the main thread.
+   * Run expensive reads off the main thread, in workers each running a
+   * read-only engine over the same database, built from the app's own
+   * plugins, env and storage (`EvaluationOptions`): so every plugin is
+   * given by module, and the storage has a `reader()`, or the engine
+   * refuses to start. Where the runtime has no workers, every read
+   * runs on the main thread.
    */
   evaluation?: EvaluationOptions;
 }
@@ -637,6 +656,12 @@ export class Vex<A = unknown> {
   // share (`invalidateAfter`).
   private pendingInvalidation: PendingInvalidation | null = null;
   private evaluation: EvaluationPool | null = null;
+  // What a query's runs cost, in ms, averaged over its recent runs
+  // wherever they ran; and the queries whose runs the pool takes
+  // (`offloads`).
+  private readonly readCost = new Map<string, number>();
+  private readonly offloading = new Set<string>();
+  private offloadAboveMs = 2;
   private announcingStorage: StorageAdapter | null = null;
   // Groups whose answers hold until a time (`clockUntil`), and the one
   // timer that wakes at the soonest.
@@ -658,6 +683,9 @@ export class Vex<A = unknown> {
   private purity = 0;
   // The app's settings and the host's capabilities (`VexOptions`).
   private env: Readonly<VexEnv> = NO_ENV;
+  // Each plugin's module, in order, when every plugin was given by
+  // one (`PluginModule`); null when any was given by value.
+  private pluginModules: string[] | null = null;
   private services: VexServices = NO_SERVICES;
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
@@ -747,7 +775,9 @@ export class Vex<A = unknown> {
 
     vex.env = settings(options.env);
     vex.services = options.services ?? NO_SERVICES;
-    const plugins = options.plugins.map((plugin) =>
+    const given = await loadPlugins(options.plugins);
+    vex.pluginModules = given.modules;
+    const plugins = given.plugins.map((plugin) =>
       resolvePlugin(plugin, vex.env),
     );
     claimTableNames(plugins);
@@ -770,21 +800,32 @@ export class Vex<A = unknown> {
 
     // After every table is ensured: a worker's read-only engine
     // registers the tables it finds, and refuses one it does not.
-    if (
-      options.evaluation &&
-      options.evaluation.workers > 0 &&
-      workersAvailable()
-    ) {
-      vex.evaluation = new EvaluationPool(
-        new URL("./evaluation-worker.js", import.meta.url),
-        options.evaluation.workers,
-        {
-          module: String(options.evaluation.module),
-          setup: options.evaluation.setup,
-          handlerTimeoutMs: vex.handlerTimeoutMs,
-          reactive: vex.reactiveDefaults,
-        },
+    if (options.evaluation && options.evaluation.workers > 0) {
+      const { plugins: modules, reader } = readsElsewhere(
+        vex.pluginModules,
+        options.plugins.length,
+        vex.storage,
       );
+      const offloadAbove = options.evaluation.offloadAboveMs ?? 2;
+      if (!(offloadAbove >= 0)) {
+        throw new TypeError(
+          "evaluation.offloadAboveMs: a run time in ms, 0 or more",
+        );
+      }
+      vex.offloadAboveMs = offloadAbove;
+      if (workersAvailable()) {
+        vex.evaluation = new EvaluationPool(
+          new URL("./evaluation-worker.js", import.meta.url),
+          options.evaluation.workers,
+          {
+            plugins: modules,
+            env: vex.env,
+            reader,
+            handlerTimeoutMs: vex.handlerTimeoutMs,
+            reactive: vex.reactiveDefaults,
+          },
+        );
+      }
     }
 
     return vex;
@@ -2372,12 +2413,13 @@ export class Vex<A = unknown> {
     // the index before its dependencies change, and returns after.
     this.unindexGroup(group);
     this.runningGroups.add(group);
+    const pool = this.poolFor(group.queryName);
+    group.offThread = pool !== null;
     const run = (async () => {
       try {
-        const answer =
-          this.evaluation && group.offThread
-            ? await this.runGroupOffThread(group, this.evaluation)
-            : await this.runGroupHere(group, reg, ectx);
+        const answer = pool
+          ? await this.runGroupOffThread(group, pool)
+          : await this.runGroupHere(group, reg, ectx);
         group.last = answer.measurement;
         // Filed again under what this run read of its caller.
         if (this.groups.get(group.key) === group) this.fileCaller(group);
@@ -2410,6 +2452,7 @@ export class Vex<A = unknown> {
     let result: unknown;
     do {
       group.stale = false;
+      const began = performance.now();
       result = await this.checkedRun(group.queryName, async () => {
         group.tables = new Set();
         group.dependencies = [];
@@ -2428,6 +2471,7 @@ export class Vex<A = unknown> {
         group.reads = reads;
         return answer;
       });
+      this.noteCost(group.queryName, performance.now() - began);
     } while (group.stale);
     const json = checkedAnswer(`query ${group.queryName}`, reg.returns, result);
     return { result, measurement: this.measureReactiveResult(result, json) };
@@ -2455,6 +2499,7 @@ export class Vex<A = unknown> {
         group.dependencies = [{ table: ANY_TABLE, raw: true }];
       }
       evaluation = await pool.run(request);
+      this.noteCost(group.queryName, evaluation.durationMs);
       group.tables = new Set(evaluation.tables);
       group.dependencies = evaluation.dependencies;
       group.reads = new Set(evaluation.callerReads);
@@ -2463,14 +2508,14 @@ export class Vex<A = unknown> {
   }
 
   /**
-   * @internal A subscription's query run here for another engine's
-   * subscription (`EvaluationPool`): its result, measured, and what
-   * it read.
+   * @internal A query run here for another engine (`EvaluationPool`):
+   * its result, measured, what it read, and how long it took.
    */
   async evaluate(request: EvaluationRequest): Promise<Evaluation> {
     const reg = this.queries.get(request.name);
     if (!reg) throw new Error(`Query not found: ${request.name}`);
     const args = reg.args(request.args);
+    const began = performance.now();
     const tables = new Set<string>();
     const dependencies: QueryDependency[] = [];
     const callerReads = new Set<string>();
@@ -2499,7 +2544,35 @@ export class Vex<A = unknown> {
       tables: [...tables],
       dependencies,
       callerReads: [...callerReads],
+      durationMs: performance.now() - began,
     };
+  }
+
+  /**
+   * The pool that takes `name`'s runs, or null when they run here: a
+   * pool there is, no `purityCheck` repeats runs on this thread, and
+   * the query's runs cost past `offloadAboveMs` (`offloading`).
+   */
+  private poolFor(name: string): EvaluationPool | null {
+    if (!this.evaluation || this.purity > 0) return null;
+    if (this.offloadAboveMs === 0 || this.offloading.has(name)) {
+      return this.evaluation;
+    }
+    return null;
+  }
+
+  /**
+   * A run of `name` took `ms`: its average moves a third of the way
+   * there. Past `offloadAboveMs` the pool takes its runs; under half
+   * of it they return here, so a query near the line does not flap.
+   */
+  private noteCost(name: string, ms: number): void {
+    if (!this.evaluation) return;
+    const before = this.readCost.get(name);
+    const cost = before === undefined ? ms : before + (ms - before) / 3;
+    this.readCost.set(name, cost);
+    if (cost > this.offloadAboveMs) this.offloading.add(name);
+    else if (cost < this.offloadAboveMs / 2) this.offloading.delete(name);
   }
 
   /**
@@ -2595,9 +2668,6 @@ export class Vex<A = unknown> {
         meta.commits = commits;
         meta.judged = judged.size;
         meta.affectedGroups = affected.length;
-        if (this.evaluation) {
-          meta.offThread = affected.filter((group) => group.offThread).length;
-        }
         meta.activeSubs = this.subscriptions.size;
         meta.reEvaluated = affected.map((group) => group.queryName);
 
@@ -2610,6 +2680,10 @@ export class Vex<A = unknown> {
             this.recheckSkipped(group, _invEctx),
           ),
         ]);
+        // Where each run went is decided as it starts (`poolFor`).
+        if (this.evaluation) {
+          meta.offThread = affected.filter((group) => group.offThread).length;
+        }
       },
     );
   }
@@ -2648,8 +2722,8 @@ export class Vex<A = unknown> {
       last: null,
       run: null,
       stale: false,
-      // A caller is plain data, so every one crosses to a worker.
-      offThread: this.evaluation !== null,
+      // Set by each run (`runGroup`): where it ran.
+      offThread: false,
       filed: false,
       family,
       reads: null,
@@ -2915,8 +2989,28 @@ export class Vex<A = unknown> {
       if (!reg) throw new Error(`Query not found: ${name}`);
       const args = reg.args(given);
       const recording = isTraceRecording(ectx);
+      const pool = this.poolFor(name);
+      if (pool) {
+        // Run where the pool runs it, as a subscription's would be.
+        const evaluation = await pool.run({ name, args, user });
+        this.noteCost(name, evaluation.durationMs);
+        if (recording) {
+          meta.plugin = reg.plugin;
+          meta.offThread = true;
+          meta.tables = evaluation.tables;
+          meta.dependencies = describeQueryDependencies(
+            evaluation.dependencies,
+          );
+          if (evaluation.resultRows !== undefined) {
+            meta.resultRows = evaluation.resultRows;
+          }
+          meta.resultBytes = evaluation.resultBytes;
+        }
+        return reading(evaluation.result, evaluation) as T;
+      }
       const tables = recording ? new Set<string>() : undefined;
       const dependencies = recording ? ([] as QueryDependency[]) : undefined;
+      const began = performance.now();
       const result = await this.checkedRun(name, () => {
         const ctx = this.buildQueryContext(ectx, user, {
           tables,
@@ -2929,6 +3023,7 @@ export class Vex<A = unknown> {
           ectx,
         );
       });
+      this.noteCost(name, performance.now() - began);
       const json = checkedAnswer(`query ${name}`, reg.returns, result);
       if (tables && dependencies) {
         meta.plugin = reg.plugin;
@@ -3471,6 +3566,81 @@ const NONE: string[] = [];
 // (`HostOptions`).
 const NO_ENV = Object.freeze({}) as Readonly<VexEnv>;
 const NO_SERVICES = Object.freeze({}) as VexServices;
+
+/**
+ * The plugins `given` names, each module's imported, in order; and
+ * every module's reference when all were given by one.
+ */
+async function loadPlugins<A>(
+  given: ReadonlyArray<PluginFunction<A> | PluginDef<A> | PluginModule>,
+): Promise<{
+  plugins: Array<PluginFunction<A> | PluginDef<A>>;
+  modules: string[] | null;
+}> {
+  const plugins: Array<PluginFunction<A> | PluginDef<A>> = [];
+  const modules: string[] = [];
+  let byValue = false;
+  for (const entry of given) {
+    if (!(entry instanceof URL) && typeof entry !== "string") {
+      plugins.push(entry);
+      byValue = true;
+      continue;
+    }
+    const specifier = entry instanceof URL ? entry.href : entry;
+    if (specifier.startsWith("./") || specifier.startsWith("../")) {
+      throw new Error(
+        `plugin module "${specifier}" is relative: pass new URL(path, import.meta.url)`,
+      );
+    }
+    const exported = (await import(specifier)).default;
+    const each = Array.isArray(exported) ? exported : [exported];
+    if (each.length === 0 || !each.every(isPlugin)) {
+      throw new Error(
+        `plugin module "${specifier}" has no default export of a plugin (a function, a definition, or an array of them)`,
+      );
+    }
+    plugins.push(...each);
+    modules.push(specifier);
+  }
+  return { plugins, modules: byValue ? null : modules };
+}
+
+function isPlugin(
+  value: unknown,
+): value is PluginFunction<any> | PluginDef<any> {
+  if (typeof value === "function") return true;
+  const def = value as Partial<PluginDef<any>> | null;
+  return (
+    typeof def === "object" &&
+    def !== null &&
+    typeof def.name === "string" &&
+    typeof def.queries === "object" &&
+    typeof def.mutations === "object"
+  );
+}
+
+/**
+ * What a worker builds its engine from, or why it cannot: every
+ * plugin by module, and a storage another thread can open to read.
+ */
+function readsElsewhere(
+  modules: string[] | null,
+  given: number,
+  storage: StorageAdapter,
+): { plugins: string[]; reader: StorageReader } {
+  if (!modules) {
+    throw new Error(
+      `evaluation workers build their engine from the app's plugins, so each is given by module (PluginModule): of ${given}, some are given by value`,
+    );
+  }
+  const reader = storage.reader?.() ?? null;
+  if (!reader) {
+    throw new Error(
+      "evaluation workers open the storage from another thread, which this one cannot be (a database in memory, or one with no reader())",
+    );
+  }
+  return { plugins: modules, reader };
+}
 
 /** `env` as every context reads it: plain data, copied and frozen. */
 function settings(env: VexEnv | undefined): Readonly<VexEnv> {

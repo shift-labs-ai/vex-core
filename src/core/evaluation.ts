@@ -1,39 +1,33 @@
-import type { PluginFunction } from "./api.js";
-import type { StorageAdapter } from "./storage.js";
+import { HttpError, isHttpError } from "../http/error.js";
+import type { StorageReader } from "./storage.js";
 import type { QueryDependency } from "./trace-metadata.js";
-import type { PluginDef, ReactiveBudget, VexUser } from "./types.js";
+import type { ReactiveBudget, VexEnv, VexUser } from "./types.js";
 
 /**
- * Subscription evaluation off the main thread.
+ * Reads off the main thread.
  *
  * A pool of workers, each running a read-only engine over the same
- * database with the same plugins, runs a subscription's query and
- * answers with its result, measured, and the tables and dependencies
- * the run recorded. The main thread keeps everything else: which
- * subscriptions a write affects, their runs' single flight, delivery.
+ * database, built from the app's own plugins (each given by module,
+ * `PluginModule`), its `env` and the storage's `reader()`, runs a
+ * query and answers with its result, measured, and the tables and
+ * dependencies the run recorded. The main thread keeps everything
+ * else: which subscriptions a write affects, their runs' single
+ * flight, delivery, writes, actions.
  *
- * The module `EvaluationOptions.module` names is imported by each
- * worker; its default export builds what a worker's engine needs,
- * from `EvaluationOptions.setup`:
- *
- *   export default ({ path }): EvaluationSetup => ({
- *     plugins: [...],
- *     storage: sqliteAdapter(path, { readonly: true }),
- *   });
+ * A run's answer crosses back as a copy, which costs the main thread;
+ * a run cheaper than that is cheaper here. So the pool takes a query's
+ * runs, subscriptions' and one-shot calls' alike, once they cost more
+ * than `offloadAboveMs`, measured over its recent runs wherever they
+ * ran, and hands them back once they cost under half of it.
  */
 export interface EvaluationOptions {
-  /** How many workers evaluate; none evaluates on the main thread. */
+  /** How many workers read; none reads on the main thread. */
   workers: number;
-  /** The module whose default export is an `EvaluationSetup` factory. */
-  module: string | URL;
-  /** What the factory is called with; it crosses to each worker. */
-  setup?: unknown;
-}
-
-/** What a worker's engine is built from (`EvaluationOptions.module`). */
-export interface EvaluationSetup {
-  plugins: Array<PluginFunction<any> | PluginDef<any>>;
-  storage: StorageAdapter;
+  /**
+   * The run time, in ms, past which a query's runs go to the pool
+   * (2 unless set); 0 sends every run.
+   */
+  offloadAboveMs?: number;
 }
 
 /** A subscription's query, as a worker runs it. */
@@ -56,14 +50,66 @@ export interface Evaluation {
   resultBytes: number;
   tables: string[];
   dependencies: QueryDependency[];
+  /** How long the run took where it ran, in ms. */
+  durationMs: number;
 }
 
-/** The engine's settings a worker's engine shares. */
+/** What a worker's engine is built from: the main engine's own. */
 export interface EvaluationInit {
-  module: string;
-  setup: unknown;
+  /** Each plugin's module, in the order the main engine registered. */
+  plugins: string[];
+  env: Readonly<VexEnv>;
+  reader: StorageReader;
   handlerTimeoutMs: number;
   reactive: Required<ReactiveBudget>;
+}
+
+/**
+ * An error as it crosses from a worker: its name and message, and an
+ * HttpError's status, body and headers, so a refusal answers the
+ * caller as it would from the main thread.
+ */
+export interface CrossedError {
+  name: string;
+  message: string;
+  http?: {
+    status: number;
+    body: unknown;
+    headers: Record<string, string>;
+    expose: boolean;
+  };
+}
+
+/** `error` as it crosses (`CrossedError`). */
+export function crossing(error: unknown): CrossedError {
+  if (isHttpError(error)) {
+    return {
+      name: error.name,
+      message: error.message,
+      http: {
+        status: error.status,
+        body: error.body,
+        headers: error.headers,
+        expose: error.expose,
+      },
+    };
+  }
+  return error instanceof Error
+    ? { name: error.name, message: error.message }
+    : { name: "Error", message: String(error) };
+}
+
+/** The error `crossed` describes, rebuilt on this side. */
+export function crossed(crossed: CrossedError): Error {
+  const error = crossed.http
+    ? new HttpError(crossed.http.status, crossed.message, {
+        body: crossed.http.body,
+        headers: crossed.http.headers,
+        expose: crossed.http.expose,
+      })
+    : new Error(crossed.message);
+  error.name = crossed.name;
+  return error;
 }
 
 export type WorkerInbound =
@@ -72,9 +118,9 @@ export type WorkerInbound =
 
 export type WorkerOutbound =
   | { type: "ready" }
-  | { type: "failed"; error: string }
+  | { type: "failed"; error: CrossedError }
   | { type: "done"; id: number; evaluation: Evaluation }
-  | { type: "error"; id: number; error: string };
+  | { type: "error"; id: number; error: CrossedError };
 
 /** Whether this runtime can host evaluation workers. */
 export function workersAvailable(): boolean {
@@ -177,14 +223,14 @@ export class EvaluationPool {
         case "ready":
           return booted(null);
         case "failed":
-          return booted(new Error(message.error));
+          return booted(crossed(message.error));
         case "done":
         case "error": {
           const run = member.run;
           if (run?.id !== message.id) return;
           member.run = null;
           if (message.type === "done") run.pending.resolve(message.evaluation);
-          else run.pending.reject(new Error(message.error));
+          else run.pending.reject(crossed(message.error));
           return this.dispatch();
         }
       }

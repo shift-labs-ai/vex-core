@@ -799,6 +799,18 @@ export function sqliteAdapter(
       );
     },
 
+    reader() {
+      if (isMemoryDatabase(path)) return null;
+      return {
+        adapter: "sqlite" as const,
+        path,
+        ...(opts?.busyTimeout !== undefined
+          ? { busyTimeout: opts.busyTimeout }
+          : {}),
+        ...(opts?.cacheSize !== undefined ? { cacheSize: opts.cacheSize } : {}),
+      };
+    },
+
     getSchema(table: string) {
       return state.schemas.get(table) ?? null;
     },

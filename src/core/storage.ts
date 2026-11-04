@@ -83,6 +83,20 @@ export interface StorageAdapter {
    * engine lists them for each raw read that holds a table.
    */
   viewNames?(): string[] | Promise<string[]>;
+  /**
+   * How another thread opens this storage to read it (an evaluation
+   * worker), as plain data; null or absent when no other thread can
+   * (a database in memory, a Durable Object's).
+   */
+  reader?(): StorageReader | null;
   getSchema(table: string): StoredTableSchema | null;
   close(): Promise<void> | void;
+}
+
+/** How a thread opens a storage another adapter writes (`reader`). */
+export interface StorageReader {
+  adapter: "sqlite";
+  path: string;
+  busyTimeout?: number;
+  cacheSize?: number;
 }

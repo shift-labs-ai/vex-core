@@ -33,6 +33,11 @@ const CONVERSATIONS = 3;
 const BURST = Number(process.env.BENCH_BURST ?? 50);
 const SECONDS = Number(process.env.BENCH_SECONDS ?? 5);
 const WORKERS = Number(process.env.BENCH_WORKERS ?? 0);
+/** The run time past which a read goes to the pool; the engine's default unless set. */
+const OFFLOAD_MS =
+  process.env.BENCH_OFFLOAD_MS === undefined
+    ? undefined
+    : Number(process.env.BENCH_OFFLOAD_MS);
 
 function percentile(sorted: number[], fraction: number): number {
   return (
@@ -48,7 +53,7 @@ async function tier(players: number) {
   const path = join(dir, "scale.db");
   const passes: Array<{ duration: number; reEvaluated: number }> = [];
   const vex = await Vex.create({
-    plugins: [benchmarkPlugin],
+    plugins: [new URL("./invalidation-plugin.ts", import.meta.url)],
     storage: sqliteAdapter(path),
     reactive: { maxRows: 10_000, maxBytes: 16 * 1024 * 1024 },
     tracer: {
@@ -65,8 +70,7 @@ async function tier(players: number) {
       ? {
           evaluation: {
             workers: WORKERS,
-            module: new URL("./invalidation-setup.ts", import.meta.url),
-            setup: { path },
+            ...(OFFLOAD_MS !== undefined ? { offloadAboveMs: OFFLOAD_MS } : {}),
           },
         }
       : {}),

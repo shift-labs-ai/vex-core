@@ -3,8 +3,7 @@
  * guilds, with inventories and zone chat. Every view a client holds
  * open is a live query here; every tick of play is a write.
  *
- * Shared by the main engine and its evaluation workers
- * (`mmo-setup.ts`).
+ * Passed by module, so each evaluation worker imports it too.
  */
 
 import type { VexPluginAPI } from "../src/core/api.js";
@@ -206,3 +205,6 @@ export function mmoPlugin(api: VexPluginAPI) {
     handler: (ctx, args) => ctx.db.table("items").insert(args),
   });
 }
+
+/** Given by module, as evaluation workers import it. */
+export default mmoPlugin;

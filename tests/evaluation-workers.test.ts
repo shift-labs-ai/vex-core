@@ -1,9 +1,10 @@
 /**
- * Subscriptions evaluated off the main thread (`EvaluationPool`): a
- * worker runs the query over a read-only engine on the same database
- * and answers with the result and what it read; the main thread keeps
- * judging, single-flight runs and delivery, so what a subscriber sees
- * is what it sees on the main thread.
+ * Reads off the main thread (`EvaluationPool`): a worker builds its
+ * read-only engine from the app's own plugin modules, env and storage,
+ * runs the query and answers with the result and what it read; the
+ * main thread keeps judging, single-flight runs and delivery, so what
+ * a reader sees is what it sees on the main thread. The pool takes a
+ * query's runs once they cost more than `offloadAboveMs`.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
@@ -11,12 +12,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
-import { Vex } from "../src/core/engine.js";
+import { Vex, type VexOptions } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
 import type { VexUser } from "../src/core/types.js";
-import { evaluationPlugin } from "./fixtures/evaluation-plugin.js";
+import { isHttpError } from "../src/http/error.js";
+import { createRouter } from "../src/http/router.js";
+import { vexHandler } from "../src/http/vex-handler.js";
 
-const SETUP = new URL("./fixtures/evaluation-setup.ts", import.meta.url);
+const PLUGIN = new URL("./fixtures/evaluation-plugin.ts", import.meta.url);
 
 let open: Vex[] = [];
 let dirs: string[] = [];
@@ -30,15 +33,23 @@ afterEach(async () => {
   spans.length = 0;
 });
 
-async function create(workers = 2) {
+function databasePath() {
   const dir = mkdtempSync(join(tmpdir(), "vex-eval-"));
   dirs.push(dir);
-  const path = join(dir, "db.sqlite");
+  return join(dir, "db.sqlite");
+}
+
+async function create(
+  workers = 2,
+  options: Partial<VexOptions> & { offloadAboveMs?: number } = {},
+) {
+  const { offloadAboveMs = 0, ...rest } = options;
   const vex = await Vex.create({
-    plugins: [evaluationPlugin],
-    storage: sqliteAdapter(path),
-    evaluation: { workers, module: SETUP, setup: { path } },
+    plugins: [PLUGIN],
+    storage: sqliteAdapter(databasePath()),
+    evaluation: { workers, offloadAboveMs },
     tracer: { onSpan: (span) => spans.push(span) },
+    ...rest,
   });
   open.push(vex);
   return vex;
@@ -203,5 +214,138 @@ describe("evaluation workers", () => {
     await vex.close();
     open = [];
     expect(vex.activeSubscriptionCount()).toBe(0);
+  });
+
+  test("a worker reads the app's env, as the main thread does", async () => {
+    const vex = await create(1, { env: { place: "everywhere" } as never });
+    const heard: unknown[] = [];
+    await vex.subscribe("ev.env", {}, (r) => heard.push(r));
+    expect(meta("subscribe").at(-1)?.offThread).toBe(true);
+    expect(heard).toEqual([{ place: "everywhere" }]);
+  });
+
+  test("a one-shot query runs in the pool too, answering and tracing as here", async () => {
+    const vex = await create(1);
+    await vex.mutate("ev.add", { scope: "a", name: "one" });
+    expect(await vex.query("ev.names", { scope: "a" })).toEqual([
+      { name: "one", when: null },
+    ]);
+    expect(meta("query").at(-1)).toEqual(
+      expect.objectContaining({ offThread: true, tables: ["items"] }),
+    );
+    // Its answer is its JSON reading, as every caller is handed.
+    const sparse = await vex.query("ev.sparse", { scope: "a" });
+    expect(sparse).toEqual({ n: 1 });
+    expect("missing" in sparse).toBe(false);
+    // As the caller, through the policy.
+    expect(await vex.query("ev.whoami", {}, { user: alice })).toBe("alice");
+  });
+
+  test("a refusal in a worker answers with its HTTP status and body, as one here would", async () => {
+    const vex = await create(1);
+    const error = await vex.query("ev.forbidden").catch((e: unknown) => e);
+    expect(isHttpError(error)).toBe(true);
+    expect(error).toMatchObject({
+      status: 403,
+      message: "not yours",
+      body: { code: "NOT_YOURS" },
+    });
+    const app = createRouter().mount("/vex", vexHandler(vex));
+    const res = await app.handle(
+      new Request("http://x/vex/query", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "ev.forbidden" }),
+      }),
+    );
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ code: "NOT_YOURS" });
+    // An args refusal stays a 400 wherever the args are checked.
+    await expect(vex.query("ev.names", { scope: 1 })).rejects.toMatchObject({
+      status: 400,
+    });
+  });
+
+  test("the pool takes a query once its runs cost past offloadAboveMs, and hands it back once they cost under half", async () => {
+    const vex = await create(1, { offloadAboveMs: 5 });
+    const ran = () => meta("query").at(-1)?.offThread === true;
+    // Cheap: here, always.
+    for (let i = 0; i < 3; i++) await vex.query("ev.names", { scope: "a" });
+    expect(ran()).toBe(false);
+    // Costly: its first run here measures it; the next goes to the pool.
+    await vex.query("ev.slow", { ms: 20 });
+    expect(ran()).toBe(false);
+    await vex.query("ev.slow", { ms: 20 });
+    expect(ran()).toBe(true);
+    // Cheap again: its average falls a third of the way each run, and
+    // under 2.5 ms it returns here.
+    let back = 0;
+    for (let i = 0; i < 12 && ran(); i++) {
+      await vex.query("ev.slow", { ms: 0 });
+      back = i + 1;
+    }
+    expect(ran()).toBe(false);
+    expect(back).toBeGreaterThan(1);
+  });
+
+  test("a subscription's runs follow the same rule", async () => {
+    const vex = await create(1, { offloadAboveMs: 5 });
+    await vex.subscribe("ev.slow", { ms: 20 }, () => {});
+    expect(meta("subscribe").at(-1)?.offThread).toBe(false);
+    await vex.mutate("ev.add", { scope: "a", name: "one" });
+    expect(meta("invalidation").at(-1)?.offThread).toBe(1);
+  });
+
+  test("under purityCheck every read runs here, where the check repeats it", async () => {
+    const vex = await create(1, { purityCheck: "always" });
+    await vex.query("ev.names", { scope: "a" });
+    expect(meta("query").at(-1)?.offThread).toBeUndefined();
+    await vex.subscribe("ev.names", { scope: "a" }, () => {});
+    expect(meta("subscribe").at(-1)?.offThread).toBe(false);
+  });
+});
+
+describe("what a worker needs, or the engine refuses to start", () => {
+  test("a plugin given by value is refused: a worker could not import it", async () => {
+    const { default: plugin } = await import("./fixtures/evaluation-plugin.js");
+    await expect(
+      Vex.create({
+        plugins: [plugin],
+        storage: sqliteAdapter(databasePath()),
+        evaluation: { workers: 1 },
+      }),
+    ).rejects.toThrow(
+      "evaluation workers build their engine from the app's plugins, so each is given by module (PluginModule): of 1, some are given by value",
+    );
+  });
+
+  test("a storage no other thread can open is refused", async () => {
+    await expect(
+      Vex.create({
+        plugins: [PLUGIN],
+        storage: sqliteAdapter(":memory:"),
+        evaluation: { workers: 1 },
+      }),
+    ).rejects.toThrow(
+      "evaluation workers open the storage from another thread, which this one cannot be",
+    );
+  });
+
+  test("offloadAboveMs is a run time, 0 or more", async () => {
+    await expect(create(1, { offloadAboveMs: -1 })).rejects.toThrow(
+      "evaluation.offloadAboveMs: a run time in ms, 0 or more",
+    );
+  });
+
+  test("a file database says how another thread reads it; one in memory cannot be", () => {
+    const path = databasePath();
+    const file = sqliteAdapter(path, { busyTimeout: 1234 });
+    expect(file.reader?.()).toEqual({
+      adapter: "sqlite",
+      path,
+      busyTimeout: 1234,
+    });
+    expect(sqliteAdapter(":memory:").reader?.()).toBeNull();
+    file.close();
   });
 });

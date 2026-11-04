@@ -26,9 +26,8 @@ import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
 import type { VexUser } from "../src/core/types.js";
 import { rawBulkInsert } from "../src/internal.js";
-import { scalingPlugin } from "./fixtures/scaling-plugin.js";
 
-const SETUP = new URL("./fixtures/scaling-setup.ts", import.meta.url);
+const PLUGIN = new URL("./fixtures/scaling-plugin.ts", import.meta.url);
 
 type Mode = "memory" | "file" | "workers";
 const MODES: Mode[] = ["memory", "file", "workers"];
@@ -86,12 +85,12 @@ async function create(mode: Mode): Promise<Harness> {
   const path = mode === "memory" ? ":memory:" : join(dir, "db.sqlite");
   const spans: Span[] = [];
   const vex = await Vex.create({
-    plugins: [scalingPlugin],
+    plugins: [PLUGIN],
     storage: sqliteAdapter(path),
     tracer: { onSpan: (span) => spans.push(span) },
     reactive: { maxRows: 500, maxBytes: 512 * 1024 },
     ...(mode === "workers"
-      ? { evaluation: { workers: 2, module: SETUP, setup: { path } } }
+      ? { evaluation: { workers: 2, offloadAboveMs: 0 } }
       : {}),
   });
   const watches: Watch[] = [];
