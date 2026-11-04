@@ -262,6 +262,29 @@ export interface QueryContext {
   user?: VexUser | null;
 }
 
+/**
+ * Functions to run later, as the caller who scheduled them: a query,
+ * mutation or action by name, with its args. In a mutation a schedule
+ * is part of its transaction (it happens only if the mutation commits);
+ * in an action it happens when called. Each runs once.
+ */
+export interface Scheduler {
+  /** Runs `name` after `ms` milliseconds; its scheduled id. */
+  runAfter(
+    ms: number,
+    name: string,
+    args?: Record<string, any>,
+  ): Promise<string>;
+  /** Runs `name` at `time` (ms since the epoch); its scheduled id. */
+  runAt(
+    time: number,
+    name: string,
+    args?: Record<string, any>,
+  ): Promise<string>;
+  /** Cancels a scheduled function not yet started. */
+  cancel(id: string): Promise<void>;
+}
+
 export interface MutationContext {
   db: {
     table(name: string): MutationTable;
@@ -273,6 +296,8 @@ export interface MutationContext {
   id(): string;
   /** A uniform float in [0, 1). */
   random(): number;
+  /** Functions to run after this mutation commits (`Scheduler`). */
+  scheduler: Scheduler;
   user?: VexUser | null;
 }
 
@@ -303,6 +328,8 @@ export interface ActionContext {
     as?: { user: VexUser | null },
   ): Promise<T>;
   runtime: VexRuntime;
+  /** Functions to run later (`Scheduler`). */
+  scheduler: Scheduler;
   user?: VexUser | null;
   /** Aborted when the caller stops waiting (`/action`'s request
    *  closing): work that outlives its answer stops with it. */

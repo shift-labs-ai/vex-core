@@ -29,6 +29,20 @@ export const INTERNAL_TABLES: Record<string, TableSchema> = {
       meta: { type: "string", optional: true },
     },
   },
+  // Each scheduled function (ctx.scheduler): what runs, when, as whom.
+  _scheduled: {
+    columns: {
+      name: { type: "string" },
+      kind: { type: "string" },
+      args: { type: "json" },
+      caller: { type: "json", optional: true },
+      runAt: { type: "number", index: true },
+      status: { type: "string", index: true },
+      error: { type: "string", optional: true },
+      createdAt: { type: "number" },
+      finishedAt: { type: "number", optional: true },
+    },
+  },
   _jobs: {
     columns: {
       name: { type: "string", index: true },

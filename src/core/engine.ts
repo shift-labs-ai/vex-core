@@ -61,6 +61,7 @@ import type {
   QueryDef,
   ReactiveBudget,
   Reads,
+  Scheduler,
   SubscribeContext,
   TableSchema,
   VexRuntime,
@@ -571,6 +572,11 @@ export class Vex<A = unknown> {
   private readonly clockGroups = new Set<SubscriptionGroup>();
   private clockTimer: ReturnType<typeof setTimeout> | null = null;
   private clockAt = Number.POSITIVE_INFINITY;
+  // The one timer for the soonest scheduled function, and the runs
+  // under way (ctx.scheduler).
+  private scheduleTimer: ReturnType<typeof setTimeout> | null = null;
+  private scheduleAt = Number.POSITIVE_INFINITY;
+  private scheduledRun: Promise<void> | null = null;
   // Each query with one set of args: its groups, one per set of
   // callers alike in every field its runs read.
   private readonly families = new Map<string, Set<SubscriptionGroup>>();
@@ -680,6 +686,7 @@ export class Vex<A = unknown> {
     // Jobs arm last: none runs against data a migration has yet to
     // change.
     for (const plugin of plugins) await vex.registerJobs(plugin);
+    await vex.recoverScheduled();
 
     // After every table is ensured: a worker's read-only engine
     // registers the tables it finds, and refuses one it does not.
@@ -1091,7 +1098,11 @@ export class Vex<A = unknown> {
   /** When the next enabled job comes due (epoch ms), or null if none will. */
   async nextJobRun(): Promise<number | null> {
     const jobs = await this.scheduledJobs();
-    return jobs.find((job) => this.jobHandlers.has(job.name))?.nextRun ?? null;
+    const job =
+      jobs.find((entry) => this.jobHandlers.has(entry.name))?.nextRun ?? null;
+    const scheduled = await this.nextScheduled();
+    if (job === null) return scheduled;
+    return scheduled === null ? job : Math.min(job, scheduled);
   }
 
   /**
@@ -1111,6 +1122,7 @@ export class Vex<A = unknown> {
       if (!handler || nextRun > now) continue;
       results.push({ name, ...(await this.executeJob(name, handler)) });
     }
+    if (!this.closing) await this.runDueScheduled(now);
     return results;
   }
 
@@ -1119,6 +1131,155 @@ export class Vex<A = unknown> {
     return this.storage.rawQuery(
       "SELECT name, nextRun FROM _jobs WHERE enabled = 1 AND nextRun IS NOT NULL ORDER BY nextRun",
     );
+  }
+
+  /**
+   * A scheduler for `user`: each schedule is a row of `_scheduled`,
+   * written through the storage the caller is in, so a mutation's is
+   * part of its transaction. `afterCommit` arms the timer once the
+   * row can be seen.
+   */
+  private scheduler(
+    user: VexUser | null | undefined,
+    afterCommit: (arm: () => void) => void,
+  ): Scheduler {
+    const schedule = async (
+      runAt: number,
+      name: string,
+      args: Record<string, any> = {},
+    ) => {
+      const kind = this.queries.has(name)
+        ? "query"
+        : this.mutations.has(name)
+          ? "mutation"
+          : this.actions.has(name)
+            ? "action"
+            : null;
+      if (!kind) throw new Error(`Cannot schedule ${name}: no such operation`);
+      if (!Number.isFinite(runAt)) {
+        throw new TypeError("A schedule's time is a finite number of ms");
+      }
+      const reg =
+        this.queries.get(name) ??
+        this.mutations.get(name) ??
+        this.actions.get(name)!;
+      // Its args are checked now, not when it runs.
+      const checked = reg.args(args);
+      const id = generateId(12);
+      await this.storage.insert("_scheduled", {
+        _id: id,
+        name,
+        kind,
+        args: checked,
+        caller: user ?? null,
+        runAt,
+        status: "pending",
+        createdAt: Date.now(),
+      });
+      afterCommit(() => this.armScheduled());
+      return id;
+    };
+    return {
+      runAfter: (ms, name, args) => schedule(Date.now() + ms, name, args),
+      runAt: (time, name, args) => schedule(time, name, args),
+      cancel: async (id) => {
+        await this.storage.rawQuery(
+          "DELETE FROM _scheduled WHERE _id = ? AND status = 'pending'",
+          id,
+        );
+      },
+    };
+  }
+
+  /** When the soonest pending scheduled function is due, or null. */
+  private async nextScheduled(): Promise<number | null> {
+    const [row] = await this.storage.rawQuery<{ at: number | null }>(
+      "SELECT MIN(runAt) AS at FROM _scheduled WHERE status = 'pending'",
+    );
+    return row?.at ?? null;
+  }
+
+  /** Sets the one timer for the soonest pending scheduled function. */
+  private armScheduled(): void {
+    if (this.closing || this.jobScheduler !== "timers") return;
+    void this.nextScheduled().then((at) => {
+      if (at === null || this.closing) return;
+      if (this.scheduleTimer && at >= this.scheduleAt) return;
+      if (this.scheduleTimer) clearTimeout(this.scheduleTimer);
+      this.scheduleAt = at;
+      this.scheduleTimer = setTimeout(
+        () => {
+          this.scheduleTimer = null;
+          this.scheduleAt = Number.POSITIVE_INFINITY;
+          void this.runDueScheduled(Date.now()).then(() => this.armScheduled());
+        },
+        Math.max(0, at - Date.now()),
+      );
+    });
+  }
+
+  /**
+   * Runs every pending scheduled function due by `now`, one after
+   * another, each once, as the caller who scheduled it: done, or failed
+   * with its error.
+   */
+  private runDueScheduled(now: number): Promise<void> {
+    // One pass at a time; a pass asked for meanwhile joins it.
+    if (this.scheduledRun) return this.scheduledRun;
+    const pass = (async () => {
+      const due = await this.storage.rawQuery<{
+        _id: string;
+        name: string;
+        kind: "query" | "mutation" | "action";
+        args: string;
+        caller: string | null;
+      }>(
+        "SELECT _id, name, kind, args, caller FROM _scheduled WHERE status = 'pending' AND runAt <= ? ORDER BY runAt, createdAt",
+        now,
+      );
+      for (const row of due) {
+        if (this.closing) break;
+        await this.storage.update("_scheduled", row._id, { status: "running" });
+        const args = JSON.parse(row.args) as Record<string, any>;
+        const user = row.caller
+          ? (JSON.parse(row.caller) as VexUser)
+          : undefined;
+        try {
+          if (row.kind === "query") await this.query(row.name, args, { user });
+          else if (row.kind === "mutation")
+            await this.mutate(row.name, args, { user });
+          else await this.action(row.name, args, { user });
+          await this.storage.update("_scheduled", row._id, {
+            status: "done",
+            finishedAt: Date.now(),
+          });
+        } catch (error) {
+          await this.storage.update("_scheduled", row._id, {
+            status: "failed",
+            error: error instanceof Error ? error.message : String(error),
+            finishedAt: Date.now(),
+          });
+        }
+      }
+    })();
+    this.scheduledRun = pass.finally(() => {
+      this.scheduledRun = null;
+    });
+    return this.scheduledRun;
+  }
+
+  /**
+   * At start: a scheduled function that was running when the engine
+   * last stopped ran at most once, so it is failed, never run again;
+   * then the timer is armed for what is pending.
+   */
+  private async recoverScheduled(): Promise<void> {
+    if (this.jobScheduler === "none") return;
+    await this.storage.rawQuery(
+      "UPDATE _scheduled SET status = 'failed', error = 'interrupted: the engine stopped while it ran', finishedAt = ? WHERE status = 'running'",
+      Date.now(),
+    );
+    this.armScheduled();
   }
 
   private runtime(): VexRuntime {
@@ -1153,6 +1314,7 @@ export class Vex<A = unknown> {
           this.action(name, args, { ...as(), ...caller, signal }),
         ),
       runtime: this.runtime(),
+      scheduler: this.scheduler(user, (arm) => arm()),
       user: user ?? undefined,
       signal,
     };
@@ -1505,11 +1667,14 @@ export class Vex<A = unknown> {
   private buildMutationContext(
     user?: VexUser | null,
     writes?: WriteDependency[],
+    afterCommit: Array<() => void> = [],
   ): MutationContext {
     const self = this;
     const began = Date.now();
     return {
       now: () => began,
+      // Its schedules are its transaction's: armed once it commits.
+      scheduler: this.scheduler(user, (arm) => afterCommit.push(arm)),
       id: () => generateId(),
       random: () => {
         const bytes = crypto.getRandomValues(new Uint8Array(7));
@@ -2568,7 +2733,8 @@ export class Vex<A = unknown> {
       if (!reg) throw new Error(`Mutation not found: ${name}`);
       const args = reg.args(given);
       const writes: WriteDependency[] = [];
-      const ctx = this.buildMutationContext(user, writes);
+      const committed: Array<() => void> = [];
+      const ctx = this.buildMutationContext(user, writes, committed);
       const result = await this.storage.transaction(() =>
         this.runMiddleware(
           ctx,
@@ -2588,6 +2754,7 @@ export class Vex<A = unknown> {
         meta.writes = describeWrites(writes);
       }
       await this.invalidateAfter(ectx, writes);
+      for (const arm of committed) arm();
       return result as T;
     });
   }
@@ -2950,6 +3117,8 @@ export class Vex<A = unknown> {
     if (!this.closing) {
       if (this.clockTimer) clearTimeout(this.clockTimer);
       this.clockTimer = null;
+      if (this.scheduleTimer) clearTimeout(this.scheduleTimer);
+      this.scheduleTimer = null;
       for (const timer of this.cronTimers.values()) clearTimeout(timer);
       this.cronTimers.clear();
       this.closing = this.shutDown();
@@ -2958,6 +3127,7 @@ export class Vex<A = unknown> {
   }
 
   private async shutDown(): Promise<void> {
+    await this.scheduledRun?.catch(() => {});
     await Promise.allSettled([...this.jobChanges.values()]);
     await Promise.allSettled([...this.runningJobs.values()]);
     this.subscriptions.clear();

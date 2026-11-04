@@ -249,6 +249,23 @@ await vex.action("notes.import", { url });
 
 An action has no database. It reads and writes through the queries and mutations it calls (`ctx.query`, `ctx.mutate`, `ctx.action`), each made as the action's caller, decided by middleware, traced, and in its own transaction: what one mutation wrote stays even if the action fails later. Middleware decides the action itself first (`info.type === "action"`). No handler timeout bounds an action, since it holds no read and no transaction; its own work bounds it, and `ctx.signal` aborts when its caller stops waiting (`vex.action(name, args, { user, signal })`; an `/action` request closing), so long work can stop with it. An action it calls inherits the signal. Actions are called over HTTP (`POST /action`), over the WebSocket (`{ type: "action", id, name, args? }`, stopped when the connection closes), and with `VexClient.action()`, and never subscribed to. A caller that has already stopped waiting starts nothing. Middleware that tells the action more about its caller (`ctx.user`) tells every call it makes.
 
+## Scheduling
+
+A mutation does no I/O: it holds the write lock, and it may roll back after an effect is sent. What it wants done outside the database it schedules, and the schedule is part of its transaction (a transactional outbox): it runs only if the mutation commits.
+
+```ts
+api.registerMutation("invite", {
+  args: { email: Type.String() },
+  async handler(ctx, args) {
+    const id = await ctx.db.table("invites").insert({ email: args.email });
+    await ctx.scheduler.runAfter(0, "mail.sendInvite", { id });
+    return id;
+  },
+});
+```
+
+`runAfter(ms, name, args)` and `runAt(time, name, args)` schedule a query, mutation or action by name, its args checked when scheduled; `cancel(id)` removes one not yet started. Each runs once, as the caller who scheduled it, and is recorded `done` or `failed` in `_scheduled`. One that was running when the engine stopped is failed at the next start, never run again. An action schedules too, outside any transaction. With `jobScheduler: "external"`, `nextJobRun()` and `runDueJobs()` include them.
+
 ## Operation access
 
 An app can make every query, mutation and action declare who may run it, so an operation without a declaration does not compile. Choose the declaration's shape as the engine's type parameter:
