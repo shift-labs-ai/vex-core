@@ -776,8 +776,8 @@ export class Vex<A = unknown> {
       // The adapter forgets what it compiled when the schema moves.
       sql: <T>(sql: string, ...params: any[]) =>
         this.storage.rawQuery<T>(sql, ...params),
-      query: (name, args = {}) => this.query(name, args),
-      mutate: (name, args = {}) => this.mutate(name, args),
+      query: (name, args = {}, call) => this.query(name, args, call),
+      mutate: (name, args = {}, call) => this.mutate(name, args, call),
     };
     for (const migration of migrations) {
       if (applied.has(migration.id)) continue;

@@ -299,8 +299,18 @@ export interface ActionContext {
  */
 export interface MigrationContext {
   sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
-  query<T = any>(name: string, args?: Record<string, any>): Promise<T>;
-  mutate<T = any>(name: string, args?: Record<string, any>): Promise<T>;
+  /** As the caller `call` names: the system when it names none. */
+  query<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    call?: CallContext,
+  ): Promise<T>;
+  /** As the caller `call` names: the system when it names none. */
+  mutate<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    call?: CallContext,
+  ): Promise<T>;
 }
 
 /** A change to the stored data or schema, applied once, by `id`. */
