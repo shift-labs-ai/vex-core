@@ -92,6 +92,47 @@ A handler reaches the engine only through its context: a query reads through `ct
 
 A query answers from what its context reads. One that reads anything else (a module's variable, `Date.now()`) goes stale, since no write announces a change to it. `purityCheck` finds such a query: with `"always"` (in tests) or a share of runs (`0.01`), a run is repeated on the same data, and a subscription a write skipped is run again, and a query whose answers differ is refused or ended with a `PurityError` naming it. Read the clock through `ctx.now(resolutionMs)`, which a subscription re-runs on.
 
+## Plugins, settings and services
+
+A plugin is given by value (a function or a definition) or by module: a `URL`, an absolute path or a package name, whose default export is a plugin, a definition, or an array of them. The engine imports a module itself, so another thread can import the same plugin from the same reference ([Reads off the main thread](#reads-off-the-main-thread)).
+
+```ts
+const vex = await Vex.create({
+  storage: sqliteAdapter(".vex/data.db"),
+  plugins: [
+    new URL("./plugins/notes.ts", import.meta.url),
+    new URL("./plugins/mail.ts", import.meta.url),
+  ],
+  env: { dataDir: "/data", publicUrl: "https://notes.example" },
+  services: { mailer },
+});
+```
+
+What a plugin is configured with arrives two ways, and neither is a closure over its factory:
+
+- **`env`: the app's settings.** One object of plain data (strings, numbers, booleans, arrays, plain objects), checked and frozen as the engine starts, the same on every thread. Every context reads it as `ctx.env`, middleware included, and every plugin's registration as `api.env`. A value that changes while the server runs is not a setting: it belongs in a table, where reads of it are tracked.
+- **`services`: the host's live capabilities.** A process fleet, a dispatcher, a network client: objects, used as given, on the thread that owns them. Actions, jobs and webhooks hold them as `ctx.services`. No query or mutation does: a query that needs the outside world is an action, and a mutation's effect on it is scheduled (`ctx.scheduler`), so it happens only if the mutation commits.
+
+An app types both once, by augmenting the interfaces; the engine then requires what it declares:
+
+```ts
+declare module "vex-core" {
+  interface VexEnv { dataDir: string; publicUrl: string | null }
+  interface VexServices { mailer: Mailer }
+}
+
+// plugins/mail.ts
+export default (api: VexPluginAPI) => {
+  api.setName("mail");
+  api.registerAction("invite", {
+    args: { to: Type.String() },
+    handler: (ctx, args) => ctx.services.mailer.send(args.to, `${ctx.env.publicUrl}/join`),
+  });
+};
+```
+
+A plugin module's top-level code runs once per thread that imports it, so a module-level `Map` or client is one per thread, each its own. Keep state in tables and capabilities in `services`.
+
 ## Cloudflare Durable Objects
 
 `durableObjectAdapter` stores a Vex engine's tables in a SQLite-backed Durable Object's own database:
@@ -225,7 +266,7 @@ SQLite reports what a statement reads and writes: its compiled program, as `EXPL
 - **Finding what a write affects:** each group is filed by the tables its last run read and, for a dependency holding columns equal to values (`=`, `IN`), under the combination of those values (a zone and a cell; a list of ids); a dependency holding none so files it wide. A write judges only the groups filed under the values its rows hold (both the value left and taken, for a column it changes), those filed wide, and any with a run open; a write that does not know a column of a shape, or names no rows (a filtered delete past its bound, raw SQL), or an unattributed change, judges every group on the table. The invalidation span records `judged`. The cost of a pass does not grow with the subscriptions the engine holds: 100k players with 500k live views sustain the writes per second of 1k; an MMO-shaped world (`bun run bench:mmo`) with 10k players and 120k views sustains ~9k writes/s and ~700k deliveries/s on one thread, at 2.6 KB of heap per subscription.
 - **Bursts:** writes that commit while another write holds or waits for the storage's write lock invalidate in one pass, begun on the next turn of the event loop, with the union of what they changed: each affected subscription re-runs once for all of them. A lone write invalidates at once. Every mutation still resolves only after its pass delivered.
 - **Writes during a run:** a subscription is registered before its first run, and a run of its query is single-flight. A write that commits while a run is open, and that a read the run has made so far could have seen, marks the subscription stale: the run repeats before its result is delivered, so a subscriber sees every write committed after a read of its query, and results are delivered in the order they were read.
-- **Evaluation workers:** with `evaluation: { workers, module, setup }`, subscriptions re-run off the main thread: each worker runs a read-only engine (`sqliteAdapter(path, { readonly: true })`) built by the `module`'s default export from `setup`, over the same WAL database, and answers with the result, its measurement, and what it read; the main thread keeps judging which writes affect what, single-flight runs, budgets and delivery. A pass's affected groups run together, bounded by the pool. Where the runtime has no `Worker`, everything evaluates on the main thread.
+- **Off the main thread:** with `evaluation`, expensive reads run in workers ([Reads off the main thread](#reads-off-the-main-thread)); the main thread keeps judging which writes affect what, single-flight runs, budgets and delivery. A pass's affected groups run together, bounded by the pool.
 - **Raw reads:** `ctx.db.sql(reads, sql, ...params)` names every table the statement reads, and a table read but not named is refused, so what a subscription depends on is written where it is read. A table held to rows (`{ messages: [filters] }`, or `{ messages: { where, reads } }` to hold columns too) is, inside the statement, those rows and nothing else: a non-materialized common table expression of the table's name shadows it, so indexes still serve, and the read is skipped like a builder read's when a write misses them. A table read whole (`{ t: "all" }`) re-runs it on every write to `t`. The hold is enforced, not declared: a statement naming a held table as `main.t`, or reaching it through a view, is refused. A raw read that reads no table re-runs after any write.
 - **Access policies:** raw SQL in a query context (`ctx.db.sql`) is refused when it reads a governed table, in any spelling or through any view. A literal or column that merely shares a governed table's name is not a read. Published SQL has its own rule (below).
 - **Costs:** a statement's first run in a given schema compiles it once more for `EXPLAIN` (a few µs); after that, writes, reads and invalidation cost what they cost without tracking, within measurement noise. The query builder, bulk inserts and mutations run at parity with untracked writes; raw writes and raw reads run faster. On a Durable Object a single-statement write makes no more SQL calls, and bills no more rows, than without tracking; raw SQL of several statements reads `total_changes()` before and after.
@@ -269,6 +310,26 @@ api.registerQuery("prompt", {
 ```
 
 It is for composing queries another plugin owns, which may not be installed (a missing one rejects with `Query not found: name`). Within a plugin, a plain function over `ctx` composes as well and costs less.
+
+## Reads off the main thread
+
+One thread runs the engine's JavaScript: its HTTP and WebSocket traffic, writes, invalidation and every query's handler. A view whose run costs milliseconds holds all of them. `evaluation` moves such reads to a pool of workers:
+
+```ts
+const vex = await Vex.create({
+  storage: sqliteAdapter(".vex/data.db"),
+  plugins: [new URL("./plugins/notes.ts", import.meta.url)],
+  env,
+  evaluation: { workers: 2 },
+});
+```
+
+- **Each worker builds its own read-only engine from the app's own**: the same plugin modules, the same `env`, the same database, opened by the storage's `reader()` (`sqliteAdapter` on a file has one). Nothing else is written for it. An engine refuses to start a pool when a plugin is given by value, which a worker could not import, or when its storage has no reader (a database in memory).
+- **The pool takes expensive reads, not every read.** A run's answer crosses back as a copy, which costs the main thread, so a cheap run is cheaper where it is. The engine averages each query's run time wherever it runs; past `offloadAboveMs` (2 ms unless set) its runs, a subscription's re-runs and one-shot `vex.query` calls alike, go to the pool, and under half of it they come back. `offloadAboveMs: 0` sends every run.
+- **What a reader sees does not change**: the same answer as its JSON reading, the same dependencies narrowing the next write, the same access policies and middleware, as the caller (plain data, as every caller is). A refusal in a worker answers with its `HttpError` status, body and headers.
+- **What stays on the main thread**: writes, actions, jobs, webhooks and every `services` call; reads repeated by `purityCheck`; everything, where the runtime has no `Worker`.
+
+A file-based app is given by module too: a module whose default export is `(await scanDirectory(dir)).plugins`.
 
 ## Actions
 
@@ -737,7 +798,7 @@ Age retention alone is not a hard volume bound. Production sinks should also cap
 
 | Entry | Contents |
 |-------|----------|
-| `vex-core` | `Vex`, `Type` and `Static` (TypeBox), `sqliteAdapter`, `durableObjectAdapter`, `id`, the errors a caller handles (`ArgsError`, `ReentryError`, `PurityError`, `RateLimitExceededError`), core types, tracer, `RateLimiter`. Under the `workerd` condition, everything but `sqliteAdapter` and `config` |
+| `vex-core` | `Vex`, `Type` and `Static` (TypeBox), `sqliteAdapter`, `durableObjectAdapter`, `id`, the errors a caller handles (`ArgsError`, `ReentryError`, `PurityError`, `RateLimitExceededError`), core types (`VexEnv` and `VexServices` to augment, `PluginModule`), tracer, `RateLimiter`. Under the `workerd` condition, everything but `sqliteAdapter` and `config` |
 | `vex-core/framework` | `table`, `query`, `mutation`, `action`, `webhook`, `job`, `middleware`, `scanDirectory`, `Type` |
 | `vex-core/http` | `Router`, `createRouter`, `HttpError`, `compose`, `vexHandler`, static handlers (`serveDir`, `serveFile`), plus middleware (`cors`, `bearerAuth`, `bodyParser`, `accessLog`, `requestId`, `rateLimit`, `errorBoundary`, `sessions`) |
 | `vex-core/client` | `VexProvider`, `useQuery`, `useMutation` |

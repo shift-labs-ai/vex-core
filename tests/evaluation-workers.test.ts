@@ -305,6 +305,20 @@ describe("evaluation workers", () => {
   });
 });
 
+test("a file-based app is a plugin module too, and its reads run in the pool", async () => {
+  const vex = await Vex.create({
+    plugins: [new URL("./fixtures/refs/scanned.ts", import.meta.url)],
+    storage: sqliteAdapter(databasePath()),
+    evaluation: { workers: 1, offloadAboveMs: 0 },
+    tracer: { onSpan: (span) => spans.push(span) },
+  });
+  open.push(vex);
+  await vex.mutate("todos.add", { text: "b" });
+  await vex.mutate("todos.add", { text: "a" });
+  expect(await vex.query("todos.list")).toEqual(["a", "b"]);
+  expect(meta("query").at(-1)?.offThread).toBe(true);
+});
+
 describe("what a worker needs, or the engine refuses to start", () => {
   test("a plugin given by value is refused: a worker could not import it", async () => {
     const { default: plugin } = await import("./fixtures/evaluation-plugin.js");
