@@ -1869,8 +1869,10 @@ export class Vex<A = unknown> {
     handler: () => Promise<any> | any,
     ectx: ExecContext,
   ): Promise<any> {
-    // The middleware and the handler run in the handler's frame
-    // (`guards.ts`); a webhook writes as a mutation does.
+    // The handler runs in its frame (`frames.ts`): it reaches the
+    // engine only through its context. Middleware is the app's own
+    // authority and runs outside it: a gate may ask the engine how to
+    // decide. A webhook runs as an action does.
     const kind: FrameKind = info.type === "webhook" ? "action" : info.type;
     const run = () => {
       const result = Promise.resolve(inFrame(kind, info.name, handler));
@@ -1886,7 +1888,7 @@ export class Vex<A = unknown> {
       const chain = (): Promise<any> | any => {
         if (i < this.middleware.length) {
           const middleware = this.middleware[i++]!;
-          return inFrame(kind, info.name, () => middleware(ctx, info, chain));
+          return middleware(ctx, info, chain);
         }
         return this.trace("handler", info.name, mwEctx, run);
       };

@@ -67,3 +67,35 @@ test("a handler calling a captured engine is refused; an action's ctx calls are 
   );
   expect(await vex.action("re.viaCtx")).toBe(1);
 });
+
+test("middleware may ask the engine how to decide; the handler it lets through may not", async () => {
+  const holder: { vex?: Vex } = {};
+  const vex = await Vex.create({
+    storage: sqliteAdapter(":memory:"),
+    plugins: [
+      (api: VexPluginAPI) => {
+        api.setName("gate");
+        api.registerQuery("allowed", {
+          args: {},
+          handler: () => true,
+        });
+        api.registerQuery("open", { args: {}, handler: () => "opened" });
+        api.registerQuery("reentrant", {
+          args: {},
+          handler: () => holder.vex!.query("gate.allowed"),
+        });
+        api.use(async (_ctx, info, next) => {
+          if (info.name === "gate.allowed") return next();
+          if (!(await holder.vex!.query("gate.allowed"))) throw new Error("no");
+          return next();
+        });
+      },
+    ],
+  });
+  open.push(vex);
+  holder.vex = vex;
+  expect(await vex.query("gate.open")).toBe("opened");
+  await expect(vex.query("gate.reentrant")).rejects.toThrow(
+    "vex.query is refused inside query gate.reentrant",
+  );
+});
