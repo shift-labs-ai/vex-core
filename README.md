@@ -246,6 +246,22 @@ api.registerQuery("sql", {
 
 A published table with an access policy is read only for callers its policy leaves `UNRESTRICTED`, since raw SQL cannot apply the row filter; everyone else is refused. Storage that cannot show a statement's program (`StorageAdapter.readOnlyTables`) refuses every call. Results are reactive like any raw read: a subscription depends on exactly the tables the statement read. `ctx.db.publishedTables()` lists the dataset: each published table with every column a statement can read, `_id` included.
 
+## Composing queries
+
+A query may call another by name: `ctx.query(name, args?, { user }?)`. The call is a call of its own, with its args checked, middleware deciding it as the calling query's caller (or the `user` given), and its answer checked. What it reads is the calling query's: a subscription re-runs when a write reaches what either read, and skips a write both rule out.
+
+```ts
+api.registerQuery("prompt", {
+  args: { workspaceId: Type.String() },
+  async handler(ctx, args) {
+    const skills = await ctx.query("skills.list", args).catch(() => []); // the plugin may be absent
+    return render(skills);
+  },
+});
+```
+
+It is for composing queries another plugin owns, which may not be installed (a missing one rejects with `Query not found: name`). Within a plugin, a plain function over `ctx` composes as well and costs less.
+
 ## Actions
 
 A mutation runs inside one transaction, so it must not wait: on a person, on another process, on the network. Work that does is an action, the third kind of operation beside queries and mutations:

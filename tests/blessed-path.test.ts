@@ -1225,3 +1225,104 @@ describe("only a schema Type builds declares an arg or a return", () => {
     );
   });
 });
+
+describe("a query composes another by name (ctx.query)", () => {
+  const seen: Array<{ type: string; name: string; as: string | null }> = [];
+  const composing = (api: VexPluginAPI) => {
+    api.setName("cq");
+    api.use((ctx, info, next) => {
+      seen.push({
+        type: info.type,
+        name: info.name,
+        as: ctx.user?.id ?? null,
+      });
+      return next();
+    });
+    api.registerQuery("wrapped", {
+      args: { scope: Type.String() },
+      handler: async (ctx, args) => {
+        runs.set("wrapped", (runs.get("wrapped") ?? 0) + 1);
+        return {
+          n: await ctx.query("bp.count", { scope: args.scope, extra: null }),
+        };
+      },
+    });
+    api.registerQuery("fenced", {
+      args: {},
+      handler: async (ctx) => ({
+        rows: await ctx.query("bp.visible", { scope: "a" }),
+      }),
+    });
+    api.registerQuery("optional", {
+      args: {},
+      handler: async (ctx) => {
+        try {
+          return await ctx.query("absent.thing");
+        } catch (error) {
+          return (error as Error).message;
+        }
+      },
+    });
+    api.registerQuery("badArgs", {
+      args: {},
+      handler: (ctx) => ctx.query("bp.count", { scope: 1 }),
+    });
+    api.registerQuery("asSystem", {
+      args: {},
+      handler: (ctx) => ctx.query("bp.visible", { scope: "a" }, { user: null }),
+    });
+  };
+
+  test("what the called query reads is the caller's: a write it reads re-runs the subscription, one it rules out does not", async () => {
+    const vex = await create({ plugins: [plugin, composing] });
+    const heard: number[] = [];
+    await vex.subscribe("cq.wrapped", { scope: "a" }, (r: any) =>
+      heard.push(r.n),
+    );
+    const before = runs.get("wrapped")!;
+    await vex.mutate("bp.add", { scope: "a", n: 1 });
+    expect(heard).toEqual([0, 1]);
+    await vex.mutate("bp.add", { scope: "b", n: 1 });
+    expect(runs.get("wrapped")).toBe(before + 1);
+  });
+
+  test("it is a call: middleware decides it as the caller, its args are checked, a missing query is said so", async () => {
+    seen.length = 0;
+    const vex = await create({ plugins: [plugin, composing] });
+    await vex.query("cq.wrapped", { scope: "a" }, { user: alice });
+    expect(seen).toEqual([
+      { type: "query", name: "cq.wrapped", as: "alice" },
+      { type: "query", name: "bp.count", as: "alice" },
+    ]);
+    expect(await vex.query("cq.optional")).toBe(
+      "Query not found: absent.thing",
+    );
+    await expect(vex.query("cq.badArgs")).rejects.toThrow(
+      'query bp.count takes arg "scope": must be string',
+    );
+    seen.length = 0;
+    await vex.query("cq.asSystem", {}, { user: alice });
+    expect(seen.at(-1)).toEqual({
+      type: "query",
+      name: "bp.visible",
+      as: null,
+    });
+  });
+
+  test("the caller's fields the called query reads tell callers apart", async () => {
+    const vex = await create({ plugins: [plugin, composing] });
+    await vex.mutate("bp.add", { scope: "a", n: 1 });
+    await vex.mutate("bp.add", { scope: "a", n: 9 });
+    const wide: any[] = [];
+    const fenced: any[] = [];
+    await vex.subscribe("cq.fenced", {}, (r: any) => wide.push(r), {
+      user: alice,
+    });
+    await vex.subscribe("cq.fenced", {}, (r: any) => fenced.push(r), {
+      user: { ...alice, fence: "5" } as VexUser,
+    });
+    expect(wide.at(-1).rows.map((r: any) => r.n)).toEqual([1, 9]);
+    expect(fenced.at(-1).rows.map((r: any) => r.n)).toEqual([1]);
+    expect(vex.describeSubscriptions().unique).toBe(2);
+  });
+});

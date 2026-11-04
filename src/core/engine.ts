@@ -223,6 +223,14 @@ function trackedCaller(user: VexUser, reads: Set<string>): VexUser {
   });
 }
 
+/** Where a query run records what it reads (`buildQueryContext`). */
+interface QueryTracking {
+  tables?: Set<string>;
+  dependencies?: QueryDependency[];
+  /** The caller's fields the run reads. */
+  callerReads?: Set<string>;
+}
+
 /** An answer as JSON says it (`serializeJson`). */
 interface Json {
   serialized: string | undefined;
@@ -1348,13 +1356,18 @@ export class Vex<A = unknown> {
     return ctx;
   }
 
+  /**
+   * A query's context, for a run traced under `ectx` as `user`, its
+   * reads recorded where `tracking` says. A query it calls
+   * (`ctx.query`) records into the same.
+   */
   private buildQueryContext(
-    touchedTables?: Set<string>,
-    user?: VexUser | null,
-    dependencies?: QueryDependency[],
-    callerReads?: Set<string>,
+    ectx: ExecContext,
+    user: VexUser | null | undefined,
+    tracking: QueryTracking = {},
   ): QueryContext {
     const self = this;
+    const { tables: touchedTables, dependencies, callerReads } = tracking;
     if (user && callerReads) user = trackedCaller(user, callerReads);
     // One prepared access context per governed table per operation:
     // a handler reading `sessions` through three chains resolves the
@@ -1532,6 +1545,20 @@ export class Vex<A = unknown> {
           });
         },
       },
+      query: <T>(
+        name: string,
+        args: Record<string, any> = {},
+        as?: { user: VexUser | null },
+      ) => {
+        // As the context's caller as middleware left it, unless `as`
+        // names another, which is plain data as any caller is.
+        if (as?.user != null) serializeJson(as.user, "a caller");
+        const caller = as ? as.user : ctx.user;
+        return self.composedQuery(name, args, caller, ectx, {
+          tables: touchedTables,
+          dependencies,
+        }) as Promise<T>;
+      },
       now(resolutionMs: number): number {
         if (!Number.isInteger(resolutionMs) || resolutionMs < 1000) {
           throw new TypeError(
@@ -1545,6 +1572,44 @@ export class Vex<A = unknown> {
       user: user ?? undefined,
     };
     return ctx;
+  }
+
+  /**
+   * Query `name` called from another query's handler (`ctx.query`): a
+   * call of its own, its args checked, decided by middleware, its
+   * handler in its frame, its answer checked; what it reads is the
+   * calling run's, so a subscription re-runs when it changes. Its
+   * caller's reads are the caller's own: when that is the calling
+   * context's caller, its tracked view already records them.
+   */
+  private composedQuery(
+    name: string,
+    given: Record<string, any>,
+    user: VexUser | null | undefined,
+    parent: ExecContext,
+    tracking: QueryTracking,
+  ): Promise<unknown> {
+    const reg = this.queries.get(name);
+    if (!reg) return Promise.reject(new Error(`Query not found: ${name}`));
+    let args: Readonly<Record<string, any>>;
+    try {
+      args = reg.args(given);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.trace("query", name, parent, async (ectx) => {
+      const ctx = this.buildQueryContext(ectx, user, tracking);
+      const result = await this.runMiddleware(
+        ctx,
+        { type: "query", name, args, access: reg.def.access },
+        () => reg.def.handler(ctx, args),
+        ectx,
+      );
+      return reading(
+        result,
+        checkedAnswer(`query ${name}`, reg.returns, result),
+      );
+    });
   }
 
   private trackQueryBuilder(
@@ -2223,12 +2288,11 @@ export class Vex<A = unknown> {
         group.tables = new Set();
         group.dependencies = [];
         const reads = new Set<string>();
-        const ctx = this.buildQueryContext(
-          group.tables,
-          group.user,
-          group.dependencies,
-          reads,
-        );
+        const ctx = this.buildQueryContext(ectx, group.user, {
+          tables: group.tables,
+          dependencies: group.dependencies,
+          callerReads: reads,
+        });
         const answer = await this.runMiddleware(
           ctx,
           info,
@@ -2284,14 +2348,13 @@ export class Vex<A = unknown> {
     const tables = new Set<string>();
     const dependencies: QueryDependency[] = [];
     const callerReads = new Set<string>();
-    const ctx = this.buildQueryContext(
-      tables,
-      request.user,
-      dependencies,
-      callerReads,
-    );
-    const result = await this.trace("evaluate", request.name, null, (ectx) =>
-      this.runMiddleware(
+    const result = await this.trace("evaluate", request.name, null, (ectx) => {
+      const ctx = this.buildQueryContext(ectx, request.user, {
+        tables,
+        dependencies,
+        callerReads,
+      });
+      return this.runMiddleware(
         ctx,
         {
           type: "query",
@@ -2301,8 +2364,8 @@ export class Vex<A = unknown> {
         },
         () => reg.def.handler(ctx, args),
         ectx,
-      ),
-    );
+      );
+    });
     const json = checkedAnswer(`query ${request.name}`, reg.returns, result);
     return {
       result,
@@ -2733,7 +2796,10 @@ export class Vex<A = unknown> {
       const tables = recording ? new Set<string>() : undefined;
       const dependencies = recording ? ([] as QueryDependency[]) : undefined;
       const result = await this.checkedRun(name, () => {
-        const ctx = this.buildQueryContext(tables, user, dependencies);
+        const ctx = this.buildQueryContext(ectx, user, {
+          tables,
+          dependencies,
+        });
         return this.runMiddleware(
           ctx,
           { type: "query", name, args, access: reg.def.access },

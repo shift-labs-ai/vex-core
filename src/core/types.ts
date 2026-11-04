@@ -271,6 +271,20 @@ export interface QueryContext {
     publishedTables(): PublishedTable[];
   };
   /**
+   * Query `name`, called by name: a call of its own (its args
+   * checked, decided by middleware, its answer checked) as this
+   * query's caller, unless `as` names another. What it reads counts as
+   * read by this query, so a subscription re-runs when it changes. A
+   * query not registered rejects with `Query not found: name`. Within a
+   * plugin a plain function over `ctx` composes as well, and costs
+   * less; this composes queries other plugins own.
+   */
+  query<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    as?: { user: VexUser | null },
+  ): Promise<T>;
+  /**
    * The time, to `resolutionMs` (a whole number, at least 1000): the
    * start of the current interval of that length. The query depends
    * on it: a subscription re-runs when the next interval begins. A
