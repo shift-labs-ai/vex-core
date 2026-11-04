@@ -65,7 +65,9 @@ import type {
   Scheduler,
   StoredTableSchema,
   SubscribeContext,
+  VexEnv,
   VexRuntime,
+  VexServices,
   VexUser,
   WebhookRequest,
   WebhookResponse,
@@ -75,6 +77,8 @@ import {
   type ArgsShape,
   compileArgs,
   compileReturns,
+  frozenJson,
+  isPlainObject,
   serializeJson,
 } from "./values.js";
 
@@ -523,9 +527,36 @@ interface JobRunResult {
  * query, mutation and action of every plugin must declare. Unchosen,
  * there is none to declare.
  */
-export interface VexOptions<A = undefined> {
+/**
+ * `env` and `services`, each required once the app declares a field
+ * it must hold (`VexEnv`, `VexServices`), optional while it declares
+ * none.
+ */
+type HostOptions = (Partial<VexEnv> extends VexEnv
+  ? { env?: VexEnv }
+  : { env: VexEnv }) &
+  (Partial<VexServices> extends VexServices
+    ? { services?: VexServices }
+    : { services: VexServices });
+
+export type VexOptions<A = undefined> = EngineOptions<A> & HostOptions;
+
+interface EngineOptions<A> {
   plugins: Array<PluginFunction<A> | PluginDef<A>>;
   storage: StorageAdapter;
+  /**
+   * The app's settings (`VexEnv`): an object of plain data, checked
+   * and frozen as the engine starts, which every context reads as
+   * `ctx.env` and every plugin's registration as `api.env`. None is
+   * an empty one.
+   */
+  env?: VexEnv;
+  /**
+   * The host's live capabilities (`VexServices`), handed to actions,
+   * jobs and webhooks as `ctx.services`, as given. No query or
+   * mutation holds them. None is an empty set.
+   */
+  services?: VexServices;
   tracer?: Tracer;
   appId?: string;
   handlerTimeoutMs?: number;
@@ -625,6 +656,9 @@ export class Vex<A = unknown> {
   private readonly rowChecks = new Map<string, RowChecks>();
   // The share of runs `purityCheck` repeats.
   private purity = 0;
+  // The app's settings and the host's capabilities (`VexOptions`).
+  private env: Readonly<VexEnv> = NO_ENV;
+  private services: VexServices = NO_SERVICES;
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
   private appId: string = "unknown";
@@ -711,7 +745,11 @@ export class Vex<A = unknown> {
       };
     }
 
-    const plugins = options.plugins.map(resolvePlugin);
+    vex.env = settings(options.env);
+    vex.services = options.services ?? NO_SERVICES;
+    const plugins = options.plugins.map((plugin) =>
+      resolvePlugin(plugin, vex.env),
+    );
     claimTableNames(plugins);
 
     // Register internal tables
@@ -826,6 +864,7 @@ export class Vex<A = unknown> {
       ).map((row) => row.migrationId),
     );
     const context: MigrationContext = {
+      env: this.env,
       // The adapter forgets what it compiled when the schema moves.
       sql: <T>(sql: string, ...params: any[]) =>
         this.storage.rawQuery<T>(sql, ...params),
@@ -1370,6 +1409,8 @@ export class Vex<A = unknown> {
         ),
       runtime: this.runtime(),
       scheduler: this.scheduler(user, (arm) => arm()),
+      env: this.env,
+      services: this.services,
       user: user ?? undefined,
       signal,
     };
@@ -1590,6 +1631,7 @@ export class Vex<A = unknown> {
           }),
         ) as Promise<T>;
       },
+      env: self.env,
       now(resolutionMs: number): number {
         if (!Number.isInteger(resolutionMs) || resolutionMs < 1000) {
           throw new TypeError(
@@ -1802,6 +1844,7 @@ export class Vex<A = unknown> {
     const began = Date.now();
     return {
       now: () => began,
+      env: this.env,
       // Its schedules are its transaction's: armed once it commits.
       scheduler: this.scheduler(user, (arm) => afterCommit.push(arm)),
       id: () => generateId(),
@@ -3424,6 +3467,19 @@ function parseSchedule(schedule: string): number {
 }
 
 const NONE: string[] = [];
+// What an app that gives none holds: its types then require none
+// (`HostOptions`).
+const NO_ENV = Object.freeze({}) as Readonly<VexEnv>;
+const NO_SERVICES = Object.freeze({}) as VexServices;
+
+/** `env` as every context reads it: plain data, copied and frozen. */
+function settings(env: VexEnv | undefined): Readonly<VexEnv> {
+  if (env === undefined) return NO_ENV;
+  if (!isPlainObject(env)) {
+    throw new TypeError("env is an object of settings, as plain data");
+  }
+  return frozenJson(env, "env");
+}
 const WORD = /[\w$]/;
 
 // The tables the engine writes itself, and of them the one no handler

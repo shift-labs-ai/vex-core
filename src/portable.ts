@@ -85,6 +85,8 @@ export type {
   ReactiveBudget,
   SubscribeContext,
   TableSchema,
+  VexEnv,
+  VexServices,
   VexUser,
   WebhookDef,
   WebhookRequest,

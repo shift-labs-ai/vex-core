@@ -274,7 +274,12 @@ export function jsonCopy<T>(value: T, what: string): T {
   return serialized === undefined ? (undefined as T) : JSON.parse(serialized);
 }
 
-function isPlainObject(value: unknown): value is Record<string, any> {
+/** `value` as JSON reads it back, frozen through; refused unless JSON. */
+export function frozenJson<T>(value: T, what: string): Readonly<T> {
+  return deepFreeze(jsonCopy(value, what));
+}
+
+export function isPlainObject(value: unknown): value is Record<string, any> {
   if (value === null || typeof value !== "object") return false;
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;

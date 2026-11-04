@@ -6,6 +6,7 @@ import type {
   PluginDef,
   QueryDef,
   TableSchema,
+  VexEnv,
   WebhookDef,
 } from "./types.js";
 import type { ArgsShape } from "./values.js";
@@ -16,6 +17,8 @@ import type { ArgsShape } from "./values.js";
  * none is not one an engine requiring a declaration accepts.
  */
 export interface VexPluginAPI<A = undefined> {
+  /** The app's settings (`VexEnv`), the same as every context reads. */
+  readonly env: Readonly<VexEnv>;
   setName(name: string): void;
   registerTable(name: string, schema: TableSchema): void;
   registerQuery<S extends ArgsShape>(name: string, def: QueryDef<A, S>): void;
@@ -31,7 +34,9 @@ export interface VexPluginAPI<A = undefined> {
 
 export type PluginFunction<A = undefined> = (api: VexPluginAPI<A>) => void;
 
-export function createPluginAPI<A = undefined>(): {
+export function createPluginAPI<A = undefined>(
+  env: Readonly<VexEnv> = EMPTY_ENV,
+): {
   api: VexPluginAPI<A>;
   resolve: () => PluginDef<A>;
 } {
@@ -45,6 +50,7 @@ export function createPluginAPI<A = undefined>(): {
   const middleware: MiddlewareFn<A>[] = [];
 
   const api: VexPluginAPI<A> = {
+    env,
     setName(n: string) {
       name = n;
     },
@@ -93,11 +99,15 @@ export function createPluginAPI<A = undefined>(): {
   return { api, resolve };
 }
 
+// A plugin resolved outside an engine (a test, a scan) reads none.
+const EMPTY_ENV = Object.freeze({}) as Readonly<VexEnv>;
+
 export function resolvePlugin<A = undefined>(
   input: PluginFunction<A> | PluginDef<A>,
+  env: Readonly<VexEnv> = EMPTY_ENV,
 ): PluginDef<A> {
   if (typeof input === "function") {
-    const { api, resolve } = createPluginAPI<A>();
+    const { api, resolve } = createPluginAPI<A>(env);
     input(api);
     return resolve();
   }

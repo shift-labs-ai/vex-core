@@ -164,6 +164,27 @@ export interface VexUser {
   isAdmin: boolean;
 }
 
+/**
+ * The app's settings (`VexOptions.env`): plain data every context and
+ * every plugin's registration reads, the same on every thread. An app
+ * declares its fields by augmenting this interface:
+ *
+ *   declare module "vex-core" {
+ *     interface VexEnv { sessionRoot: string; publicUrl: string | null }
+ *   }
+ */
+// biome-ignore lint/suspicious/noEmptyInterface: an app augments it.
+export interface VexEnv {}
+
+/**
+ * The host's live capabilities (`VexOptions.services`): a process
+ * fleet, a dispatcher, a network client. Actions alone hold them
+ * (`ActionContext.services`), on the thread that owns them. An app
+ * declares them by augmenting this interface, as it does `VexEnv`.
+ */
+// biome-ignore lint/suspicious/noEmptyInterface: an app augments it.
+export interface VexServices {}
+
 export interface CallContext {
   parent?: ExecContext;
   user?: VexUser | null;
@@ -284,6 +305,8 @@ export interface QueryContext {
     args?: Record<string, any>,
     as?: { user: VexUser | null },
   ): Promise<T>;
+  /** The app's settings (`VexEnv`). */
+  env: Readonly<VexEnv>;
   /**
    * The time, to `resolutionMs` (a whole number, at least 1000): the
    * start of the current interval of that length. The query depends
@@ -338,6 +361,8 @@ export interface MutationContext {
   random(): number;
   /** Functions to run after this mutation commits (`Scheduler`). */
   scheduler: Scheduler;
+  /** The app's settings (`VexEnv`). */
+  env: Readonly<VexEnv>;
   user?: VexUser | null;
 }
 
@@ -370,6 +395,10 @@ export interface ActionContext {
   runtime: VexRuntime;
   /** Functions to run later (`Scheduler`). */
   scheduler: Scheduler;
+  /** The app's settings (`VexEnv`). */
+  env: Readonly<VexEnv>;
+  /** The host's live capabilities (`VexServices`), as the app gave them. */
+  services: VexServices;
   user?: VexUser | null;
   /** Aborted when the caller stops waiting (`/action`'s request
    *  closing): work that outlives its answer stops with it. */
@@ -383,6 +412,8 @@ export interface ActionContext {
  */
 export interface MigrationContext {
   sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
+  /** The app's settings (`VexEnv`). */
+  env: Readonly<VexEnv>;
   /** As the caller `call` names: the system when it names none. */
   query<T = any>(
     name: string,
