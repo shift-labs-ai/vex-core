@@ -12,6 +12,8 @@ npm install vex-core
 
 Peer: `react` ^19 (only if you use `vex-core/client`).
 
+Upgrading: [`docs/upgrading/`](docs/upgrading/), one file per version (from 0.22: [0.23](docs/upgrading/0.23.md)).
+
 ## Quick start
 
 ```ts

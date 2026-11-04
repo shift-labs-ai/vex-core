@@ -901,6 +901,15 @@ describe("the schema changes through migrations; raw access is internal", () => 
     ).rejects.toThrow("Duplicate migration: a");
   });
 
+  test("what an app handles is exported: the schema language and the errors it may catch", async () => {
+    const entry = await import("../src/index.js");
+    const framework = await import("../src/framework/index.js");
+    for (const name of ["Type", "ArgsError", "PurityError", "ReentryError"]) {
+      expect((entry as any)[name]).toBeDefined();
+    }
+    expect(framework.Type).toBe(entry.Type);
+  });
+
   test("the public engine holds no raw access", async () => {
     const vex = await create();
     for (const name of ["unsafeSql", "unsafeGetStorage", "unsafeBulkInsert"]) {

@@ -23,11 +23,13 @@ export { narrowingDrift, UNRESTRICTED } from "./core/access.js";
 export type { PluginFunction, VexPluginAPI } from "./core/api.js";
 export { createPluginAPI, resolvePlugin } from "./core/api.js";
 export type { OperationDescription, VexOptions } from "./core/engine.js";
-export { Vex } from "./core/engine.js";
+// What a handler reaching past its context, and an impure query, throw.
+export { PurityError, Vex } from "./core/engine.js";
 export type {
   EvaluationOptions,
   EvaluationSetup,
 } from "./core/evaluation.js";
+export { ReentryError } from "./core/frames.js";
 export { id } from "./core/id.js";
 // Rate limiting
 export type {
