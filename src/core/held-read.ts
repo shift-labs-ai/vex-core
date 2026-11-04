@@ -1,10 +1,10 @@
 import { leadingSqlKeyword, sqlAfterLeadingComments } from "./sql-text.js";
 import { buildWhereClause, quoteIdent } from "./sql-where.js";
-import type { Hold } from "./types.js";
+import type { Reads } from "./types.js";
 
 /**
  * A raw read held to rows: the statement rewritten so that, inside
- * it, each table named in `over` is the rows its filters match and
+ * it, each table `over` holds is the rows its filters match and
  * nothing else, and only the columns its `reads` name when given. A
  * common table expression of the table's own name, selecting from
  * the base table under its schema (`main`) with the filters as its
@@ -23,20 +23,23 @@ import type { Hold } from "./types.js";
  */
 export function holdStatement(
   sql: string,
-  over: Record<string, Hold>,
+  over: Reads,
   params: any[],
 ): { sql: string; params: any[] } {
   const statement = sqlAfterLeadingComments(sql);
   const keyword = leadingSqlKeyword(statement);
   if (keyword !== "SELECT" && keyword !== "WITH") {
-    throw new Error(`sqlOver holds a read; got ${keyword || "no statement"}`);
+    throw new Error(
+      `ctx.db.sql holds a read; got ${keyword || "no statement"}`,
+    );
   }
   const expressions: string[] = [];
   const bound: any[] = [];
   for (const [table, hold] of Object.entries(over)) {
+    if (hold === "all") continue;
     if (qualified(table).test(statement)) {
       throw new Error(
-        `sqlOver cannot hold ${JSON.stringify(table)}: the statement names it under its schema`,
+        `ctx.db.sql cannot hold ${JSON.stringify(table)}: the statement names it under its schema`,
       );
     }
     const { where: filters, reads } = Array.isArray(hold)

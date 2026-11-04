@@ -107,7 +107,7 @@ export function scalingPlugin(api: VexPluginAPI) {
     args: { scopes: "json" },
     async handler(ctx, args) {
       const scopes = args.scopes as string[];
-      const rows = (await ctx.db.sqlOver(
+      const rows = (await ctx.db.sql(
         { items: [{ column: "scope", operator: "IN", value: scopes }] },
         `SELECT scope, SUM(n) AS sum, COUNT(*) AS count, MAX(version) AS version
            FROM items WHERE scope IN (${scopes.map(() => "?").join(", ")})

@@ -112,8 +112,8 @@ export function equivalencePlugin(api: VexPluginAPI) {
         const sql = `SELECT ${cols.map((c) => (c === "*" ? c : quoteIdent(c))).join(", ")} FROM ${quoteIdent(spec.table)} ORDER BY _id`;
         data =
           spec.raw === "sql"
-            ? await ctx.db.sql(sql)
-            : await ctx.db.sqlOver(
+            ? await ctx.db.sql({ [spec.table]: "all" }, sql)
+            : await ctx.db.sql(
                 {
                   [spec.table]:
                     spec.raw === "over" || !spec.select
@@ -193,12 +193,10 @@ export function equivalencePlugin(api: VexPluginAPI) {
   api.registerMutation("upsert", {
     args: { table: "string", keys: "json", data: "json" },
     handler: (ctx, args) =>
-      ctx.db
-        .table(args.table)
-        .upsert(args.keys as object, {
-          ...(args.data as object),
-          version: next(),
-        }),
+      ctx.db.table(args.table).upsert(args.keys as object, {
+        ...(args.data as object),
+        version: next(),
+      }),
   });
   api.registerMutation("delete", {
     args: { table: "string", id: "string" },

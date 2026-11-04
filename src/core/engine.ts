@@ -29,14 +29,13 @@ import {
   type WriteDependency,
 } from "./trace-metadata.js";
 import type { ExecContext, Tracer } from "./tracer.js";
-import { createRootSpan, isTraceRecording } from "./tracer.js";
+import { createRootSpan, isTraceRecording, noopExecCtx } from "./tracer.js";
 import type {
   ActionContext,
   ActionDef,
   CallContext,
   ColumnType,
   DescribedColumn,
-  Hold,
   JobDef,
   MiddlewareFn,
   MiddlewareInfo,
@@ -48,6 +47,8 @@ import type {
   QueryContext,
   QueryDef,
   ReactiveBudget,
+  Reads,
+  SubscribeContext,
   TableSchema,
   VexRuntime,
   VexUser,
@@ -123,14 +124,63 @@ interface Subscription {
   group: SubscriptionGroup;
   callback: SubscriptionCallback;
   lastHash: number;
+  onError?: SubscribeContext["onError"];
 }
 
-function groupKey(
-  queryName: string,
-  args: Record<string, any>,
-  user: VexUser | null | undefined,
-): string {
-  return `${queryName}\0${JSON.stringify(args)}\0${subscriptionUserKey(user)}`;
+/**
+ * A value as JSON with every object's keys sorted, so two values with
+ * the same data spell alike; null when it holds anything JSON cannot
+ * say (a function, a symbol, a cycle).
+ */
+function canonical(value: unknown, seen = new Set<object>()): string | null {
+  if (value === null || typeof value !== "object") {
+    if (typeof value === "function" || typeof value === "symbol") return null;
+    return value === undefined ? "null" : JSON.stringify(value);
+  }
+  if (seen.has(value)) return null;
+  seen.add(value);
+  try {
+    if (typeof (value as { toJSON?: unknown }).toJSON === "function") {
+      return canonical((value as { toJSON(): unknown }).toJSON(), seen);
+    }
+    if (Array.isArray(value)) {
+      const items = value.map((item) => canonical(item, seen));
+      return items.includes(null) ? null : `[${items.join(",")}]`;
+    }
+    const entries: string[] = [];
+    for (const key of Object.keys(value).sort()) {
+      const item = (value as Record<string, unknown>)[key];
+      if (item === undefined) continue;
+      const spelled = canonical(item, seen);
+      if (spelled === null) return null;
+      entries.push(`${JSON.stringify(key)}:${spelled}`);
+    }
+    return `{${entries.join(",")}}`;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+const callerIdentities = new WeakMap<object, number>();
+let lastCallerIdentity = 0;
+
+/**
+ * Who a caller is, for sharing a group: every field of it. Callers
+ * that are plain data and alike in every field share; one carrying
+ * functions (closures over what it may see) is itself alone, since
+ * nothing says two such are alike. An app that knows which fields
+ * decide what a caller sees says so (`VexOptions.callerKey`).
+ */
+export function defaultCallerKey(user: VexUser | null | undefined): string {
+  if (user == null) return "none";
+  const data = canonical(user);
+  if (data !== null) return `data:${data}`;
+  let identity = callerIdentities.get(user);
+  if (identity === undefined) {
+    identity = ++lastCallerIdentity;
+    callerIdentities.set(user, identity);
+  }
+  return `caller:${identity}`;
 }
 
 /** A measured result as a joiner hears it: its serialized form, read. */
@@ -138,10 +188,6 @@ function parsed(measurement: ReactiveMeasurement): unknown {
   return measurement.serialized === undefined
     ? undefined
     : JSON.parse(measurement.serialized);
-}
-
-function subscriptionUserKey(user: VexUser | null | undefined): string {
-  return JSON.stringify(user ? [user.id, user.name, user.isAdmin] : null);
 }
 
 /**
@@ -396,6 +442,15 @@ export interface VexOptions<A = undefined> {
    */
   jobScheduler?: "timers" | "external" | "none";
   /**
+   * Who a caller is when subscriptions decide whether to share a run:
+   * two callers with one key are answered alike by every query, so
+   * one run serves both. The key must therefore say everything that
+   * decides what a caller may see (an id, its roles, a fence, whom it
+   * acts for). Unset, it is every field of the caller
+   * (`defaultCallerKey`), which never shares wrongly.
+   */
+  callerKey?: (user: VexUser | null | undefined) => string;
+  /**
    * Evaluate subscriptions off the main thread, in workers each running
    * a read-only engine over the same database (`EvaluationOptions`).
    * Where the runtime has no workers, or for a caller that cannot
@@ -444,6 +499,8 @@ export class Vex<A = unknown> {
   // share (`invalidateAfter`).
   private pendingInvalidation: PendingInvalidation | null = null;
   private evaluation: EvaluationPool | null = null;
+  private callerKey: (user: VexUser | null | undefined) => string =
+    defaultCallerKey;
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
   private appId: string = "unknown";
@@ -510,6 +567,7 @@ export class Vex<A = unknown> {
     if (options.tracer) vex.tracer = options.tracer;
     if (options.appId) vex.appId = options.appId;
     if (options.jobScheduler) vex.jobScheduler = options.jobScheduler;
+    if (options.callerKey) vex.callerKey = options.callerKey;
     if (options.handlerTimeoutMs)
       vex.handlerTimeoutMs = options.handlerTimeoutMs;
     if (options.reactive) {
@@ -984,20 +1042,16 @@ export class Vex<A = unknown> {
       }
       return prepared;
     }
-    // A raw read depends on every table it reads, any of whose changes
-    // re-runs it, but for a table it is held to rows of (`over`,
-    // `holdStatement`), whose filters narrow it like a builder read's;
-    // one that reads no table, on any change at all.
-    function trackRaw(
-      tables: readonly string[],
-      over?: Record<string, Hold>,
-    ): void {
+    // A raw read depends on each table it reads as `reads` says: held
+    // to rows, narrowed like a builder read's; whole, on any change to
+    // it. One that reads no table depends on any change at all.
+    function trackRaw(tables: readonly string[], reads?: Reads): void {
       if (!touchedTables && !dependencies) return;
       for (const table of tables) {
         touchedTables?.add(table);
-        const hold = over?.[table];
+        const hold = reads?.[table];
         dependencies?.push(
-          hold === undefined
+          hold === undefined || hold === "all"
             ? { table, raw: true }
             : Array.isArray(hold)
               ? { table, filters: hold }
@@ -1007,27 +1061,64 @@ export class Vex<A = unknown> {
       if (tables.length === 0)
         dependencies?.push({ table: ANY_TABLE, raw: true });
     }
-    // A raw read as the caller, refused over a governed table; held
-    // to the rows `over` names, when given, by the statement itself.
+    // A raw read as the caller, of the tables `reads` names, each held
+    // by the statement itself (`holdStatement`) or read whole; refused
+    // over a governed table or one it does not name.
     function rawRead<T>(
+      reads: Reads,
       sql: string,
       params: any[],
-      over?: Record<string, Hold>,
     ): Promise<T[]> {
-      const held = over ? holdStatement(sql, over, params) : { sql, params };
-      const read = (tables: string[]): Promise<T[]> => {
+      if (typeof reads !== "object" || reads === null) {
+        return Promise.reject(
+          new Error(
+            'ctx.db.sql(reads, sql, ...params): name each table the statement reads, held to rows ({ t: filters }) or whole ({ t: "all" })',
+          ),
+        );
+      }
+      let statement: { sql: string; params: any[] };
+      try {
+        statement = holdStatement(sql, reads, params);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      const held = Object.keys(reads).filter((t) => reads[t] !== "all");
+      const read = (tables: string[], views: string[]): Promise<T[]> => {
         const governed = tables.filter((table) =>
           self.accessPolicies.has(table),
         );
         if (governed.length > 0) {
           return Promise.reject(governedRawSqlError(governed));
         }
-        trackRaw(tables, over);
-        return self.storage.rawQuery<T>(held.sql, ...held.params);
+        // A view reads its base tables by their own names, past the
+        // expressions that hold them: a held read names no view.
+        const named = held.length > 0 ? viewsNamed(sql, views) : NO_VIEWS;
+        if (named.length > 0) {
+          return Promise.reject(
+            new Error(
+              `ctx.db.sql cannot hold ${held.map((t) => JSON.stringify(t)).join(", ")} through a view (${named.join(", ")}): read the table itself`,
+            ),
+          );
+        }
+        const unnamed = tables.filter((table) => !(table in reads));
+        if (unnamed.length > 0) {
+          return Promise.reject(
+            new Error(
+              `ctx.db.sql reads ${unnamed.map((t) => JSON.stringify(t)).join(", ")} without naming ${unnamed.length > 1 ? "them" : "it"}: hold ${unnamed.length > 1 ? "each" : "it"} to rows ({ ${unnamed[0]}: filters }) or read ${unnamed.length > 1 ? "each" : "it"} whole ({ ${unnamed[0]}: "all" })`,
+            ),
+          );
+        }
+        trackRaw(tables, reads);
+        return self.storage.rawQuery<T>(statement.sql, ...statement.params);
       };
-      // Known tables are answered at once, without a microtask hop.
-      const tables = self.rawReadTables(held.sql);
-      return Array.isArray(tables) ? read(tables) : tables.then(read);
+      // Known tables and views are answered at once, without a
+      // microtask hop.
+      const tables = self.rawReadTables(statement.sql);
+      const views = held.length > 0 ? self.viewNames() : NO_VIEWS;
+      if (Array.isArray(tables) && Array.isArray(views)) {
+        return read(tables, views);
+      }
+      return Promise.all([tables, views]).then(([t, v]) => read(t, v));
     }
     ctx = {
       db: {
@@ -1038,13 +1129,11 @@ export class Vex<A = unknown> {
             resolvePrepared(name, policy),
           );
         },
-        sql: <T = Record<string, any>>(sql: string, ...params: any[]) =>
-          rawRead<T>(sql, params),
-        sqlOver: <T = Record<string, any>>(
-          over: Record<string, Hold>,
+        sql: <T = Record<string, any>>(
+          reads: Reads,
           sql: string,
           ...params: any[]
-        ) => rawRead<T>(sql, params, over),
+        ) => rawRead<T>(reads, sql, params),
         async publishedSql<T = Record<string, any>>(
           sql: string,
           ...params: any[]
@@ -1211,6 +1300,18 @@ export class Vex<A = unknown> {
       delete: () => current.delete(),
     };
     return tracked;
+  }
+
+  /** Every view, from the adapter's per-schema list where it keeps one. */
+  private viewNames(): string[] | Promise<string[]> {
+    return (
+      this.storage.viewNames?.() ??
+      this.storage
+        .rawQuery<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'view'",
+        )
+        .then((rows) => rows.map(({ name }) => name))
+    );
   }
 
   /**
@@ -1905,13 +2006,10 @@ export class Vex<A = unknown> {
           try {
             const reg = this.queries.get(group.queryName);
             if (!reg) return;
-            const budget = this.resolveReactive(reg.def);
-            if (budget === false) {
-              meta.disabledSubscriptions =
-                (meta.disabledSubscriptions ?? 0) + group.members.size;
-              this.dropGroup(group);
-              return;
-            }
+            // A group exists only for a reactive query (`subscribe`).
+            const budget = this.resolveReactive(
+              reg.def,
+            ) as Required<ReactiveBudget>;
             const { result, measurement } = await this.runGroup(
               group,
               reg,
@@ -1919,19 +2017,27 @@ export class Vex<A = unknown> {
             );
             try {
               this.assertReactiveBudget(measurement, budget);
-            } catch {
+            } catch (err) {
               meta.budgetExceeded = true;
               meta.disabledSubscriptions =
                 (meta.disabledSubscriptions ?? 0) + group.members.size;
               meta.resultRows = measurement.resultRows;
               meta.resultBytes = measurement.resultBytes;
               meta.budget = budget;
+              // It cannot be answered within its budget: it ends, and
+              // each member is told why.
+              const members = [...group.members];
               this.dropGroup(group);
+              for (const sub of members) this.notify(sub, err as Error, true);
               return;
             }
             this.deliver(group, result, measurement);
           } catch (err) {
+            // A failed run keeps the last answer and runs again on the
+            // next write that reaches it; each member is told meanwhile.
             console.error(`[vex] subscription ${group.queryName} failed:`, err);
+            for (const sub of group.members)
+              this.notify(sub, err as Error, false);
           }
         };
         await Promise.all(affected.map(reEvaluate));
@@ -1956,6 +2062,18 @@ export class Vex<A = unknown> {
           err,
         );
       }
+    }
+  }
+
+  /** Tells a subscriber its view failed; a throwing listener is logged. */
+  private notify(sub: Subscription, error: Error, ended: boolean): void {
+    try {
+      sub.onError?.(error, ended);
+    } catch (err) {
+      console.error(
+        `[vex] subscription ${sub.group.queryName} onError failed:`,
+        err,
+      );
     }
   }
 
@@ -2068,7 +2186,7 @@ export class Vex<A = unknown> {
     name: string,
     args: Record<string, any>,
     callback: SubscriptionCallback,
-    callCtx?: CallContext,
+    callCtx?: SubscribeContext,
   ): Promise<() => void> {
     this.assertOpen();
     const { user } = callCtx ? normalizeCallContext(callCtx) : {};
@@ -2085,7 +2203,7 @@ export class Vex<A = unknown> {
       // made and registered before its first run, so a write
       // committing during the run finds it (`runGroup`). A group with
       // an answer already hands it over without a run.
-      const key = groupKey(name, args, user);
+      const key = `${name}\0${canonical(args) ?? JSON.stringify(args)}\0${this.callerKey(user)}`;
       let group = this.groups.get(key);
       if (!group) {
         group = {
@@ -2104,7 +2222,13 @@ export class Vex<A = unknown> {
         };
         this.groups.set(key, group);
       }
-      const sub: Subscription = { id: subId, group, callback, lastHash: 0 };
+      const sub: Subscription = {
+        id: subId,
+        group,
+        callback,
+        lastHash: 0,
+        onError: callCtx?.onError,
+      };
       group.members.add(sub);
       this.subscriptions.set(subId, sub);
       try {
@@ -2210,11 +2334,19 @@ export class Vex<A = unknown> {
 
   // ─── Unsafe ───
 
+  /**
+   * Runs SQL on the storage as it is: no access policy, no tracking
+   * of what it reads. What it writes is announced like any write:
+   * subscriptions over what it changed re-run, judged as an
+   * unattributed change (every one over the tables it touched).
+   */
   async unsafeSql<T = Record<string, any>>(
     sql: string,
     ...params: any[]
   ): Promise<T[]> {
-    return this.storage.rawQuery<T>(sql, ...params);
+    const rows = await this.storage.rawQuery<T>(sql, ...params);
+    if (statementKind(sql) !== "read") await this.announceWrites();
+    return rows;
   }
 
   async unsafeBulkInsert(
@@ -2236,8 +2368,47 @@ export class Vex<A = unknown> {
     });
   }
 
+  /**
+   * The storage, for code that keeps tables of its own on it: every
+   * write through it is announced as `unsafeSql`'s are, a
+   * transaction's once it commits, so no write can leave a
+   * subscription unaware of it.
+   */
   unsafeGetStorage(): StorageAdapter {
-    return this.storage;
+    const storage = this.storage;
+    const announced =
+      <F extends (...args: any[]) => Promise<any>>(write: F) =>
+      async (...args: Parameters<F>) => {
+        const result = await write(...args);
+        await this.announceWrites();
+        return result;
+      };
+    return {
+      ...storage,
+      insert: announced(storage.insert),
+      upsert: announced(storage.upsert),
+      update: announced(storage.update),
+      delete: announced(storage.delete),
+      bulkInsert: announced(storage.bulkInsert),
+      rawExec: announced(storage.rawExec),
+      rawQuery: async <T>(sql: string, ...params: any[]) => {
+        const rows = await storage.rawQuery<T>(sql, ...params);
+        if (statementKind(sql) !== "read") await this.announceWrites();
+        return rows;
+      },
+      transaction: announced(
+        storage.transaction,
+      ) as StorageAdapter["transaction"],
+    };
+  }
+
+  /**
+   * Invalidates for writes the engine did not make itself, so did not
+   * record: whatever the storage reports changed, judged whole. Not
+   * traced, since a tracer may itself write through the storage.
+   */
+  private announceWrites(): Promise<void> {
+    return this.invalidateAfter(noopExecCtx);
   }
 
   // ─── Introspection ───
@@ -2452,4 +2623,31 @@ function parseSchedule(schedule: string): number {
     default:
       return 0;
   }
+}
+
+const NO_VIEWS: string[] = [];
+const WORD = /[\w$]/;
+
+/**
+ * The views of `views` that `sql` names as a word. A statement reaches
+ * a view only by naming it (a view naming another is reached through
+ * the first); a name inside a string literal counts too, so nothing is
+ * missed and more than needed may be refused.
+ */
+function viewsNamed(sql: string, views: string[]): string[] {
+  if (views.length === 0) return NO_VIEWS;
+  const text = sql.toLowerCase();
+  return views.filter((view) => {
+    const name = view.toLowerCase();
+    for (
+      let at = text.indexOf(name);
+      at !== -1;
+      at = text.indexOf(name, at + 1)
+    ) {
+      const before = text[at - 1] ?? "";
+      const after = text[at + name.length] ?? "";
+      if (!WORD.test(before) && !WORD.test(after)) return true;
+    }
+    return false;
+  });
 }

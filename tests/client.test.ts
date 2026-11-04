@@ -947,6 +947,66 @@ function idleKillingProxy(
   };
 }
 
+describe("WebSocket subscription end", () => {
+  test("a view that outgrows its budget ends on the client too, with the reason", async () => {
+    const { VexClient } = await import("../src/client/client.js");
+    const own = await Vex.create({
+      storage: sqliteAdapter(":memory:"),
+      plugins: [
+        {
+          name: "b",
+          tables: { rows: { columns: { v: "number" } } },
+          queries: {
+            small: {
+              args: {},
+              reactive: { maxRows: 1, maxBytes: 100_000 },
+              handler: async (ctx) => ctx.db.table("rows").all(),
+            },
+          },
+          mutations: {
+            add: {
+              args: { v: "number" },
+              handler: async (ctx, args) => ctx.db.table("rows").insert(args),
+            },
+          },
+        },
+      ],
+    });
+    const handlers = vexWebSocket(own, {});
+    const srv = Bun.serve({
+      port: 0,
+      fetch: (req, s) => handlers.upgrade(req, s),
+      websocket: {
+        open: handlers.open as any,
+        message: handlers.message as any,
+        close: handlers.close as any,
+      },
+    });
+    const client = new VexClient({ basePath: `http://localhost:${srv.port}` });
+    try {
+      let heard!: () => void;
+      let ended!: (error: Error) => void;
+      const first = new Promise<void>((resolve) => {
+        heard = resolve;
+      });
+      const end = new Promise<Error>((resolve) => {
+        ended = resolve;
+      });
+      client.subscribe("b.small", {}, () => heard(), ended);
+      await first;
+      await own.mutate("b.add", { v: 1 });
+      await own.mutate("b.add", { v: 2 });
+      const error = await end;
+      expect(error.message).toContain("budget exceeded");
+      expect(own.activeSubscriptionCount()).toBe(0);
+    } finally {
+      client.close();
+      srv.stop(true);
+      await own.close();
+    }
+  });
+});
+
 describe("WebSocket heartbeat", () => {
   test("an idle client survives an ingress idle timeout", async () => {
     // THE deployment bug: without a heartbeat the socket dies at the

@@ -337,7 +337,17 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           args: { sql: "string" },
           async handler(ctx, args) {
             count(`raw:${args.sql}`);
-            return ctx.db.sql(args.sql);
+            // Every table these reads may reach, each read whole.
+            return ctx.db.sql(
+              {
+                items: "all",
+                other: "all",
+                secrets: "all",
+                loose: "all",
+                children: "all",
+              },
+              args.sql,
+            );
           },
         });
         api.registerMutation("raw", {

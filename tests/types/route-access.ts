@@ -16,7 +16,9 @@ const ok = () => new Response("ok");
 const app = createRouter<Access>();
 app.get("/notes", { access: { permission: "notes.read" } }, ok);
 app.post("/notes", { access: { permission: "notes.write" } }, ok, ok);
-app.get("/health", { access: "public" }, ok).head("/health", { access: "public" }, ok);
+app
+  .get("/health", { access: "public" }, ok)
+  .head("/health", { access: "public" }, ok);
 
 // A route without a declaration does not build.
 // @ts-expect-error access is required

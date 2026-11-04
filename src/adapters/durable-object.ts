@@ -90,6 +90,7 @@ export function durableObjectAdapter(
         "SELECT rootpage, tbl_name FROM sqlite_master WHERE rootpage > 0",
         [],
       ),
+    views: () => run("SELECT name FROM sqlite_master WHERE type = 'view'", []),
   };
   const state = new SqliteAdapterState();
 
@@ -270,6 +271,11 @@ export function durableObjectAdapter(
     tablesRead(query: string) {
       open();
       return state.tablesRead(introspection, query);
+    },
+
+    viewNames() {
+      open();
+      return state.viewNames(introspection);
     },
 
     readOnlyTables(query: string) {

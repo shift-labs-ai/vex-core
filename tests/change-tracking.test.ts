@@ -57,7 +57,10 @@ describe("sqlite (file): a subscription over a table created by raw SQL", () => 
             args: {},
             async handler(ctx) {
               runs++;
-              return ctx.db.sql("SELECT count(*) AS c FROM loose");
+              return ctx.db.sql(
+                { loose: "all" },
+                "SELECT count(*) AS c FROM loose",
+              );
             },
           });
           api.registerMutation("touch", {

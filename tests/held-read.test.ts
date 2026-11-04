@@ -1,5 +1,5 @@
 /**
- * A raw read held to rows (`sqlOver`) is held by the statement the
+ * A raw read held to rows (`ctx.db.sql`) is held by the statement the
  * engine runs, not by the handler's word: inside it, a held table is
  * the rows its filters match and nothing else.
  */
@@ -31,7 +31,7 @@ function plugin(api: VexPluginAPI) {
   api.registerQuery("count", {
     args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sqlOver(
+      ctx.db.sql(
         {
           messages: [
             { column: "sessionId", operator: "=", value: args.sessionId },
@@ -45,7 +45,7 @@ function plugin(api: VexPluginAPI) {
     args: { sessionIds: "json" },
     handler: (ctx, args) => {
       const ids = args.sessionIds as string[];
-      return ctx.db.sqlOver(
+      return ctx.db.sql(
         { messages: [{ column: "sessionId", operator: "IN", value: ids }] },
         ids
           .map(
@@ -60,7 +60,7 @@ function plugin(api: VexPluginAPI) {
   api.registerQuery("withOwnCte", {
     args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sqlOver(
+      ctx.db.sql(
         {
           messages: [
             { column: "sessionId", operator: "=", value: args.sessionId },
@@ -72,7 +72,7 @@ function plugin(api: VexPluginAPI) {
   api.registerQuery("bypass", {
     args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sqlOver(
+      ctx.db.sql(
         {
           messages: [
             { column: "sessionId", operator: "=", value: args.sessionId },
@@ -85,7 +85,7 @@ function plugin(api: VexPluginAPI) {
   api.registerQuery("texts", {
     args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sqlOver(
+      ctx.db.sql(
         {
           messages: {
             where: [
@@ -100,7 +100,7 @@ function plugin(api: VexPluginAPI) {
   api.registerQuery("pastColumns", {
     args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sqlOver(
+      ctx.db.sql(
         {
           messages: {
             where: [
@@ -120,7 +120,7 @@ function plugin(api: VexPluginAPI) {
   api.registerQuery("twoTables", {
     args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sqlOver(
+      ctx.db.sql(
         {
           messages: [
             { column: "sessionId", operator: "=", value: args.sessionId },
@@ -211,7 +211,7 @@ describe("a raw read held to rows", () => {
   test("naming a held table under its schema is refused, in every spelling", async () => {
     const vex = await create();
     await expect(vex.query("h.bypass", { sessionId: "a" })).rejects.toThrow(
-      'sqlOver cannot hold "messages"',
+      'ctx.db.sql cannot hold "messages"',
     );
     for (const spelling of [
       "main.messages",
@@ -271,7 +271,7 @@ describe("a raw read held to rows", () => {
   test("only a read is held", () => {
     for (const sql of ["DELETE FROM messages", "VALUES (1)", ""]) {
       expect(() => holdStatement(sql, { messages: [] }, [])).toThrow(
-        "sqlOver holds a read",
+        "ctx.db.sql holds a read",
       );
     }
   });

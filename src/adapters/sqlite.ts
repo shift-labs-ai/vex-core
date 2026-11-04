@@ -454,6 +454,10 @@ export function sqliteAdapter(
         all(
           "SELECT rootpage, tbl_name FROM sqlite_master WHERE rootpage > 0",
         ) as { rootpage: number; tbl_name: string }[],
+      views: () =>
+        all("SELECT name FROM sqlite_master WHERE type = 'view'") as {
+          name: string;
+        }[],
     };
   }
   const writerIntrospection = introspection(db);
@@ -787,6 +791,12 @@ export function sqliteAdapter(
 
     readOnlyTables(sql: string) {
       return analyzeRead((on) => state.readOnlyTables(on, sql));
+    },
+
+    viewNames() {
+      return (
+        state.cachedViewNames() ?? analyzeRead((on) => state.viewNames(on))
+      );
     },
 
     getSchema(table: string) {

@@ -151,6 +151,17 @@ export interface CallContext {
   signal?: AbortSignal;
 }
 
+/** How a subscription is made: as whom, and whom to tell of failures. */
+export interface SubscribeContext extends CallContext {
+  /**
+   * The subscription's view could not be produced. `ended`: it is
+   * over (its result outgrew its reactive budget) and hears nothing
+   * more. Otherwise a run failed: the subscriber keeps the last
+   * answer, and the next write that reaches the view runs it again.
+   */
+  onError?: (error: Error, ended: boolean) => void;
+}
+
 export interface SubscriptionSummary {
   total: number;
   unique: number;
@@ -188,29 +199,37 @@ export interface PublishedTable {
 }
 
 /**
- * How a raw read is held to a table (`QueryContext.db.sqlOver`): the
- * rows its filters match, and, when `reads` is given, those columns
- * of them alone.
+ * How a raw read is held to a table it reads (`QueryContext.db.sql`):
+ * to the rows its filters match, and, when `reads` is given, to those
+ * columns of them alone.
  */
 export type Hold = Filter[] | { where: Filter[]; reads: string[] };
+
+/**
+ * What a raw read reads (`QueryContext.db.sql`): each table it reads,
+ * held to rows (`Hold`), or read whole (`"all"`), every write to which
+ * re-runs its subscriptions.
+ */
+export type Reads = Record<string, Hold | "all">;
 
 export interface QueryContext {
   db: {
     table(name: string): QueryBuilder;
-    sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
     /**
-     * A raw read held to the rows `over` names: inside the statement,
-     * each table there is the rows its filters match (an AND of
-     * them) and nothing else, and only the columns `reads` names
-     * when given, so a write to other rows, or to other columns of
-     * them, does not re-run a subscription that made it. Every other
-     * table it reads it depends on whole, as `sql` does. The hold is
-     * the engine's, not the handler's word: a statement cannot read
-     * past it. One naming a held table under its schema (`main.t`)
-     * is refused.
+     * A raw read, of the tables `reads` names and no other: a table
+     * read but not named is refused, so what a subscription depends on
+     * is written down where it is read. A table held to rows (`Hold`)
+     * is, inside the statement, those rows and nothing else, and only
+     * the columns its `reads` name when given: a write to other rows,
+     * or to other columns of them, does not re-run a subscription that
+     * made it. A table read whole (`"all"`) re-runs it on every write.
+     * The hold is the engine's, not the handler's word: a statement
+     * cannot read past it, and one naming a held table under its
+     * schema (`main.t`) is refused. A governed table is refused too,
+     * as raw SQL cannot apply its policy.
      */
-    sqlOver<T = Record<string, any>>(
-      over: Record<string, Hold>,
+    sql<T = Record<string, any>>(
+      reads: Reads,
       sql: string,
       ...params: any[]
     ): Promise<T[]>;

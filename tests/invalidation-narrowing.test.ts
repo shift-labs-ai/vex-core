@@ -148,7 +148,7 @@ function plugin(api: VexPluginAPI) {
   // A sidebar's previews: one raw statement over many sessions' rows,
   // held to those sessions.
   counted("previews", (ctx, ids: string[]) =>
-    ctx.db.sqlOver(
+    ctx.db.sql(
       { sessions: [{ column: "_id", operator: "IN", value: ids }] },
       `SELECT _id, title FROM sessions WHERE _id IN (${ids.map(() => "?").join(", ")}) ORDER BY title`,
       ...ids,
@@ -534,7 +534,7 @@ describe("invalidation narrowing (SHFT-2537)", () => {
     expect(ran("mine")).toBe(mineRuns);
   });
 
-  test("a raw read held to rows (sqlOver) is skipped like a builder read, and traced as narrowed", async () => {
+  test("a raw read held to rows is skipped like a builder read, and traced as narrowed", async () => {
     const spans: Span[] = [];
     const vex = await create({
       tracer: { onSpan: (span) => spans.push(span) },

@@ -171,14 +171,17 @@ function reactivityPlugin(api: VexPluginAPI) {
     args: {},
     async handler(ctx) {
       rawRuns++;
-      return ctx.db.sql("SELECT * FROM items ORDER BY name ASC");
+      return ctx.db.sql(
+        { items: "all" },
+        "SELECT * FROM items ORDER BY name ASC",
+      );
     },
   });
   api.registerQuery("rawUnknown", {
     args: {},
     async handler(ctx) {
       rawRuns++;
-      return ctx.db.sql("SELECT 1 as value");
+      return ctx.db.sql({}, "SELECT 1 as value");
     },
   });
   api.registerQuery("flaky", {

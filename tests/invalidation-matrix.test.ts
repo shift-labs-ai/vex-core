@@ -274,14 +274,17 @@ const SHAPES: Record<string, Shape> = {
     u: await ctx.db.table("u").order("name", "asc").all(),
   }),
   "raw SELECT scope = a": (ctx) =>
-    ctx.db.sql("SELECT name FROM t WHERE scope = 'a' ORDER BY name"),
-  "sqlOver scope IN [a,b]": (ctx) =>
-    ctx.db.sqlOver(
+    ctx.db.sql(
+      { t: "all" },
+      "SELECT name FROM t WHERE scope = 'a' ORDER BY name",
+    ),
+  "held scope IN [a,b]": (ctx) =>
+    ctx.db.sql(
       { t: [{ column: "scope", operator: "IN", value: ["a", "b"] }] },
       "SELECT scope, COUNT(*) AS n FROM t GROUP BY scope ORDER BY scope",
     ),
-  "sqlOver _id = A1 (UNION ALL)": (ctx, ids) =>
-    ctx.db.sqlOver(
+  "held _id = A1 (UNION ALL)": (ctx, ids) =>
+    ctx.db.sql(
       { t: [{ column: "_id", operator: "=", value: ids.A1 }] },
       "SELECT name FROM t UNION ALL SELECT name FROM t WHERE n > 0",
     ),
@@ -416,16 +419,14 @@ const WRITES: Record<string, Write> = {
         { kind: "q", name: "a1", n: 5, flag: false },
       ),
   "insert scope a with own _id": (ctx) =>
-    ctx.db
-      .table("t")
-      .insert({
-        _id: "own-a",
-        scope: "a",
-        kind: "k",
-        name: "a7",
-        n: 1,
-        flag: false,
-      }),
+    ctx.db.table("t").insert({
+      _id: "own-a",
+      scope: "a",
+      kind: "k",
+      name: "a7",
+      n: 1,
+      flag: false,
+    }),
   "delete where scope IN [c]": (ctx) =>
     ctx.db.table("t").where("scope", "IN", ["c"]).delete(),
   "delete where n > 40": (ctx) =>

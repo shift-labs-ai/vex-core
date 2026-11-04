@@ -676,6 +676,8 @@ export interface SqliteIntrospection {
   explain(statement: string): ExplainRow[];
   /** The root page of every table and index in the main database. */
   rootPages(): { rootpage: number; tbl_name: string }[];
+  /** The name of every view in the main database. */
+  views(): { name: string }[];
 }
 
 // The cursors a program opens on stored tables. `Clear` is DELETE
@@ -757,6 +759,7 @@ export class SqliteAdapterState {
     ANALYSIS_CACHE_SIZE,
   );
   private roots: Map<number, string> | null = null;
+  private viewList: string[] | null = null;
   private dataVersion: number | undefined;
   private schemaEpoch = 0;
 
@@ -789,6 +792,18 @@ export class SqliteAdapterState {
     this.reads.clear();
     this.plainReads.clear();
     this.roots = null;
+    this.viewList = null;
+  }
+
+  /** The views as last listed for this schema; null when not listed yet. */
+  cachedViewNames(): string[] | null {
+    return this.viewList;
+  }
+
+  /** The views in the main database, listed once per schema. */
+  viewNames(introspection: SqliteIntrospection): string[] {
+    this.viewList ??= introspection.views().map(({ name }) => name);
+    return this.viewList;
   }
 
   /**

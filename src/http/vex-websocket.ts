@@ -466,7 +466,16 @@ async function handleSubscribe(
       frame.name,
       frame.args ?? {},
       sendSubscriptionData,
-      ws.data.user ? { user: ws.data.user } : undefined,
+      {
+        ...(ws.data.user ? { user: ws.data.user } : {}),
+        // An ended subscription is the client's to drop: the error
+        // frame is terminal there.
+        onError: (error, ended) => {
+          if (!ended || !ws.data.subs.has(frame.id)) return;
+          ws.data.subs.delete(frame.id);
+          sendFailure(ws, frame.id, error);
+        },
+      },
     );
   } catch (err) {
     ws.data.subs.delete(frame.id);

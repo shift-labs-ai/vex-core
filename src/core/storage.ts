@@ -72,6 +72,11 @@ export interface StorageAdapter {
    * refuses `publishedSql` outright.
    */
   readOnlyTables?(sql: string): ReadOnlyRead | Promise<ReadOnlyRead>;
+  /**
+   * The name of every view, listed once per schema. Without it the
+   * engine lists them for each raw read that holds a table.
+   */
+  viewNames?(): string[] | Promise<string[]>;
   getSchema(table: string): TableSchema | null;
   close(): Promise<void> | void;
 }
