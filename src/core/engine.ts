@@ -214,7 +214,7 @@ type Family = Map<
   string,
   {
     reads: ReadonlySet<string> | null;
-    bySeen: Map<string, Set<SubscriptionGroup>>;
+    bySeen: Map<string, Slot>;
   }
 >;
 
@@ -2214,11 +2214,12 @@ export class Vex<A = unknown> {
    * in it finds the group by lookup (`joinableGroup`).
    */
   private fileCaller(group: SubscriptionGroup): void {
-    this.unfileCaller(group);
     const at = {
       reads: readsKey(group.reads),
       seen: callerSeen(group.user, group.reads),
     };
+    const was = group.callerFiling;
+    if (was && was.reads === at.reads && was.seen === at.seen) return;
     let family = this.families.get(group.family);
     if (!family) {
       family = new Map();
@@ -2233,13 +2234,10 @@ export class Vex<A = unknown> {
       };
       family.set(at.reads, file);
     }
-    let groups = file.bySeen.get(at.seen);
-    if (!groups) {
-      groups = new Set();
-      file.bySeen.set(at.seen, groups);
-    }
-    groups.add(group);
+    slotAdd(file.bySeen, at.seen, group);
     group.callerFiling = at;
+    // Filed anew before leaving where it was, so its family stays.
+    if (was) this.leaveFiling(group, was);
   }
 
   /** Unfiles `group` from where its family filed it. */
@@ -2247,12 +2245,17 @@ export class Vex<A = unknown> {
     const at = group.callerFiling;
     if (!at) return;
     group.callerFiling = undefined;
+    this.leaveFiling(group, at);
+  }
+
+  private leaveFiling(
+    group: SubscriptionGroup,
+    at: { reads: string; seen: string },
+  ): void {
     const family = this.families.get(group.family);
     const file = family?.get(at.reads);
-    const groups = file?.bySeen.get(at.seen);
-    if (!family || !file || !groups) return;
-    groups.delete(group);
-    if (groups.size === 0) file.bySeen.delete(at.seen);
+    if (!family || !file) return;
+    slotDelete(file.bySeen, at.seen, group);
     if (file.bySeen.size === 0) family.delete(at.reads);
     if (family.size === 0) this.families.delete(group.family);
   }
@@ -2578,8 +2581,9 @@ export class Vex<A = unknown> {
     user: VexUser | null | undefined,
   ): SubscriptionGroup | undefined {
     for (const file of this.families.get(family)?.values() ?? []) {
-      const groups = file.bySeen.get(callerSeen(user, file.reads));
-      if (groups) for (const group of groups) return group;
+      const slot = file.bySeen.get(callerSeen(user, file.reads));
+      if (slot instanceof Set) for (const group of slot) return group;
+      else if (slot) return slot;
     }
     return undefined;
   }
