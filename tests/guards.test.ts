@@ -229,3 +229,26 @@ try {
     expect(out).toContain("bun --preload vex-core/guard");
   });
 });
+
+describe("a guard survives being wrapped", () => {
+  test("a library assigning a wrapper over a guarded global leaves it guarded, and the wrapper works", async () => {
+    const vex = await engine();
+    const originalNow = Date.now;
+    let wrapped = 0;
+    // As instrumentation does: wrap, calling what it wrapped.
+    Date.now = () => {
+      wrapped++;
+      return originalNow.call(Date);
+    };
+    try {
+      expect(typeof Date.now()).toBe("number");
+      expect(wrapped).toBe(1);
+      reach = "Date.now";
+      await expect(vex.query("g.reach")).rejects.toThrow("is refused in query");
+      expect((Date.now as any)[Symbol.for("vex.guarded")]).toBe(true);
+    } finally {
+      Date.now = originalNow;
+    }
+    expect(wrapped).toBe(1);
+  });
+});

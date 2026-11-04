@@ -27,6 +27,9 @@ interface Frame {
 }
 
 const frames = new AsyncLocalStorage<Frame>();
+// Set while a guard calls a wrapper assigned over it: the wrapper's
+// own call to the function it wrapped goes to the original.
+const throughWrapper = new AsyncLocalStorage<boolean>();
 
 /** Runs `fn` as handler `name` of `kind`. */
 export function inFrame<T>(kind: FrameKind, name: string, fn: () => T): T {
@@ -108,16 +111,32 @@ function guardFunction(
   if (!owner) return;
   const original = owner[key];
   if (typeof original !== "function" || original[GUARDED]) return;
+  // What the guard calls through to: the original, or a wrapper a
+  // library or instrumentation assigned since (the setter below).
+  let inner: (...args: any[]) => any = original;
+  const through = (call: () => any) =>
+    inner === original ? call() : throughWrapper.run(true, call);
   const guarded = new Proxy(original, {
     apply(target, self, args) {
+      // A wrapper calling the function it wrapped reaches the original.
+      if (throughWrapper.getStore()) return Reflect.apply(target, self, args);
       const refused = refusal(label, category);
       if (refused) throw refused;
-      return Reflect.apply(target, self, args);
+      return through(() => Reflect.apply(inner, self, args));
     },
     construct(target, args, newTarget) {
+      if (throughWrapper.getStore()) {
+        return Reflect.construct(target, args, newTarget);
+      }
       const refused = refusal(label, category);
       if (refused) throw refused;
-      return Reflect.construct(target, args, newTarget);
+      return through(() =>
+        Reflect.construct(
+          inner,
+          args,
+          newTarget === guarded ? inner : newTarget,
+        ),
+      );
     },
     get(target, prop, receiver) {
       if (prop === GUARDED) return true;
@@ -125,18 +144,30 @@ function guardFunction(
       return Reflect.get(target, prop, receiver);
     },
   });
+  // An accessor: reading it is always the guard, and assigning to it
+  // (a library wrapping it) changes only what the guard calls through
+  // to, so a wrapper never unguards it.
   try {
-    owner[key] = guarded;
+    const descriptor = Object.getOwnPropertyDescriptor(owner, key);
+    Object.defineProperty(owner, key, {
+      configurable: true,
+      enumerable: descriptor?.enumerable ?? true,
+      get: () => guarded,
+      set: (fn: unknown) => {
+        if (typeof fn === "function" && fn !== guarded) {
+          inner = fn as (...args: any[]) => any;
+        } else if (fn === guarded) {
+          inner = original;
+        }
+      },
+    });
   } catch {
+    // A property that cannot become an accessor (the runtime's own,
+    // such as Bun's) is assigned instead; one that cannot be assigned
+    // either stays unguarded, and `assertGuarded` names it.
     try {
-      Object.defineProperty(owner, key, {
-        value: guarded,
-        writable: true,
-        configurable: true,
-      });
-    } catch {
-      // A frozen property cannot be guarded: `assertGuarded` names it.
-    }
+      owner[key] = guarded;
+    } catch {}
   }
 }
 
