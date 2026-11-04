@@ -806,14 +806,12 @@ export class Vex<A = unknown> {
       await vex.registerPlugin(plugin);
     }
     await vex.migrate(options.migrations ?? []);
-    // Jobs arm last: none runs against data a migration has yet to
-    // change.
-    for (const plugin of plugins) await vex.registerJobs(plugin);
-    await vex.recoverScheduled();
 
-    // After every table is ensured: a worker's read-only engine
-    // registers the tables it finds, and refuses one it does not.
-    // The engine starts with its workers built, or not at all.
+    // After every table is ensured and migrated: a worker's read-only
+    // engine registers the tables it finds, and refuses one it does
+    // not. The engine starts with its workers built, or not at all;
+    // before any job or schedule arms, so a failure leaves nothing
+    // running, as a failed migration does.
     if (options.evaluation && reader && workersAvailable()) {
       const pool = new EvaluationPool(
         new URL("./evaluation-worker.js", import.meta.url),
@@ -826,17 +824,22 @@ export class Vex<A = unknown> {
           reactive: vex.reactiveDefaults,
         },
       );
-      vex.evaluation = pool;
       try {
         await pool.ready;
       } catch (error) {
-        await vex.close();
+        pool.close();
         throw new Error(
           `an evaluation worker could not build its engine: ${error instanceof Error ? error.message : String(error)}`,
           { cause: error },
         );
       }
+      vex.evaluation = pool;
     }
+
+    // Jobs arm last: none runs against data a migration has yet to
+    // change.
+    for (const plugin of plugins) await vex.registerJobs(plugin);
+    await vex.recoverScheduled();
 
     return vex;
   }
