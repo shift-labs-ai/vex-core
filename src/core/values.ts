@@ -9,11 +9,18 @@ import { Compile } from "typebox/compile";
 import { HttpError } from "../http/error.js";
 
 /**
+ * A schema as `Type` builds it. Each TypeBox kind carries its `~kind`;
+ * a string or a plain object (`"string"`, `{ type: "number" }`) does
+ * not, so neither is one, though `TSchema` alone would take either.
+ */
+export type Schema = TSchema & { readonly "~kind": string };
+
+/**
  * What an operation takes: each arg's name and its schema, a TypeBox
  * type (JSON Schema that infers as TypeScript). The handler's args are
  * `ArgsOf` the shape.
  */
-export type ArgsShape = Record<string, TSchema>;
+export type ArgsShape = Record<string, Schema>;
 
 /** The args a handler receives for `S`. */
 export type ArgsOf<S extends ArgsShape> = Static<TObject<S>>;

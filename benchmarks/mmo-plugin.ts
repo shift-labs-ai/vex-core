@@ -30,31 +30,31 @@ export function mmoPlugin(api: VexPluginAPI) {
   api.setName("mmo");
   api.registerTable("players", {
     columns: {
-      name: { type: "string" },
-      zone: { type: "string", index: true },
-      partyId: { type: "string", index: true },
-      guildId: { type: "string", index: true },
-      level: { type: "number", index: true },
-      x: { type: "number" },
-      y: { type: "number" },
-      cell: { type: "string" },
-      hp: { type: "number" },
+      name: Type.String(),
+      zone: Type.String({ index: true }),
+      partyId: Type.String({ index: true }),
+      guildId: Type.String({ index: true }),
+      level: Type.Number({ index: true }),
+      x: Type.Number(),
+      y: Type.Number(),
+      cell: Type.String(),
+      hp: Type.Number(),
     },
     indexes: [["idx_players_zone_cell", ["zone", "cell"]]],
   });
   api.registerTable("items", {
     columns: {
-      playerId: { type: "string", index: true },
-      kind: { type: "string" },
-      qty: { type: "number" },
+      playerId: Type.String({ index: true }),
+      kind: Type.String(),
+      qty: Type.Number(),
     },
   });
   api.registerTable("messages", {
     columns: {
-      channel: { type: "string", index: true },
-      playerId: { type: "string" },
-      text: { type: "string" },
-      at: { type: "number" },
+      channel: Type.String({ index: true }),
+      playerId: Type.String(),
+      text: Type.String(),
+      at: Type.Number(),
     },
     indexes: [["idx_messages_channel_at", ["channel", "at"]]],
   });

@@ -40,3 +40,16 @@ api.registerAction("a", {
     return null;
   },
 });
+
+// Only a schema `Type` builds is one: the old declarations are not.
+api.registerQuery("old", {
+  // @ts-expect-error a type's name is not a schema
+  args: { s: "string" },
+  handler: () => null,
+});
+api.registerTable("old", {
+  columns: {
+    // @ts-expect-error a plain object is not a schema
+    n: { type: "number", optional: true },
+  },
+});

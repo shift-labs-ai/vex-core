@@ -1,7 +1,6 @@
-import type { TSchema } from "typebox";
 import type { TableAccessPolicy } from "./access.js";
 import type { ExecContext } from "./tracer.js";
-import type { ArgsOf, ArgsShape } from "./values.js";
+import type { ArgsOf, ArgsShape, Schema } from "./values.js";
 
 /** How storage keeps a column: its storage type. */
 export type ColumnType = "string" | "number" | "boolean" | "json";
@@ -12,7 +11,7 @@ export type ColumnType = "string" | "number" | "boolean" | "json";
  * with it. `default` is the schema's: the value an insert that omits
  * the column gives it.
  */
-export type ColumnDef = TSchema & {
+export type ColumnDef = Schema & {
   index?: boolean;
   /**
    * Every name this column has had before. When the table has a column
@@ -414,14 +413,14 @@ export type OperationAccess<A> = undefined extends A
  */
 export type QueryDef<A = undefined, S extends ArgsShape = any> = {
   args: S;
-  returns?: TSchema;
+  returns?: Schema;
   reactive?: false | ReactiveBudget;
   handler: (ctx: QueryContext, args: ArgsOf<S>) => Promise<any> | any;
 } & OperationAccess<A>;
 
 export type MutationDef<A = undefined, S extends ArgsShape = any> = {
   args: S;
-  returns?: TSchema;
+  returns?: Schema;
   handler: (ctx: MutationContext, args: ArgsOf<S>) => Promise<any> | any;
 } & OperationAccess<A>;
 
@@ -433,7 +432,7 @@ export type MutationDef<A = undefined, S extends ArgsShape = any> = {
  */
 export type ActionDef<A = undefined, S extends ArgsShape = any> = {
   args: S;
-  returns?: TSchema;
+  returns?: Schema;
   handler: (ctx: ActionContext, args: ArgsOf<S>) => Promise<any> | any;
 } & OperationAccess<A>;
 

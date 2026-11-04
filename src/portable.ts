@@ -86,5 +86,5 @@ export type {
   WebhookRequest,
   WebhookResponse,
 } from "./core/types.js";
-export type { ArgsOf, ArgsShape } from "./core/values.js";
+export type { ArgsOf, ArgsShape, Schema } from "./core/values.js";
 export { ArgsError } from "./core/values.js";

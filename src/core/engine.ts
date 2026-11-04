@@ -263,7 +263,7 @@ const RAW_WRITE: WriteDependency = { table: ANY_TABLE, raw: true };
 const DELETE_ROWS_RECORDED = 200;
 
 const columnTypesBySchema = new WeakMap<
-  TableSchema,
+  StoredTableSchema,
   Record<string, ColumnType>
 >();
 

@@ -50,24 +50,24 @@ export function benchmarkPlugin(api: VexPluginAPI) {
   api.setName("b");
   api.registerTable("sessions", {
     columns: {
-      workspaceId: { type: "string", index: true },
-      platform: { type: "string", index: true },
-      title: { type: "string" },
-      lastSeenAt: { type: "number", index: true },
-      enabled: { type: "number" },
+      workspaceId: Type.String({ index: true }),
+      platform: Type.String({ index: true }),
+      title: Type.String(),
+      lastSeenAt: Type.Number({ index: true }),
+      enabled: Type.Number(),
     },
     access: sessionsAccess,
   });
   api.registerTable("grants", {
     columns: {
-      userId: { type: "string", index: true },
-      sessionId: { type: "string", index: true },
+      userId: Type.String({ index: true }),
+      sessionId: Type.String({ index: true }),
     },
   });
   api.registerTable("messages", {
     columns: {
-      sessionId: { type: "string", index: true },
-      text: { type: "string" },
+      sessionId: Type.String({ index: true }),
+      text: Type.String(),
     },
   });
 
