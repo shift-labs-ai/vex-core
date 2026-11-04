@@ -175,13 +175,11 @@ export function mmoPlugin(api: VexPluginAPI) {
   api.registerMutation("move", {
     args: { id: "string", x: "number", y: "number" },
     handler: (ctx, args) =>
-      ctx.db
-        .table("players")
-        .update(args.id, {
-          x: args.x,
-          y: args.y,
-          cell: cellOf(args.x, args.y),
-        }),
+      ctx.db.table("players").update(args.id, {
+        x: args.x,
+        y: args.y,
+        cell: cellOf(args.x, args.y),
+      }),
   });
   api.registerMutation("damage", {
     args: { id: "string", hp: "number" },

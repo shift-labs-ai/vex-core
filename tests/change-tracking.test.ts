@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import { Vex } from "../src/core/engine.js";
 import { ANY_TABLE } from "../src/core/storage.js";
+import { rawSql } from "../src/internal.js";
 import { changeTrackingSuite } from "./change-tracking-suite.js";
 
 changeTrackingSuite("sqlite (memory)", () => sqliteAdapter(":memory:"));
@@ -72,7 +73,7 @@ describe("sqlite (file): a subscription over a table created by raw SQL", () => 
     });
     const theirs = sqliteAdapter(file);
     try {
-      await vex.unsafeSql("CREATE TABLE loose (v TEXT)");
+      await rawSql(vex, "CREATE TABLE loose (v TEXT)");
       await vex.subscribe("t.loose", {}, () => {});
       const before = runs;
       await theirs.rawExec("INSERT INTO loose VALUES ('x')");

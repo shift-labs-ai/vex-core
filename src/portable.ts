@@ -65,6 +65,8 @@ export type {
   JobDef,
   MiddlewareFn,
   MiddlewareInfo,
+  Migration,
+  MigrationContext,
   MutationContext,
   MutationDef,
   MutationTable,

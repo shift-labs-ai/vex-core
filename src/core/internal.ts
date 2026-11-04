@@ -6,6 +6,14 @@ import type { TableSchema } from "./types.js";
  */
 
 export const INTERNAL_TABLES: Record<string, TableSchema> = {
+  // Each migration applied, by id (VexOptions.migrations).
+  _migrations: {
+    columns: {
+      migrationId: { type: "string", index: true },
+      appliedAt: { type: "number" },
+    },
+    unique: [["migrationId"]],
+  },
   _spans: {
     columns: {
       traceId: { type: "string", index: true },

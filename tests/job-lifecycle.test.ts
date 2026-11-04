@@ -16,6 +16,7 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { JobDef } from "../src/core/types.js";
+import { rawSql } from "../src/internal.js";
 
 let open: Vex[] = [];
 afterEach(async () => {
@@ -63,7 +64,8 @@ function counting(): { job: JobDef; runs: () => number } {
 const oneInterval = () => new Promise((resolve) => setTimeout(resolve, 1_200));
 
 async function jobRows(vex: Vex, name: string): Promise<number> {
-  const [row] = await vex.unsafeSql<{ c: number }>(
+  const [row] = await rawSql<{ c: number }>(
+    vex,
     "SELECT count(*) AS c FROM _jobs WHERE name = ?",
     name,
   );
@@ -92,7 +94,8 @@ describe("the last call for a job name wins", () => {
     await oneInterval();
     expect(first.runs()).toBe(0);
     expect(second.runs()).toBe(1);
-    const rows = await vex.unsafeSql<{ plugin: string }>(
+    const rows = await rawSql<{ plugin: string }>(
+      vex,
       "SELECT plugin FROM _jobs WHERE name = 'x'",
     );
     expect(rows).toEqual([{ plugin: "second" }]);

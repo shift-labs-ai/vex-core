@@ -15,6 +15,7 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { StorageAdapter } from "../src/core/storage.js";
 import type { VexUser } from "../src/core/types.js";
+import { rawSql } from "../src/internal.js";
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
 const admin: VexUser = { id: "root", name: "Root", isAdmin: true };
@@ -75,7 +76,8 @@ async function boot(storage: StorageAdapter = sqliteAdapter(":memory:")) {
   open.push(vex);
   await vex.mutate("ps.seed", {});
   // Schema is not a mutation's to change: the view is the setup's.
-  await vex.unsafeSql(
+  await rawSql(
+    vex,
     "CREATE VIEW IF NOT EXISTS key_view AS SELECT token FROM keys",
   );
   return vex;

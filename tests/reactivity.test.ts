@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex, withSerializedSubscriptionResult } from "../src/core/engine.js";
+import { rawBulkInsert } from "../src/internal.js";
 
 const user = { id: "u1", name: "User", isAdmin: false };
 let open: Vex[] = [];
@@ -573,7 +574,7 @@ describe("reactive subscription bedrock", () => {
     }
   });
 
-  test("unsafeBulkInsert invalidation is value-precise for filtered subscriptions", async () => {
+  test("rawBulkInsert invalidation is value-precise for filtered subscriptions", async () => {
     const vex = await create({
       plugins: [reactivityPlugin],
       storage: sqliteAdapter(":memory:"),
@@ -586,7 +587,7 @@ describe("reactive subscription bedrock", () => {
 
     // Bulk rows for a different scope: recorded write values miss the
     // eq-filter, so the group must not even re-run.
-    await vex.unsafeBulkInsert("items", [
+    await rawBulkInsert(vex, "items", [
       { scope: "other", kind: "one", name: "x", score: 0, body: null },
       { scope: "other", kind: "two", name: "y", score: 0, body: null },
     ]);
@@ -594,7 +595,7 @@ describe("reactive subscription bedrock", () => {
     expect(calls).toEqual([[]]);
 
     // Matching rows re-run and deliver.
-    await vex.unsafeBulkInsert("items", [
+    await rawBulkInsert(vex, "items", [
       { scope: "a", kind: "one", name: "m", score: 0, body: null },
     ]);
     expect(listRuns).toBe(runsAfterSubscribe + 1);

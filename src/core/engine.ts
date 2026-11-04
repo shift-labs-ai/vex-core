@@ -26,6 +26,7 @@ import {
 import { holdStatement } from "./held-read.js";
 import { id as generateId } from "./id.js";
 import { INTERNAL_TABLES } from "./internal.js";
+import { RAW, type RawAccess } from "./internal-access.js";
 import { equalityKey, sameValue, writeMayAffect } from "./invalidation.js";
 import { hashResult, utf8ByteLength } from "./result-measure.js";
 import {
@@ -52,6 +53,8 @@ import type {
   JobDef,
   MiddlewareFn,
   MiddlewareInfo,
+  Migration,
+  MigrationContext,
   MutationContext,
   MutationDef,
   MutationTable,
@@ -500,6 +503,13 @@ export interface VexOptions<A = undefined> {
    */
   jobScheduler?: "timers" | "external" | "none";
   /**
+   * Changes to the stored data or schema, applied once each, in order,
+   * each in a transaction, after every table is ensured and before the
+   * engine serves anything or runs a job. The one place SQL may change
+   * the schema.
+   */
+  migrations?: readonly Migration[];
+  /**
    * Evaluate subscriptions off the main thread, in workers each running
    * a read-only engine over the same database (`EvaluationOptions`).
    * Where the runtime has no workers, or for a caller that cannot
@@ -652,6 +662,10 @@ export class Vex<A = unknown> {
       vex.plugins.push(plugin);
       await vex.registerPlugin(plugin);
     }
+    await vex.migrate(options.migrations ?? []);
+    // Jobs arm last: none runs against data a migration has yet to
+    // change.
+    for (const plugin of plugins) await vex.registerJobs(plugin);
 
     // After every table is ensured: a worker's read-only engine
     // registers the tables it finds, and refuses one it does not.
@@ -707,11 +721,52 @@ export class Vex<A = unknown> {
       assertArgsDecl("action", key, def.args);
       this.actions.set(key, { plugin: plugin.name, def });
     }
+  }
 
+  private async registerJobs(plugin: PluginDef<any>): Promise<void> {
     if (this.jobScheduler === "none") return;
     for (const [name, job] of Object.entries(plugin.jobs ?? {})) {
       const cronName = `${plugin.name}.${name}`;
       await this.addJob(cronName, job, plugin.name);
+    }
+  }
+
+  /** Applies each migration not yet applied, in order (`migrations`). */
+  private async migrate(migrations: readonly Migration[]): Promise<void> {
+    const ids = new Set<string>();
+    for (const { id } of migrations) {
+      if (ids.has(id)) throw new Error(`Duplicate migration: ${id}`);
+      ids.add(id);
+    }
+    // A read-only engine (a worker's) changes nothing.
+    if (this.jobScheduler === "none" || migrations.length === 0) return;
+    const applied = new Set(
+      (
+        await this.storage.rawQuery<{ migrationId: string }>(
+          "SELECT migrationId FROM _migrations",
+        )
+      ).map((row) => row.migrationId),
+    );
+    const context: MigrationContext = {
+      // The adapter forgets what it compiled when the schema moves.
+      sql: <T>(sql: string, ...params: any[]) =>
+        this.storage.rawQuery<T>(sql, ...params),
+      query: (name, args = {}) => this.query(name, args),
+      mutate: (name, args = {}) => this.mutate(name, args),
+    };
+    for (const migration of migrations) {
+      if (applied.has(migration.id)) continue;
+      await this.trace("migration", migration.id, null, () =>
+        this.storage.transaction(async () => {
+          await migration.up(context);
+          await this.storage.insert("_migrations", {
+            _id: generateId(12),
+            migrationId: migration.id,
+            appliedAt: ambient.now(),
+          });
+        }),
+      );
+      await this.announceWrites();
     }
   }
 
@@ -2608,7 +2663,7 @@ export class Vex<A = unknown> {
     return null;
   }
 
-  // ─── Unsafe ───
+  // ─── Raw (vex-core/internal) ───
 
   /**
    * Runs SQL on the storage as it is: no access policy, no tracking
@@ -2616,7 +2671,7 @@ export class Vex<A = unknown> {
    * subscriptions over what it changed re-run, judged as an
    * unattributed change (every one over the tables it touched).
    */
-  async unsafeSql<T = Record<string, any>>(
+  private async rawSql<T = Record<string, any>>(
     sql: string,
     ...params: any[]
   ): Promise<T[]> {
@@ -2625,7 +2680,7 @@ export class Vex<A = unknown> {
     return rows;
   }
 
-  async unsafeBulkInsert(
+  private async rawBulkInsert(
     table: string,
     rows: Record<string, any>[],
   ): Promise<void> {
@@ -2646,11 +2701,11 @@ export class Vex<A = unknown> {
 
   /**
    * The storage, for code that keeps tables of its own on it: every
-   * write through it is announced as `unsafeSql`'s are, a
+   * write through it is announced as `rawSql`'s are, a
    * transaction's once it commits, so no write can leave a
    * subscription unaware of it. Every call answers the same handle.
    */
-  unsafeGetStorage(): StorageAdapter {
+  private rawStorage(): StorageAdapter {
     this.announcingStorage ??= this.announcing(this.storage);
     return this.announcingStorage;
   }
@@ -2688,6 +2743,15 @@ export class Vex<A = unknown> {
    * record: whatever the storage reports changed, judged whole. Not
    * traced, since a tracer may itself write through the storage.
    */
+  /** Raw access for `vex-core/internal`; no public name reaches it. */
+  [RAW](): RawAccess {
+    return {
+      sql: (sql, ...params) => this.rawSql(sql, ...params),
+      storage: () => this.rawStorage(),
+      bulkInsert: (table, rows) => this.rawBulkInsert(table, rows),
+    };
+  }
+
   private announceWrites(): Promise<void> {
     return this.invalidateAfter(noopExecCtx);
   }

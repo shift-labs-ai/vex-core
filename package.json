@@ -17,6 +17,11 @@
       "import": "./dist/guard.js",
       "default": "./dist/guard.js"
     },
+    "./internal": {
+      "types": "./dist/internal.d.ts",
+      "import": "./dist/internal.js",
+      "default": "./dist/internal.js"
+    },
     "./client": {
       "types": "./dist/client/index.d.ts",
       "import": "./dist/client/index.js",

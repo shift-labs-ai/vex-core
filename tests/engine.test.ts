@@ -7,6 +7,7 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span, Tracer } from "../src/core/tracer.js";
 import type { MiddlewareInfo, MutationContext } from "../src/core/types.js";
+import { rawSql } from "../src/internal.js";
 
 // Inline KV plugin for testing (replaces app-specific plugin imports)
 function kvPlugin(api: VexPluginAPI) {
@@ -362,7 +363,7 @@ describe("webhooks", () => {
     expect(result.status).toBe(200);
     expect(result.body.received).toBe(true);
 
-    const payments = await wvex.unsafeSql("SELECT * FROM payments");
+    const payments = await rawSql(wvex, "SELECT * FROM payments");
     expect(payments).toHaveLength(1);
     expect(payments[0].amount).toBe(99);
 
@@ -884,7 +885,8 @@ describe("jobs", () => {
     expect(active).toBe(0);
     expect(maxActive).toBe(1);
 
-    const [job] = await jvex.unsafeSql<any>(
+    const [job] = await rawSql<any>(
+      jvex,
       "SELECT runs, lastStatus, lastError FROM _jobs WHERE name = ?",
       "timeout.tick",
     );
@@ -965,7 +967,8 @@ describe("jobs", () => {
     expect(active).toBe(0);
     expect(maxActive).toBe(1);
 
-    const [job] = await jvex.unsafeSql<any>(
+    const [job] = await rawSql<any>(
+      jvex,
       "SELECT runs, lastStatus, lastError FROM _jobs WHERE name = ?",
       "retrying.tick",
     );
@@ -1106,10 +1109,7 @@ describe("jobs", () => {
         storage: sqliteAdapter(path),
         plugins: [counter({ count: 0 })],
       });
-      await first.unsafeSql(
-        "UPDATE _jobs SET nextRun = ?",
-        Date.now() - 60_000,
-      );
+      await rawSql(first, "UPDATE _jobs SET nextRun = ?", Date.now() - 60_000);
       await first.close();
 
       const runs = { count: 0 };
@@ -1541,14 +1541,15 @@ describe("writes by row id", () => {
       ],
       storage: sqliteAdapter(":memory:"),
     });
-    await vex.unsafeSql(
+    await rawSql(
+      vex,
       "INSERT INTO rows (_id, name) VALUES (NULL, 'nameless'), ('a1', 'keep'), ('b2', 'gone')",
     );
     return vex;
   }
   const names = async (vex: Vex) =>
     (
-      (await vex.unsafeSql("SELECT name FROM rows ORDER BY name")) as Array<{
+      (await rawSql(vex, "SELECT name FROM rows ORDER BY name")) as Array<{
         name: string;
       }>
     ).map((r) => r.name);

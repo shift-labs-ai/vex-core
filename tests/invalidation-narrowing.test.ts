@@ -26,6 +26,7 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
 import type { VexUser } from "../src/core/types.js";
+import { rawBulkInsert } from "../src/internal.js";
 
 let open: Vex[] = [];
 const runs = new Map<string, number>();
@@ -320,7 +321,7 @@ describe("invalidation narrowing (SHFT-2537)", () => {
     const after = ran("mine");
     await vex.mutate("s.open", { title: "new", platform: "web", n: 1 });
     expect(ran("mine")).toBe(after);
-    await vex.unsafeBulkInsert("sessions", [
+    await rawBulkInsert(vex, "sessions", [
       { title: "bulk", platform: "web", n: 1 },
     ]);
     expect(ran("mine")).toBe(after);
@@ -479,7 +480,8 @@ describe("invalidation narrowing (SHFT-2537)", () => {
 
   test("a filtered delete past the recording bound still deletes every matching row", async () => {
     const vex = await create();
-    await vex.unsafeBulkInsert(
+    await rawBulkInsert(
+      vex,
       "sessions",
       Array.from({ length: 250 }, (_, i) => ({
         title: `t${i}`,
@@ -613,7 +615,8 @@ describe("invalidation narrowing (SHFT-2537)", () => {
 
     // A filtered delete of many rows is recorded by its filter alone,
     // naming no row: every view on the table is judged.
-    await vex.unsafeBulkInsert(
+    await rawBulkInsert(
+      vex,
       "sessions",
       Array.from({ length: 250 }, (_, i) => ({
         title: `i${i}`,

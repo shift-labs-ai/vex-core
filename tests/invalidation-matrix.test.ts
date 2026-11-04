@@ -32,6 +32,7 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { filterExcludes } from "../src/core/invalidation.js";
 import type { ColumnType, Filter } from "../src/core/types.js";
+import { rawBulkInsert } from "../src/internal.js";
 
 const REPORT = process.env.MATRIX_REPORT;
 const sections: string[] = [];
@@ -445,12 +446,12 @@ const WRITES: Record<string, Write> = {
 
 /** Bulk inserts go through the engine, not a mutation context. */
 const BULK: Record<string, (vex: Vex) => Promise<unknown>> = {
-  "unsafeBulkInsert scope c": (vex) =>
-    vex.unsafeBulkInsert("t", [
+  "rawBulkInsert scope c": (vex) =>
+    rawBulkInsert(vex, "t", [
       { scope: "c", kind: "z", name: "c3", n: 100, flag: false },
     ]),
-  "unsafeBulkInsert scope a": (vex) =>
-    vex.unsafeBulkInsert("t", [
+  "rawBulkInsert scope a": (vex) =>
+    rawBulkInsert(vex, "t", [
       { scope: "a", kind: "k", name: "a8", n: 1, flag: false },
     ]),
 };

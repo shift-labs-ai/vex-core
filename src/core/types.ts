@@ -292,6 +292,23 @@ export interface ActionContext {
   signal?: AbortSignal;
 }
 
+/**
+ * What a migration runs with: SQL of any kind, the schema included,
+ * and the engine's operations as the system. It runs in a transaction
+ * of its own, before the engine serves anything.
+ */
+export interface MigrationContext {
+  sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
+  query<T = any>(name: string, args?: Record<string, any>): Promise<T>;
+  mutate<T = any>(name: string, args?: Record<string, any>): Promise<T>;
+}
+
+/** A change to the stored data or schema, applied once, by `id`. */
+export interface Migration {
+  id: string;
+  up(m: MigrationContext): Promise<void> | void;
+}
+
 export interface ReactiveBudget {
   maxRows?: number;
   maxBytes?: number;

@@ -36,6 +36,7 @@ import { UNRESTRICTED } from "../src/core/access.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { VexUser } from "../src/core/types.js";
+import { rawSql } from "../src/internal.js";
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
 const bob: VexUser = { id: "bob", name: "Bob", isAdmin: false };
@@ -339,7 +340,8 @@ async function seed(vex: Vex, total = 20): Promise<DocRow[]> {
       kind: row.kind,
     });
     if (row.score !== null) {
-      await vex.unsafeSql(
+      await rawSql(
+        vex,
         "UPDATE docs SET score = ? WHERE _id = ?",
         row.score,
         row._id,
@@ -350,7 +352,8 @@ async function seed(vex: Vex, total = 20): Promise<DocRow[]> {
     if (mine || granted) accessible.push(row);
   }
   for (const row of accessible) {
-    await vex.unsafeSql(
+    await rawSql(
+      vex,
       "INSERT INTO mirror (_id, ownerId, title, kind, score) VALUES (?, ?, ?, ?, ?)",
       `m-${row._id}`,
       row.ownerId,
@@ -359,7 +362,8 @@ async function seed(vex: Vex, total = 20): Promise<DocRow[]> {
       row.score,
     );
   }
-  await vex.unsafeSql(
+  await rawSql(
+    vex,
     "INSERT INTO mirrorAll (_id, ownerId, title, kind, score) SELECT 'a-' || _id, ownerId, title, kind, score FROM docs",
   );
   return accessible;
@@ -783,7 +787,8 @@ describe("table access policies", () => {
   test("two governed tables resolve independent prepared contexts", async () => {
     const vex = await create();
     await seed(vex, 4);
-    await vex.unsafeSql(
+    await rawSql(
+      vex,
       "INSERT INTO pets (_id, ownerId, name) VALUES ('p1','alice','rex'), ('p2','bob','tux')",
     );
     prepareCalls = 0;
@@ -804,7 +809,7 @@ describe("table access policies", () => {
 
   test("policy failures reject the operation — never fail open", async () => {
     const vex = await create();
-    await vex.unsafeSql("INSERT INTO vault (_id, name) VALUES ('v1','mine')");
+    await rawSql(vex, "INSERT INTO vault (_id, name) VALUES ('v1','mine')");
     // prepare throwing rejects the query…
     await expect(
       vex.query("dx.vaultRead", {}, { user: alice }),

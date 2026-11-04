@@ -25,6 +25,7 @@ import { performance } from "node:perf_hooks";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
+import { rawBulkInsert } from "../src/internal.js";
 import {
   cellOf,
   guildOf,
@@ -123,7 +124,7 @@ async function tier(players: number) {
       row.y = Math.floor(random() * 1000);
       row.cell = cellOf(row.x, row.y);
     }
-    await vex.unsafeBulkInsert("players", rows);
+    await rawBulkInsert(vex, "players", rows);
     const items: Record<string, any>[] = [];
     const kinds = ["weapon", "armor", "potion", "gem", "scroll"];
     for (let p = 0; p < players; p++) {
@@ -135,10 +136,10 @@ async function tier(players: number) {
         });
       }
       if (items.length >= 50_000) {
-        await vex.unsafeBulkInsert("items", items.splice(0));
+        await rawBulkInsert(vex, "items", items.splice(0));
       }
     }
-    if (items.length > 0) await vex.unsafeBulkInsert("items", items);
+    if (items.length > 0) await rawBulkInsert(vex, "items", items);
     const messages: Record<string, any>[] = [];
     for (let p = 0; p < players; p++) {
       for (let m = 0; m < 5; m++) {
@@ -150,10 +151,10 @@ async function tier(players: number) {
         });
       }
       if (messages.length >= 50_000) {
-        await vex.unsafeBulkInsert("messages", messages.splice(0));
+        await rawBulkInsert(vex, "messages", messages.splice(0));
       }
     }
-    if (messages.length > 0) await vex.unsafeBulkInsert("messages", messages);
+    if (messages.length > 0) await rawBulkInsert(vex, "messages", messages);
     const seedMs = performance.now() - seedStart;
 
     // ─── Every player logs in ───

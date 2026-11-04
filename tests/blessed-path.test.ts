@@ -5,7 +5,7 @@
  *     run only when alike in every field, unless the app says which
  *     fields decide);
  *   - a write the engine is handed that no subscription hears of
- *     (`unsafeSql`, `unsafeGetStorage`);
+ *     (`rawSql`, `rawStorage` in vex-core/internal);
  *   - a raw read whose dependency is not written down (every table a
  *     raw read reads is named, held to rows or read whole), or whose
  *     hold a view slips past;
@@ -20,6 +20,7 @@ import { Vex } from "../src/core/engine.js";
 import type { VexUser } from "../src/core/types.js";
 import { createRouter } from "../src/http/router.js";
 import { vexHandler } from "../src/http/vex-handler.js";
+import { rawSql, rawStorage } from "../src/internal.js";
 
 let open: Vex[] = [];
 const runs = new Map<string, number>();
@@ -206,25 +207,23 @@ describe("callers share a run only when nothing tells them apart", () => {
 });
 
 describe("every write the engine is handed is heard", () => {
-  test("a write by unsafeSql re-runs the views it reaches", async () => {
+  test("a write by rawSql re-runs the views it reaches", async () => {
     const vex = await create();
     const seen: number[] = [];
     await vex.subscribe("bp.count", { scope: "a", extra: null }, (n: number) =>
       seen.push(n),
     );
-    await vex.unsafeSql(
-      "INSERT INTO items (_id, scope, n) VALUES ('x', 'a', 1)",
-    );
+    await rawSql(vex, "INSERT INTO items (_id, scope, n) VALUES ('x', 'a', 1)");
     expect(seen).toEqual([0, 1]);
   });
 
-  test("a write through unsafeGetStorage, and a transaction there, are heard", async () => {
+  test("a write through rawStorage, and a transaction there, are heard", async () => {
     const vex = await create();
     const seen: number[] = [];
     await vex.subscribe("bp.count", { scope: "a", extra: null }, (n: number) =>
       seen.push(n),
     );
-    const storage = vex.unsafeGetStorage();
+    const storage = rawStorage(vex);
     await storage.insert("items", { scope: "a", n: 1 });
     expect(seen).toEqual([0, 1]);
     await storage.transaction(async () => {
@@ -235,9 +234,9 @@ describe("every write the engine is handed is heard", () => {
     expect(seen).toEqual([0, 1, 2]);
   });
 
-  test("the storage handle is one handle: what a caller sets on it, the next caller sees", async () => {
+  test("the raw storage handle is one handle: what a caller sets on it, the next caller sees", async () => {
     const vex = await create();
-    expect(vex.unsafeGetStorage()).toBe(vex.unsafeGetStorage());
+    expect(rawStorage(vex)).toBe(rawStorage(vex));
   });
 
   test("a tracer writing its spans through the storage does not feed on itself", async () => {
@@ -247,7 +246,7 @@ describe("every write the engine is handed is heard", () => {
       tracer: {
         onSpan: () => {
           spans++;
-          void holder.vex?.unsafeGetStorage().rawExec("SELECT 1");
+          if (holder.vex) void rawStorage(holder.vex).rawExec("SELECT 1");
         },
       },
     });
@@ -282,7 +281,7 @@ describe("a raw read writes down what it depends on", () => {
 
   test("a held read may not reach its table through a view", async () => {
     const vex = await create();
-    await vex.unsafeSql("CREATE VIEW item_view AS SELECT * FROM items");
+    await rawSql(vex, "CREATE VIEW item_view AS SELECT * FROM items");
     await expect(
       vex.query("bp.raw", {
         reads: { items: [{ column: "scope", operator: "=", value: "a" }] },
@@ -302,7 +301,7 @@ describe("a raw read writes down what it depends on", () => {
 describe("the views a held read is checked against are the schema's own", () => {
   const held = { items: [{ column: "scope", operator: "=", value: "a" }] };
 
-  test("a view created after the list was taken, by unsafeSql, is seen", async () => {
+  test("a view created after the list was taken, by raw SQL, is seen", async () => {
     const vex = await create();
     expect(
       await vex.query("bp.raw", {
@@ -310,7 +309,7 @@ describe("the views a held read is checked against are the schema's own", () => 
         sql: "SELECT COUNT(*) AS n FROM items",
       }),
     ).toEqual([{ n: 0 }]);
-    await vex.unsafeSql("CREATE VIEW late AS SELECT * FROM items");
+    await rawSql(vex, "CREATE VIEW late AS SELECT * FROM items");
     await expect(
       vex.query("bp.raw", { reads: held, sql: "SELECT * FROM late" }),
     ).rejects.toThrow("through a view (late)");
@@ -318,7 +317,7 @@ describe("the views a held read is checked against are the schema's own", () => 
 
   test("a name that only contains a view's name is not the view", async () => {
     const vex = await create();
-    await vex.unsafeSql("CREATE VIEW it AS SELECT * FROM items");
+    await rawSql(vex, "CREATE VIEW it AS SELECT * FROM items");
     expect(
       await vex.query("bp.raw", {
         reads: held,
@@ -749,5 +748,86 @@ describe("jobs and webhooks are actions; middleware is declared", () => {
     const vex = await create();
     expect((vex as any).use).toBeUndefined();
     expect((vex as any).readTable).toBeUndefined();
+  });
+});
+
+describe("the schema changes through migrations; raw access is internal", () => {
+  const migrating = (log: string[]) => [
+    {
+      id: "001-view",
+      up: async (m: any) => {
+        log.push("001");
+        await m.sql("CREATE VIEW IF NOT EXISTS scoped AS SELECT * FROM items");
+      },
+    },
+    {
+      id: "002-seed",
+      up: async (m: any) => {
+        log.push("002");
+        await m.mutate("bp.add", { scope: "seeded", n: 1 });
+      },
+    },
+  ];
+
+  test("migrations apply once each, in order, before create returns; a failing one rolls back and stops the engine", async () => {
+    const dir = (await import("node:fs")).mkdtempSync(
+      (await import("node:path")).join(
+        (await import("node:os")).tmpdir(),
+        "vex-mig-",
+      ),
+    );
+    const file = (await import("node:path")).join(dir, "db.sqlite");
+    const log: string[] = [];
+    const first = await create({
+      storage: sqliteAdapter(file),
+      migrations: migrating(log),
+    });
+    expect(log).toEqual(["001", "002"]);
+    expect(
+      await first.query("bp.count", { scope: "seeded", extra: null }),
+    ).toBe(1);
+    await first.close();
+    open = open.filter((v) => v !== first);
+    const again = await create({
+      storage: sqliteAdapter(file),
+      migrations: [
+        ...migrating(log),
+        {
+          id: "003-broken",
+          up: async (m: any) => {
+            await m.mutate("bp.add", { scope: "broken", n: 1 });
+            throw new Error("migration failed");
+          },
+        },
+      ],
+    }).catch((error: Error) => error);
+    expect((again as Error).message).toBe("migration failed");
+    expect(log).toEqual(["001", "002"]);
+    const after = await create({ storage: sqliteAdapter(file) });
+    expect(
+      await after.query("bp.count", { scope: "broken", extra: null }),
+    ).toBe(0);
+  });
+
+  test("migration ids are unique", async () => {
+    await expect(
+      create({
+        migrations: [
+          { id: "a", up: () => {} },
+          { id: "a", up: () => {} },
+        ],
+      }),
+    ).rejects.toThrow("Duplicate migration: a");
+  });
+
+  test("the public engine holds no raw access", async () => {
+    const vex = await create();
+    for (const name of ["unsafeSql", "unsafeGetStorage", "unsafeBulkInsert"]) {
+      expect((vex as any)[name]).toBeUndefined();
+    }
+    const entry = await import("../src/index.js");
+    for (const name of ["rawSql", "rawStorage", "rawBulkInsert", "RAW"]) {
+      expect((entry as any)[name]).toBeUndefined();
+    }
   });
 });

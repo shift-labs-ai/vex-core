@@ -25,6 +25,7 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
 import type { VexUser } from "../src/core/types.js";
+import { rawBulkInsert } from "../src/internal.js";
 import { scalingPlugin } from "./fixtures/scaling-plugin.js";
 
 const SETUP = new URL("./fixtures/scaling-setup.ts", import.meta.url);
@@ -236,7 +237,8 @@ const scenarios: Record<string, (h: Harness) => Promise<void>> = {
     await h.watch("sum", { scope: "a" });
     await Promise.all([
       burst(h, 5, (i) => ["add", { scope: "a", n: i }]),
-      h.vex.unsafeBulkInsert(
+      rawBulkInsert(
+        h.vex,
         "items",
         Array.from({ length: 10 }, (_, i) => ({
           scope: "a",

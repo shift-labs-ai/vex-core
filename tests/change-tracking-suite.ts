@@ -16,6 +16,7 @@ import { UNRESTRICTED } from "../src/core/access.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { ANY_TABLE, type StorageAdapter } from "../src/core/storage.js";
+import { rawSql } from "../src/internal.js";
 
 type CreateStorage = () => Promise<StorageAdapter> | StorageAdapter;
 
@@ -481,7 +482,8 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
     test("rows a trigger writes are never narrowed away, whichever table fired it", async () => {
       for (const on of ["other", "items"]) {
         await withFixture(async ({ vex, runs }) => {
-          await vex.unsafeSql(
+          await rawSql(
+            vex,
             `CREATE TRIGGER touch_a_from_${on} AFTER INSERT ON ${on} BEGIN UPDATE items SET n = coalesce(n, 0) + 1 WHERE scope = 'a'; END`,
           );
           await vex.subscribe("ct.scope", { scope: "a" }, () => {});
@@ -491,7 +493,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           await vex.mutate("ct.addBAndOther", { raw: false });
           expect([on, runs["scope:a"]]).toEqual([on, before + 1]);
           // A Durable Object test keeps one database across both rounds.
-          await vex.unsafeSql(`DROP TRIGGER touch_a_from_${on}`);
+          await rawSql(vex, `DROP TRIGGER touch_a_from_${on}`);
         });
       }
     });
@@ -601,8 +603,9 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
 
     test("a raw read depends on the tables a view reads, through views of views", async () => {
       await withFixture(async ({ vex, runs }) => {
-        await vex.unsafeSql("CREATE VIEW item_names AS SELECT name FROM items");
-        await vex.unsafeSql(
+        await rawSql(vex, "CREATE VIEW item_names AS SELECT name FROM items");
+        await rawSql(
+          vex,
           "CREATE VIEW item_names_2 AS SELECT * FROM item_names",
         );
         const sql = "SELECT * FROM item_names_2";
@@ -617,8 +620,8 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
 
     test("raw SQL naming a governed table is refused in every spelling and through views", async () => {
       await withFixture(async ({ vex }) => {
-        await vex.unsafeSql("CREATE VIEW leak AS SELECT v FROM secrets");
-        await vex.unsafeSql("CREATE VIEW leak_2 AS SELECT * FROM leak");
+        await rawSql(vex, "CREATE VIEW leak AS SELECT v FROM secrets");
+        await rawSql(vex, "CREATE VIEW leak_2 AS SELECT * FROM leak");
         for (const sql of [
           "SELECT * FROM items, secrets",
           "SELECT * FROM main.secrets",
@@ -647,7 +650,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
 
     test("a raw read of a table created by raw SQL re-runs when it is written", async () => {
       await withFixture(async ({ vex, runs }) => {
-        await vex.unsafeSql("CREATE TABLE loose (v TEXT)");
+        await rawSql(vex, "CREATE TABLE loose (v TEXT)");
         const sql = "SELECT count(*) AS c FROM loose";
         await vex.subscribe("ct.raw", { sql }, () => {});
         const before = runs[`raw:${sql}`];

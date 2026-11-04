@@ -9,6 +9,7 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { holdStatement } from "../src/core/held-read.js";
+import { rawSql } from "../src/internal.js";
 
 let open: Vex[] = [];
 afterEach(async () => {
@@ -179,7 +180,8 @@ describe("a raw read held to rows", () => {
       ["a", "b"],
     );
     const plan = (
-      (await vex.unsafeSql(
+      (await rawSql(
+        vex,
         `EXPLAIN QUERY PLAN ${held.sql}`,
         ...held.params,
       )) as Array<{
@@ -235,11 +237,11 @@ describe("a raw read held to rows", () => {
         [],
       );
     const upper = held("SELECT COUNT(*) AS n FROM MESSAGES");
-    expect(await vex.unsafeSql(upper.sql, ...upper.params)).toEqual([{ n: 2 }]);
+    expect(await rawSql(vex, upper.sql, ...upper.params)).toEqual([{ n: 2 }]);
     const own = held(
       "WITH messages AS (SELECT 1) SELECT COUNT(*) AS n FROM messages",
     );
-    await expect(vex.unsafeSql(own.sql, ...own.params)).rejects.toThrow(
+    await expect(rawSql(vex, own.sql, ...own.params)).rejects.toThrow(
       "duplicate WITH table name",
     );
   });
@@ -257,7 +259,8 @@ describe("a raw read held to rows", () => {
     await vex.subscribe("h.texts", { sessionId: "a" }, () => {
       runs++;
     });
-    const ids = (await vex.unsafeSql(
+    const ids = (await rawSql(
+      vex,
       "SELECT _id FROM messages WHERE sessionId = 'a'",
     )) as Array<{
       _id: string;

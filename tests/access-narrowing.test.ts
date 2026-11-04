@@ -29,6 +29,7 @@ import {
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { VexUser } from "../src/core/types.js";
+import { rawSql } from "../src/internal.js";
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
 const admin: VexUser = { id: "root", name: "Root", isAdmin: true };
@@ -284,7 +285,8 @@ async function seed(vex: Vex, total = 30): Promise<Doc[]> {
   }
   const insert = async (table: string, docs: Doc[]) => {
     for (const r of docs) {
-      await vex.unsafeSql(
+      await rawSql(
+        vex,
         `INSERT INTO ${table} (_id, ownerId, title, kind, score, body) VALUES (?, ?, ?, ?, ?, ?)`,
         r._id,
         r.ownerId,
