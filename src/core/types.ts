@@ -1,6 +1,7 @@
+import type { TSchema } from "typebox";
 import type { TableAccessPolicy } from "./access.js";
 import type { ExecContext } from "./tracer.js";
-import type { ArgsDecl } from "./values.js";
+import type { ArgsOf, ArgsShape } from "./values.js";
 
 export type ColumnType = "string" | "number" | "boolean" | "json" | "any";
 
@@ -354,18 +355,22 @@ export type OperationAccess<A> = undefined extends A
   ? { access?: A }
   : { access: A };
 
-export type QueryDef<A = undefined> = {
-  args: ArgsDecl;
+/**
+ * A query: what it takes (`args`, a schema per arg, from which its
+ * handler's args are typed), what it answers when it says (`returns`),
+ * and its handler.
+ */
+export type QueryDef<A = undefined, S extends ArgsShape = any> = {
+  args: S;
+  returns?: TSchema;
   reactive?: false | ReactiveBudget;
-  handler: (ctx: QueryContext, args: Record<string, any>) => Promise<any> | any;
+  handler: (ctx: QueryContext, args: ArgsOf<S>) => Promise<any> | any;
 } & OperationAccess<A>;
 
-export type MutationDef<A = undefined> = {
-  args: ArgsDecl;
-  handler: (
-    ctx: MutationContext,
-    args: Record<string, any>,
-  ) => Promise<any> | any;
+export type MutationDef<A = undefined, S extends ArgsShape = any> = {
+  args: S;
+  returns?: TSchema;
+  handler: (ctx: MutationContext, args: ArgsOf<S>) => Promise<any> | any;
 } & OperationAccess<A>;
 
 /**
@@ -374,12 +379,10 @@ export type MutationDef<A = undefined> = {
  * no read and no transaction while it runs, so no handler timeout
  * bounds it; its own work does.
  */
-export type ActionDef<A = undefined> = {
-  args: ArgsDecl;
-  handler: (
-    ctx: ActionContext,
-    args: Record<string, any>,
-  ) => Promise<any> | any;
+export type ActionDef<A = undefined, S extends ArgsShape = any> = {
+  args: S;
+  returns?: TSchema;
+  handler: (ctx: ActionContext, args: ArgsOf<S>) => Promise<any> | any;
 } & OperationAccess<A>;
 
 /**

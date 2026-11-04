@@ -8,6 +8,7 @@
 import type { TableAccessPolicy } from "../../src/core/access.js";
 import { UNRESTRICTED } from "../../src/core/access.js";
 import type { VexPluginAPI } from "../../src/core/api.js";
+import { Type } from "../../src/portable.js";
 
 /**
  * Knobs a test turns through the database, so a handler honours them
@@ -68,7 +69,7 @@ export function scalingPlugin(api: VexPluginAPI) {
   });
 
   api.registerQuery("sum", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       const rows = (await ctx.db
         .table("items")
@@ -104,7 +105,7 @@ export function scalingPlugin(api: VexPluginAPI) {
   });
   // A raw statement over several scopes, held to their rows.
   api.registerQuery("scopes", {
-    args: { scopes: "json" },
+    args: { scopes: Type.Unknown() },
     async handler(ctx, args) {
       const scopes = args.scopes as string[];
       const rows = (await ctx.db.sql(
@@ -151,17 +152,17 @@ export function scalingPlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("add", {
-    args: { scope: "string", n: "number" },
+    args: { scope: Type.String(), n: Type.Number() },
     handler: (ctx, args) =>
       ctx.db.table("items").insert({ ...args, version: next() }),
   });
   api.registerMutation("set", {
-    args: { id: "string", n: "number" },
+    args: { id: Type.String(), n: Type.Number() },
     handler: (ctx, args) =>
       ctx.db.table("items").update(args.id, { n: args.n, version: next() }),
   });
   api.registerMutation("noop", {
-    args: { id: "string" },
+    args: { id: Type.String() },
     async handler(ctx, args) {
       const row = (await ctx.db
         .table("items")
@@ -173,16 +174,16 @@ export function scalingPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("remove", {
-    args: { id: "string" },
+    args: { id: Type.String() },
     handler: (ctx, args) => ctx.db.table("items").delete(args.id),
   });
   api.registerMutation("removeScope", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("items").where("scope", "=", args.scope).delete(),
   });
   api.registerMutation("raw", {
-    args: { scope: "string", n: "number" },
+    args: { scope: Type.String(), n: Type.Number() },
     handler: (ctx, args) =>
       ctx.db.sql(
         "INSERT INTO items (_id, scope, n, version) VALUES (?, ?, ?, ?)",
@@ -193,7 +194,7 @@ export function scalingPlugin(api: VexPluginAPI) {
       ),
   });
   api.registerMutation("failing", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       await ctx.db
         .table("items")
@@ -202,25 +203,25 @@ export function scalingPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("addGoverned", {
-    args: { title: "string" },
+    args: { title: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("governed").insert({ title: args.title, version: next() }),
   });
   api.registerMutation("renameGoverned", {
-    args: { id: "string", title: "string" },
+    args: { id: Type.String(), title: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("governed")
         .update(args.id, { title: args.title, version: next() }),
   });
   api.registerMutation("grant", {
-    args: { userId: "string", itemId: "string" },
+    args: { userId: Type.String(), itemId: Type.String() },
     async handler(ctx, args) {
       await ctx.db.table("grants").insert(args);
     },
   });
   api.registerMutation("knob", {
-    args: { key: "string", value: "number" },
+    args: { key: Type.String(), value: Type.Number() },
     async handler(ctx, args) {
       await ctx.db
         .table("knobs")
@@ -228,7 +229,7 @@ export function scalingPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("ingest", {
-    args: { scope: "string", n: "number" },
+    args: { scope: Type.String(), n: Type.Number() },
     handler: (ctx, args) =>
       ctx.db.table("items").insert({ ...args, version: next() }),
   });

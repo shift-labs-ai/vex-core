@@ -33,6 +33,7 @@ import { Vex } from "../src/core/engine.js";
 import { filterExcludes } from "../src/core/invalidation.js";
 import type { ColumnType, Filter } from "../src/core/types.js";
 import { rawBulkInsert } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 const REPORT = process.env.MATRIX_REPORT;
 const sections: string[] = [];
@@ -495,14 +496,14 @@ function matrixPlugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("q", {
-    args: { shape: "string", ids: "json" },
+    args: { shape: Type.String(), ids: Type.Unknown() },
     async handler(ctx, args) {
       runs.set(args.shape, (runs.get(args.shape) ?? 0) + 1);
       return SHAPES[args.shape](ctx, args.ids as Ids);
     },
   });
   api.registerMutation("w", {
-    args: { write: "string", ids: "json" },
+    args: { write: Type.String(), ids: Type.Unknown() },
     async handler(ctx, args) {
       await WRITES[args.write](ctx, args.ids as Ids);
     },

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
+import { Type } from "../src/portable.js";
 
 let tmp = "";
 let dbPath = "";
@@ -50,7 +51,7 @@ function makePlugin(gate: {
     api.setName("tx");
     registerRows(api);
     api.registerMutation("write", {
-      args: { v: "string" },
+      args: { v: Type.String() },
       async handler(ctx, args) {
         await ctx.db.table("rows").insert({ v: args.v });
       },
@@ -100,7 +101,7 @@ function makeJobPlugin(gate: {
     api.setName("jobtx");
     registerRows(api);
     api.registerMutation("write", {
-      args: { v: "string" },
+      args: { v: Type.String() },
       async handler(ctx, args) {
         await ctx.db.table("rows").insert({ v: args.v });
       },

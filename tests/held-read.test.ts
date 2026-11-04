@@ -10,6 +10,7 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { holdStatement } from "../src/core/held-read.js";
 import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 afterEach(async () => {
@@ -30,7 +31,7 @@ function plugin(api: VexPluginAPI) {
   api.registerTable("sessions", { columns: { title: { type: "string" } } });
   // Reads the whole table, held to one session: hears only that one.
   api.registerQuery("count", {
-    args: { sessionId: "string" },
+    args: { sessionId: Type.String() },
     handler: (ctx, args) =>
       ctx.db.sql(
         {
@@ -43,7 +44,7 @@ function plugin(api: VexPluginAPI) {
   });
   // The sidebar's shape: a UNION ALL of per-session branches.
   api.registerQuery("latest", {
-    args: { sessionIds: "json" },
+    args: { sessionIds: Type.Unknown() },
     handler: (ctx, args) => {
       const ids = args.sessionIds as string[];
       return ctx.db.sql(
@@ -59,7 +60,7 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("withOwnCte", {
-    args: { sessionId: "string" },
+    args: { sessionId: Type.String() },
     handler: (ctx, args) =>
       ctx.db.sql(
         {
@@ -71,7 +72,7 @@ function plugin(api: VexPluginAPI) {
       ),
   });
   api.registerQuery("bypass", {
-    args: { sessionId: "string" },
+    args: { sessionId: Type.String() },
     handler: (ctx, args) =>
       ctx.db.sql(
         {
@@ -84,7 +85,7 @@ function plugin(api: VexPluginAPI) {
   });
   // Held to a session's rows and to two columns of them.
   api.registerQuery("texts", {
-    args: { sessionId: "string" },
+    args: { sessionId: Type.String() },
     handler: (ctx, args) =>
       ctx.db.sql(
         {
@@ -99,7 +100,7 @@ function plugin(api: VexPluginAPI) {
       ),
   });
   api.registerQuery("pastColumns", {
-    args: { sessionId: "string" },
+    args: { sessionId: Type.String() },
     handler: (ctx, args) =>
       ctx.db.sql(
         {
@@ -114,12 +115,12 @@ function plugin(api: VexPluginAPI) {
       ),
   });
   api.registerMutation("retime", {
-    args: { id: "string", at: "number" },
+    args: { id: Type.String(), at: Type.Number() },
     handler: (ctx, args) =>
       ctx.db.table("messages").update(args.id, { at: args.at }),
   });
   api.registerQuery("twoTables", {
-    args: { sessionId: "string" },
+    args: { sessionId: Type.String() },
     handler: (ctx, args) =>
       ctx.db.sql(
         {
@@ -132,11 +133,11 @@ function plugin(api: VexPluginAPI) {
       ),
   });
   api.registerMutation("say", {
-    args: { sessionId: "string", text: "string", at: "number" },
+    args: { sessionId: Type.String(), text: Type.String(), at: Type.Number() },
     handler: (ctx, args) => ctx.db.table("messages").insert(args),
   });
   api.registerMutation("open", {
-    args: { id: "string", title: "string" },
+    args: { id: Type.String(), title: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("sessions").insert({ _id: args.id, title: args.title }),
   });

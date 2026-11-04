@@ -12,6 +12,7 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { outsideFrame } from "../src/core/frames.js";
+import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 /** Runs after the list query's read, before it answers. */
@@ -44,12 +45,12 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("create", {
-    args: { name: "string" },
+    args: { name: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("channels").insert({ name: args.name, started: false }),
   });
   api.registerMutation("start", {
-    args: { id: "string" },
+    args: { id: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("channels").update(args.id, { started: true }),
   });
@@ -100,7 +101,7 @@ describe("subscriptions see writes landing during a run (SHFT-2545)", () => {
           api.setName("other");
           api.registerTable("notes", { columns: { text: { type: "string" } } });
           api.registerMutation("add", {
-            args: { text: "string" },
+            args: { text: Type.String() },
             handler: (ctx, args) => ctx.db.table("notes").insert(args),
           });
         },

@@ -11,6 +11,7 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { MiddlewareInfo } from "../src/core/types.js";
+import { Type } from "../src/portable.js";
 
 /** An app's declaration: the permission an operation needs. */
 type Access = { permission: string } | "system";
@@ -24,7 +25,7 @@ function notesPlugin(api: VexPluginAPI<Access>) {
     handler: (ctx) => ctx.db.table("notes").all(),
   });
   api.registerMutation("add", {
-    args: { text: "string" },
+    args: { text: Type.String() },
     access: { permission: "notes.write" },
     handler: (ctx, args) => ctx.db.table("notes").insert({ text: args.text }),
   });

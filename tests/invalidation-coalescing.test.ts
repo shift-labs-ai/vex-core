@@ -10,6 +10,7 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
+import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 let runs = 0;
@@ -28,18 +29,18 @@ function plugin(api: VexPluginAPI) {
     columns: { scope: { type: "string", index: true }, n: { type: "number" } },
   });
   api.registerQuery("sum", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       runs++;
       return ctx.db.table("items").where("scope", "=", args.scope).sum("n");
     },
   });
   api.registerMutation("add", {
-    args: { scope: "string", n: "number" },
+    args: { scope: Type.String(), n: Type.Number() },
     handler: (ctx, args) => ctx.db.table("items").insert(args),
   });
   api.registerMutation("set", {
-    args: { id: "string", n: "number" },
+    args: { id: Type.String(), n: Type.Number() },
     handler: (ctx, args) =>
       ctx.db.table("items").update(args.id, { n: args.n }),
   });

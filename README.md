@@ -15,7 +15,7 @@ Peer: `react` ^19 (only if you use `vex-core/client`).
 ## Quick start
 
 ```ts
-import { Vex, sqliteAdapter } from "vex-core";
+import { Type, Vex, sqliteAdapter } from "vex-core";
 
 const vex = await Vex.create({
   storage: sqliteAdapter(".vex/data.db"),
@@ -26,7 +26,7 @@ const vex = await Vex.create({
         columns: { key: { type: "string" }, value: { type: "number" } },
       });
       api.registerMutation("set", {
-        args: { key: "string", value: "number" },
+        args: { key: Type.String(), value: Type.Number() },
         async handler(ctx, args) {
           return ctx.db.table("counters").insert(args);
         },
@@ -48,6 +48,25 @@ const unsub = await vex.subscribe("counter.list", {}, (rows) => {
   console.log("changed:", rows);
 });
 ```
+
+## Args and returns
+
+An operation declares what it takes (`args`, one schema per arg) and, optionally, what it answers (`returns`). The schemas are [TypeBox](https://github.com/sinclairzx81/typebox) types, re-exported as `Type`: JSON Schema that infers as TypeScript, so the handler's `args` are typed from the declaration, and the engine checks every call against it with a validator compiled once per operation.
+
+```ts
+api.registerMutation("rename", {
+  args: { id: Type.String(), title: Type.String(), note: Type.Optional(Type.String()) },
+  returns: Type.Null(),
+  async handler(ctx, args) {
+    // args: { id: string; title: string; note?: string }
+    await ctx.db.table("docs").update(args.id, { title: args.title });
+    return null;
+  },
+});
+```
+
+- A call with an undeclared arg, a missing one, or one of the wrong type is refused, with every problem named (HTTP answers 400). `Type.Optional` means the arg may be absent; `null` is a value its schema must allow (`Type.Union([Type.String(), Type.Null()])`).
+- Args and answers are JSON values: plain objects, arrays, strings, finite numbers, booleans, null. A `Date`, `Map`, class instance or function is refused, since a client could not receive it. An answer against a declared `returns` is refused too; a refused mutation commits nothing.
 
 ## Cloudflare Durable Objects
 
@@ -197,7 +216,7 @@ api.registerTable("sessions", { columns: { /* … */ }, published: true });
 api.registerTable("api_keys", { columns: { /* … */ } }); // not published
 
 api.registerQuery("sql", {
-  args: { sql: "string", params: "json" },
+  args: { sql: Type.String(), params: Type.Unknown() },
   reactive: false,
   handler: (ctx, args) => ctx.db.publishedSql(args.sql, ...(args.params ?? [])),
 });
@@ -217,7 +236,7 @@ A mutation runs inside one transaction, so it must not wait: on a person, on ano
 
 ```ts
 api.registerAction("import", {
-  args: { url: "string" },
+  args: { url: Type.String() },
   async handler(ctx, args) {
     const rows = await fetchRows(args.url);          // may take minutes
     for (const row of rows) await ctx.mutate("notes.add", row);
@@ -338,10 +357,10 @@ export const todos = table({ text: "string", done: "boolean" });
 // todos.ts
 import { action, query, mutation } from "vex-core/framework";
 export const list = query({}, async (ctx) => ctx.db.table("todos").all());
-export const add = mutation({ text: "string" }, async (ctx, args) =>
+export const add = mutation({ text: Type.String() }, async (ctx, args) =>
   ctx.db.table("todos").insert({ text: args.text, done: false }),
 );
-export const importAll = action({ texts: "json" }, async (ctx, args) => {
+export const importAll = action({ texts: Type.Unknown() }, async (ctx, args) => {
   for (const text of args.texts) await ctx.mutate("todos.add", { text });
 });
 ```

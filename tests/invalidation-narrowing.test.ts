@@ -27,6 +27,7 @@ import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
 import type { VexUser } from "../src/core/types.js";
 import { rawBulkInsert } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 const runs = new Map<string, number>();
@@ -94,7 +95,7 @@ function plugin(api: VexPluginAPI) {
     fn: (ctx: any, args: any) => Promise<unknown>,
   ) => {
     api.registerQuery(name, {
-      args: { arg: "json?" },
+      args: { arg: Type.Optional(Type.Unknown()) },
       async handler(ctx, args) {
         runs.set(name, ran(name) + 1);
         return fn(ctx, args.arg);
@@ -157,26 +158,30 @@ function plugin(api: VexPluginAPI) {
   );
 
   api.registerMutation("open", {
-    args: { title: "string", platform: "string", n: "json?" },
+    args: {
+      title: Type.String(),
+      platform: Type.String(),
+      n: Type.Optional(Type.Unknown()),
+    },
     async handler(ctx, args) {
       return ctx.db.table("sessions").insert(args);
     },
   });
   api.registerMutation("openGoverned", {
-    args: { title: "string" },
+    args: { title: Type.String() },
     async handler(ctx, args) {
       return ctx.db.table("governed").insert(args);
     },
   });
   api.registerMutation("grant", {
-    args: { userId: "string", sessionId: "string" },
+    args: { userId: Type.String(), sessionId: Type.String() },
     async handler(ctx, args) {
       await ctx.db.table("grants").insert(args);
     },
   });
   // `conversations.touch`: one row's columns, by update.
   api.registerMutation("touch", {
-    args: { table: "string", id: "string", data: "json" },
+    args: { table: Type.String(), id: Type.String(), data: Type.Unknown() },
     async handler(ctx, args) {
       await ctx.db
         .table(args.table)
@@ -184,13 +189,13 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("close", {
-    args: { id: "string" },
+    args: { id: Type.String() },
     async handler(ctx, args) {
       await ctx.db.table("sessions").delete(args.id);
     },
   });
   api.registerMutation("closePlatform", {
-    args: { platform: "string" },
+    args: { platform: Type.String() },
     async handler(ctx, args) {
       await ctx.db
         .table("sessions")
@@ -200,7 +205,7 @@ function plugin(api: VexPluginAPI) {
   });
   // A limit on the chain bounds a read of it, not the delete.
   api.registerMutation("closePlatformLimited", {
-    args: { platform: "string" },
+    args: { platform: Type.String() },
     async handler(ctx, args) {
       await ctx.db
         .table("sessions")
@@ -210,7 +215,7 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("retitle", {
-    args: { id: "string", title: "string" },
+    args: { id: Type.String(), title: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("sessions").update(args.id, { title: args.title }),
   });
@@ -222,7 +227,7 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("upsertTitle", {
-    args: { title: "string", platform: "string" },
+    args: { title: Type.String(), platform: Type.String() },
     async handler(ctx, args) {
       await ctx.db
         .table("sessions")

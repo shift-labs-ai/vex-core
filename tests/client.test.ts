@@ -13,6 +13,7 @@ import {
   vexHandler,
   vexWebSocket,
 } from "../src/http/index.js";
+import { Type } from "../src/portable.js";
 
 /** What the `items.refused` query throws: a refusal with a code. */
 const REFUSAL = {
@@ -40,7 +41,7 @@ beforeAll(async () => {
             handler: async (ctx) => ctx.db.table("items").all(),
           },
           byName: {
-            args: { name: "string" },
+            args: { name: Type.String() },
             handler: async (ctx, args) =>
               ctx.db.table("items").where("name", "=", args.name).all(),
           },
@@ -70,7 +71,7 @@ beforeAll(async () => {
         },
         mutations: {
           create: {
-            args: { name: "string", value: "number" },
+            args: { name: Type.String(), value: Type.Number() },
             handler: async (ctx, args) => ctx.db.table("items").insert(args),
           },
         },
@@ -78,7 +79,7 @@ beforeAll(async () => {
           // Writes through a mutation, then reads through a query, as
           // its caller: the answer names who it ran as.
           tally: {
-            args: { name: "string" },
+            args: { name: Type.String() },
             handler: async (ctx, args) => {
               await ctx.mutate("items.create", { name: args.name, value: 1 });
               const rows = await ctx.query("items.byName", { name: args.name });
@@ -965,7 +966,7 @@ describe("WebSocket subscription end", () => {
           },
           mutations: {
             add: {
-              args: { v: "number" },
+              args: { v: Type.Number() },
               handler: async (ctx, args) => ctx.db.table("rows").insert(args),
             },
           },

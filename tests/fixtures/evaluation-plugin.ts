@@ -6,6 +6,7 @@
 import type { TableAccessPolicy } from "../../src/core/access.js";
 import { UNRESTRICTED } from "../../src/core/access.js";
 import type { VexPluginAPI } from "../../src/core/api.js";
+import { Type } from "../../src/portable.js";
 
 /** A person sees the items granted to them, said to SQL as `_id IN`. */
 const itemsAccess: TableAccessPolicy<{ ids: string[] }> = {
@@ -41,7 +42,7 @@ export function evaluationPlugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("list", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("items")
@@ -50,7 +51,7 @@ export function evaluationPlugin(api: VexPluginAPI) {
         .all(),
   });
   api.registerQuery("names", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       const rows = await ctx.db
         .table("items")
@@ -83,24 +84,24 @@ export function evaluationPlugin(api: VexPluginAPI) {
   });
   // An answer that is not its own JSON reading: an undefined field.
   api.registerQuery("sparse", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     handler: async (ctx, args) => ({
       n: await ctx.db.table("items").where("scope", "=", args.scope).count(),
       missing: undefined,
     }),
   });
   api.registerMutation("add", {
-    args: { scope: "string", name: "string" },
+    args: { scope: Type.String(), name: Type.String() },
     handler: (ctx, args) => ctx.db.table("items").insert(args),
   });
   api.registerMutation("grant", {
-    args: { userId: "string", itemId: "string" },
+    args: { userId: Type.String(), itemId: Type.String() },
     handler: async (ctx, args) => {
       await ctx.db.table("grants").insert(args);
     },
   });
   api.registerMutation("rename", {
-    args: { id: "string", name: "string" },
+    args: { id: Type.String(), name: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("items").update(args.id, { name: args.name }),
   });

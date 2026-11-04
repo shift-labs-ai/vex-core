@@ -16,6 +16,7 @@ import { Vex } from "../src/core/engine.js";
 import type { StorageAdapter } from "../src/core/storage.js";
 import type { VexUser } from "../src/core/types.js";
 import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
 const admin: VexUser = { id: "root", name: "Root", isAdmin: true };
@@ -44,7 +45,7 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("read", {
-    args: { sql: "string", params: "json" },
+    args: { sql: Type.String(), params: Type.Unknown() },
     handler: (ctx, args) =>
       ctx.db.publishedSql(args.sql, ...((args.params as unknown[]) ?? [])),
   });
@@ -62,11 +63,11 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("key", {
-    args: { token: "string" },
+    args: { token: Type.String() },
     handler: (ctx, args) => ctx.db.table("keys").insert({ token: args.token }),
   });
   api.registerMutation("note", {
-    args: { body: "string" },
+    args: { body: Type.String() },
     handler: (ctx, args) => ctx.db.table("notes").insert({ body: args.body }),
   });
 }

@@ -37,6 +37,7 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { VexUser } from "../src/core/types.js";
 import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
 const bob: VexUser = { id: "bob", name: "Bob", isAdmin: false };
@@ -144,7 +145,7 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerQuery("run", {
-    args: { op: "json" },
+    args: { op: Type.Unknown() },
     // The test drives arbitrary builder chains through one query so
     // every read path is exercised inside a real query context.
     async handler(ctx, args) {
@@ -200,7 +201,7 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerQuery("grouped", {
-    args: { table: "string", spec: "json" },
+    args: { table: Type.String(), spec: Type.Unknown() },
     async handler(ctx, args) {
       const spec = (args.spec ?? {}) as {
         columns?: string | string[];
@@ -279,7 +280,12 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("addDoc", {
-    args: { id: "string", ownerId: "string", title: "string", kind: "string" },
+    args: {
+      id: Type.String(),
+      ownerId: Type.String(),
+      title: Type.String(),
+      kind: Type.String(),
+    },
     async handler(ctx, args) {
       await ctx.db.table("docs").insert({
         _id: args.id,
@@ -292,7 +298,7 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("grant", {
-    args: { userId: "string", docId: "string" },
+    args: { userId: Type.String(), docId: Type.String() },
     async handler(ctx, args) {
       await ctx.db.table("grants").insert(args);
     },

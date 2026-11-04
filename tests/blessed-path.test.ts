@@ -21,6 +21,7 @@ import type { VexUser } from "../src/core/types.js";
 import { createRouter } from "../src/http/router.js";
 import { vexHandler } from "../src/http/vex-handler.js";
 import { rawSql, rawStorage } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 const runs = new Map<string, number>();
@@ -42,7 +43,7 @@ function plugin(api: VexPluginAPI) {
   });
   // What a caller sees depends on its fence, not only its id.
   api.registerQuery("visible", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       const fence = (ctx.user as { fence?: string } | undefined)?.fence;
       runs.set("visible", (runs.get("visible") ?? 0) + 1);
@@ -52,7 +53,7 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("count", {
-    args: { scope: "string", extra: "json?" },
+    args: { scope: Type.String(), extra: Type.Optional(Type.Unknown()) },
     async handler(ctx, args) {
       runs.set("count", (runs.get("count") ?? 0) + 1);
       if (failing) throw new Error("count failed");
@@ -65,12 +66,12 @@ function plugin(api: VexPluginAPI) {
     handler: (ctx) => ctx.db.table("items").all(),
   });
   api.registerQuery("raw", {
-    args: { reads: "json", sql: "string" },
+    args: { reads: Type.Unknown(), sql: Type.String() },
     handler: (ctx, args) =>
       ctx.db.sql(args.reads as Record<string, any>, args.sql),
   });
   api.registerMutation("add", {
-    args: { scope: "string", n: "number" },
+    args: { scope: Type.String(), n: Type.Number() },
     handler: (ctx, args) => ctx.db.table("items").insert(args),
   });
 }
@@ -371,15 +372,20 @@ describe("args are what the operation declares, and nothing else", () => {
   const typed = (api: VexPluginAPI) => {
     api.setName("t");
     api.registerQuery("typed", {
-      args: { s: "string", n: "number", b: "boolean?", j: "json?" },
+      args: {
+        s: Type.String(),
+        n: Type.Number(),
+        b: Type.Optional(Type.Boolean()),
+        j: Type.Optional(Type.Unknown()),
+      },
       handler: (_ctx, args) => ({ ...args }),
     });
     api.registerMutation("mut", {
-      args: { s: "string" },
+      args: { s: Type.String() },
       handler: (_ctx, args) => args.s,
     });
     api.registerAction("act", {
-      args: { n: "number" },
+      args: { n: Type.Number() },
       handler: (_ctx, args) => args.n,
     });
   };
@@ -388,12 +394,12 @@ describe("args are what the operation declares, and nothing else", () => {
   test("a wrong type, a missing arg, an undeclared arg, a non-finite number or a non-JSON value is refused, by every call", async () => {
     const vex = await engine();
     const refusals: Array<[Record<string, unknown>, string]> = [
-      [{ s: 1, n: 1 }, 'takes arg "s" as string; got number 1'],
-      [{ n: 1 }, 'needs arg "s" (string)'],
+      [{ s: 1, n: 1 }, 'takes arg "s": must be string'],
+      [{ n: 1 }, 'needs arg "s"'],
       [{ s: "a", n: 1, x: 1 }, 'takes no arg "x"'],
-      [{ s: "a", n: Number.NaN }, 'takes arg "n" as number'],
-      [{ s: "a", n: Infinity }, 'takes arg "n" as number'],
-      [{ s: "a", n: 1, b: "yes" }, 'takes arg "b" as boolean'],
+      [{ s: "a", n: Number.NaN }, 'takes arg "n": must be number'],
+      [{ s: "a", n: Infinity }, 'takes arg "n": must be number'],
+      [{ s: "a", n: 1, b: "yes" }, 'takes arg "b": must be boolean'],
       [{ s: "a", n: 1, j: new Date() }, "holds a Date"],
       [{ s: "a", n: 1, j: { f: () => 1 } }, "holds a function"],
     ];
@@ -404,21 +410,40 @@ describe("args are what the operation declares, and nothing else", () => {
       );
     }
     await expect(vex.mutate("t.mut", { s: 2 })).rejects.toThrow(
-      'takes arg "s" as string',
+      'takes arg "s": must be string',
     );
     await expect(vex.action("t.act", {})).rejects.toThrow('needs arg "n"');
     expect(vex.activeSubscriptionCount()).toBe(0);
   });
 
-  test("an optional arg may be absent or null; absent stays absent, null stays null", async () => {
+  test("an optional arg may be absent; null is a value its schema must allow", async () => {
     const vex = await engine();
     expect(await vex.query("t.typed", { s: "a", n: 1 })).toEqual({
       s: "a",
       n: 1,
     });
-    expect(
-      await vex.query("t.typed", { s: "a", n: 1, b: null, j: undefined }),
-    ).toEqual({ s: "a", n: 1, b: null });
+    // Undefined is an arg not given.
+    expect(await vex.query("t.typed", { s: "a", n: 1, j: undefined })).toEqual({
+      s: "a",
+      n: 1,
+    });
+    await expect(
+      vex.query("t.typed", { s: "a", n: 1, b: null }),
+    ).rejects.toThrow('takes arg "b": must be boolean');
+    const nullable = await create({
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("nl");
+          api.registerQuery("q", {
+            args: {
+              b: Type.Optional(Type.Union([Type.Boolean(), Type.Null()])),
+            },
+            handler: (_ctx, args) => ({ ...args }),
+          });
+        },
+      ],
+    });
+    expect(await nullable.query("nl.q", { b: null })).toEqual({ b: null });
   });
 
   test("a declaration naming a type the engine cannot check is refused at create", async () => {
@@ -452,7 +477,7 @@ describe("args are what the operation declares, and nothing else", () => {
             return next();
           });
           api.registerQuery("q", {
-            args: { s: "string" },
+            args: { s: Type.String() },
             handler: (_ctx, args) => {
               seen = args.s;
               return null;
@@ -550,7 +575,7 @@ describe("time and chance are the context's, and a query's time is reactive", ()
       handler: (ctx) => ({ at: ctx.now(1000) }),
     });
     api.registerQuery("badResolution", {
-      args: { r: "number" },
+      args: { r: Type.Number() },
       handler: (ctx, args) => ctx.now(args.r),
     });
     api.registerMutation("stamp", {
@@ -652,7 +677,7 @@ describe("a mutation's raw SQL reads and changes rows, nothing else", () => {
   const raw = (api: VexPluginAPI) => {
     api.setName("rw");
     api.registerMutation("run", {
-      args: { sql: "string" },
+      args: { sql: Type.String() },
       handler: (ctx, args) => ctx.db.sql(args.sql),
     });
   };

@@ -3,6 +3,7 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex, withSerializedSubscriptionResult } from "../src/core/engine.js";
 import { rawBulkInsert } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 const user = { id: "u1", name: "User", isAdmin: false };
 let open: Vex[] = [];
@@ -37,7 +38,7 @@ function reactivityPlugin(api: VexPluginAPI) {
   });
   api.registerTable("audit", { columns: { value: { type: "string" } } });
   api.registerQuery("list", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       listRuns++;
       return ctx.db
@@ -72,7 +73,7 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("names", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       return ctx.db
         .table("items")
@@ -85,7 +86,7 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("summary", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       const scoped = ctx.db.table("items").where("scope", "=", args.scope);
       return {
@@ -156,7 +157,7 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("branched", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       // The underlying query builder is mutable-shared: this order() call
       // changes the SQL that base.all() executes. The recorded descriptor
@@ -214,24 +215,29 @@ function reactivityPlugin(api: VexPluginAPI) {
   });
   api.registerMutation("add", {
     args: {
-      scope: "string",
-      kind: "string",
-      name: "string",
-      body: "json?",
-      score: "number?",
+      scope: Type.String(),
+      kind: Type.String(),
+      name: Type.String(),
+      body: Type.Optional(Type.Unknown()),
+      score: Type.Optional(Type.Number()),
     },
     async handler(ctx, args) {
       return ctx.db.table("items").insert({ ...args, score: args.score ?? 0 });
     },
   });
   api.registerMutation("touchAudit", {
-    args: { value: "string" },
+    args: { value: Type.String() },
     async handler(ctx, args) {
       await ctx.db.table("audit").insert(args);
     },
   });
   api.registerMutation("upsert", {
-    args: { scope: "string", kind: "string", name: "string", body: "json?" },
+    args: {
+      scope: Type.String(),
+      kind: Type.String(),
+      name: Type.String(),
+      body: Type.Optional(Type.Unknown()),
+    },
     async handler(ctx, args) {
       await ctx.db
         .table("items")
@@ -242,7 +248,7 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("renameFirst", {
-    args: { scope: "string", name: "string" },
+    args: { scope: Type.String(), name: Type.String() },
     async handler(ctx, args) {
       const row = await ctx.db
         .table("items")
@@ -252,19 +258,19 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("deleteByScope", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       return ctx.db.table("items").where("scope", "=", args.scope).delete();
     },
   });
   api.registerMutation("rawTouchAudit", {
-    args: { value: "string" },
+    args: { value: Type.String() },
     async handler(ctx, args) {
       await ctx.db.sql("INSERT INTO audit (value) VALUES (?)", args.value);
     },
   });
   api.registerMutation("ingest", {
-    args: { scope: "string", name: "string" },
+    args: { scope: Type.String(), name: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("items").insert({
         scope: args.scope,

@@ -8,6 +8,7 @@ import { performance } from "node:perf_hooks";
 import type { TableAccessPolicy } from "../src/core/access.js";
 import { UNRESTRICTED } from "../src/core/access.js";
 import type { VexPluginAPI } from "../src/core/api.js";
+import { Type } from "../src/portable.js";
 
 /**
  * CPU each query handler burns besides its reads, in ms: the policy
@@ -85,7 +86,7 @@ export function benchmarkPlugin(api: VexPluginAPI) {
   });
   // One conversation: its session row and its message count.
   api.registerQuery("conversation", {
-    args: { id: "string" },
+    args: { id: Type.String() },
     handler: async (ctx, args) => {
       work();
       const sessions = ctx.db.table("sessions");
@@ -106,7 +107,7 @@ export function benchmarkPlugin(api: VexPluginAPI) {
   });
   // A workspace's effective bindings: its sessions, enabled or not.
   api.registerQuery("effective", {
-    args: { workspaceId: "string" },
+    args: { workspaceId: Type.String() },
     handler: (ctx, args) => {
       work();
       return ctx.db
@@ -118,7 +119,7 @@ export function benchmarkPlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("seed", {
-    args: { users: "number", conversations: "number" },
+    args: { users: Type.Number(), conversations: Type.Number() },
     async handler(ctx, args) {
       const ids: string[][] = [];
       for (let u = 0; u < args.users; u++) {
@@ -143,7 +144,7 @@ export function benchmarkPlugin(api: VexPluginAPI) {
   });
   // `conversations.touch`: an inbound message's mark on its session.
   api.registerMutation("touch", {
-    args: { id: "string", at: "number" },
+    args: { id: Type.String(), at: Type.Number() },
     async handler(ctx, args) {
       await ctx.db
         .table("sessions")
@@ -151,7 +152,7 @@ export function benchmarkPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("message", {
-    args: { id: "string", text: "string" },
+    args: { id: Type.String(), text: Type.String() },
     async handler(ctx, args) {
       await ctx.db
         .table("messages")

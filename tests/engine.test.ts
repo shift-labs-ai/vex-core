@@ -8,6 +8,7 @@ import { Vex } from "../src/core/engine.js";
 import type { Span, Tracer } from "../src/core/tracer.js";
 import type { MiddlewareInfo, MutationContext } from "../src/core/types.js";
 import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 // Inline KV plugin for testing (replaces app-specific plugin imports)
 function kvPlugin(api: VexPluginAPI) {
@@ -21,7 +22,7 @@ function kvPlugin(api: VexPluginAPI) {
     unique: [["scope", "key"]],
   });
   api.registerQuery("get", {
-    args: { scope: "string", key: "string" },
+    args: { scope: Type.String(), key: Type.String() },
     async handler(ctx, args) {
       const row = await ctx.db
         .table("kv")
@@ -32,7 +33,7 @@ function kvPlugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("getAll", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       const rows = await ctx.db
         .table("kv")
@@ -44,7 +45,11 @@ function kvPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("set", {
-    args: { scope: "string", key: "string", value: "json?" },
+    args: {
+      scope: Type.String(),
+      key: Type.String(),
+      value: Type.Optional(Type.Unknown()),
+    },
     async handler(ctx, args) {
       await ctx.db
         .table("kv")
@@ -52,7 +57,7 @@ function kvPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("delete", {
-    args: { scope: "string", key: "string" },
+    args: { scope: Type.String(), key: Type.String() },
     async handler(ctx, args) {
       const row = await ctx.db
         .table("kv")
@@ -177,7 +182,7 @@ describe("subscriptions", () => {
             },
           });
           api.registerMutation("touch", {
-            args: { value: "string" },
+            args: { value: Type.String() },
             async handler(ctx, args) {
               await ctx.db.table("events").insert({ value: args.value });
             },
@@ -220,7 +225,11 @@ describe("mutation context chaining", () => {
             },
           });
           api.registerMutation("add", {
-            args: { category: "string", status: "string", name: "string" },
+            args: {
+              category: Type.String(),
+              status: Type.String(),
+              name: Type.String(),
+            },
             async handler(ctx, args) {
               await ctx.db.table("items").insert({
                 category: args.category,
@@ -230,7 +239,7 @@ describe("mutation context chaining", () => {
             },
           });
           api.registerMutation("findAndDelete", {
-            args: { category: "string", status: "string" },
+            args: { category: Type.String(), status: Type.String() },
             async handler(ctx, args) {
               const row = await ctx.db
                 .table("items")
@@ -295,7 +304,7 @@ describe("custom plugin", () => {
             },
           });
           api.registerMutation("add", {
-            args: { text: "string" },
+            args: { text: Type.String() },
             async handler(ctx, args) {
               return ctx.db
                 .table("todos")
@@ -334,7 +343,7 @@ describe("webhooks", () => {
             columns: { amount: { type: "number" }, status: { type: "string" } },
           });
           api.registerMutation("paid", {
-            args: { amount: "number" },
+            args: { amount: Type.Number() },
             handler: (ctx, args) =>
               ctx.db
                 .table("payments")
@@ -602,7 +611,7 @@ describe("middleware", () => {
           api.setName("test");
           api.registerTable("items", { columns: { name: { type: "string" } } });
           api.registerMutation("add", {
-            args: { name: "string" },
+            args: { name: Type.String() },
             handler: async (ctx, args) =>
               ctx.db.table("items").insert({ name: args.name }),
           });
@@ -661,7 +670,7 @@ describe("plugin name collisions", () => {
               columns: { name: { type: "string" } },
             });
             api.registerMutation("add", {
-              args: { name: "string" },
+              args: { name: Type.String() },
               handler: async (ctx, args) =>
                 ctx.db.table("items").insert({ name: args.name }),
             });
@@ -669,7 +678,7 @@ describe("plugin name collisions", () => {
           (api: VexPluginAPI) => {
             api.setName("items");
             api.registerMutation("add", {
-              args: { name: "string" },
+              args: { name: Type.String() },
               handler: async (ctx, args) =>
                 ctx.db.table("items").insert({ name: args.name }),
             });
@@ -1216,7 +1225,7 @@ describe("trace metadata", () => {
             },
           });
           api.registerQuery("read", {
-            args: { workspaceId: "string" },
+            args: { workspaceId: Type.String() },
             handler: (ctx, args) =>
               ctx.db
                 .table("documents")
@@ -1224,11 +1233,11 @@ describe("trace metadata", () => {
                 .all(),
           });
           api.registerMutation("insert", {
-            args: { workspaceId: "string", content: "string" },
+            args: { workspaceId: Type.String(), content: Type.String() },
             handler: (ctx, args) => ctx.db.table("documents").insert(args),
           });
           api.registerMutation("upsert", {
-            args: { workspaceId: "string", content: "string" },
+            args: { workspaceId: Type.String(), content: Type.String() },
             handler: (ctx, args) =>
               ctx.db
                 .table("documents")
@@ -1238,18 +1247,18 @@ describe("trace metadata", () => {
                 ),
           });
           api.registerMutation("update", {
-            args: { id: "string", content: "string" },
+            args: { id: Type.String(), content: Type.String() },
             handler: (ctx, args) =>
               ctx.db
                 .table("documents")
                 .update(args.id, { content: args.content }),
           });
           api.registerMutation("delete", {
-            args: { id: "string" },
+            args: { id: Type.String() },
             handler: (ctx, args) => ctx.db.table("documents").delete(args.id),
           });
           api.registerMutation("rawDelete", {
-            args: { workspaceId: "string" },
+            args: { workspaceId: Type.String() },
             handler: (ctx, args) =>
               ctx.db.sql(
                 "DELETE FROM documents WHERE workspaceId = ?",
@@ -1410,11 +1419,11 @@ describe("trace metadata", () => {
           api.setName("echo");
           api.registerTable("items", { columns: { text: { type: "string" } } });
           api.registerQuery("get", {
-            args: { text: "string", token: "string" },
+            args: { text: Type.String(), token: Type.String() },
             handler: async (_ctx, args) => args.text.length,
           });
           api.registerMutation("big", {
-            args: { text: "string", token: "string" },
+            args: { text: Type.String(), token: Type.String() },
             handler: async (_ctx, args) => args.text.length,
           });
           api.registerWebhook("hook", {
@@ -1511,7 +1520,7 @@ describe("writes by row id", () => {
           api.setName("del");
           api.registerTable("rows", { columns: { name: { type: "string" } } });
           api.registerMutation("deleteRead", {
-            args: { name: "string" },
+            args: { name: Type.String() },
             async handler(ctx, args) {
               const row = await ctx.db
                 .table("rows")
@@ -1521,12 +1530,12 @@ describe("writes by row id", () => {
             },
           });
           api.registerMutation("deleteMatching", {
-            args: { name: "string" },
+            args: { name: Type.String() },
             handler: (ctx, args) =>
               ctx.db.table("rows").where("name", "=", args.name).delete(),
           });
           api.registerMutation("renameRead", {
-            args: { name: "string", to: "string" },
+            args: { name: Type.String(), to: Type.String() },
             async handler(ctx, args) {
               const row = await ctx.db
                 .table("rows")

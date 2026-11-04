@@ -30,6 +30,7 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { VexUser } from "../src/core/types.js";
 import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
 const admin: VexUser = { id: "root", name: "Root", isAdmin: true };
@@ -126,7 +127,7 @@ function plugin(api: VexPluginAPI) {
   }
 
   api.registerQuery("run", {
-    args: { op: "json" },
+    args: { op: Type.Unknown() },
     async handler(ctx, args) {
       const spec = args.op as {
         table: string;
@@ -181,7 +182,7 @@ function plugin(api: VexPluginAPI) {
   });
 
   api.registerQuery("grouped", {
-    args: { table: "string", spec: "json" },
+    args: { table: Type.String(), spec: Type.Unknown() },
     async handler(ctx, args) {
       const spec = (args.spec ?? {}) as {
         columns?: string | string[];
@@ -231,7 +232,7 @@ function plugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("grant", {
-    args: { userId: "string", docId: "string" },
+    args: { userId: Type.String(), docId: Type.String() },
     async handler(ctx, args) {
       await ctx.db.table("grants").insert(args);
     },

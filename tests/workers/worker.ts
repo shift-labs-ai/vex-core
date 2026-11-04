@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { durableObjectAdapter, Vex, type VexPluginAPI } from "vex-core";
 import { cors, createRouter, sessions, vexHandler } from "vex-core/http";
+import { Type } from "../../src/portable.js";
 
 /**
  * A bare SQLite-backed Durable Object. The tests reach its storage
@@ -14,7 +15,7 @@ function counterPlugin(api: VexPluginAPI) {
     columns: { key: { type: "string" }, value: { type: "number" } },
   });
   api.registerMutation("set", {
-    args: { key: "string", value: "number" },
+    args: { key: Type.String(), value: Type.Number() },
     async handler(ctx, args) {
       return ctx.db.table("counters").insert(args);
     },

@@ -6,10 +6,13 @@
  * Durable Objects".
  */
 
+export type { Static, TSchema } from "typebox";
+// The schema language: TypeBox, re-exported so an app holds the
+// engine's own version.
+export { default as Type } from "typebox";
 // Adapters
 export type { DurableObjectSqlStorage } from "./adapters/durable-object.js";
 export { durableObjectAdapter } from "./adapters/durable-object.js";
-
 // Core
 export type {
   AccessReader,
@@ -83,5 +86,5 @@ export type {
   WebhookRequest,
   WebhookResponse,
 } from "./core/types.js";
-export type { ArgsDecl, ArgType } from "./core/values.js";
+export type { ArgsOf, ArgsShape } from "./core/values.js";
 export { ArgsError } from "./core/values.js";

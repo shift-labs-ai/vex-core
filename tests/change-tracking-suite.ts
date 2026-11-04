@@ -17,6 +17,7 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { ANY_TABLE, type StorageAdapter } from "../src/core/storage.js";
 import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 type CreateStorage = () => Promise<StorageAdapter> | StorageAdapter;
 
@@ -321,21 +322,21 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           access: { prepare: () => UNRESTRICTED, row: () => true },
         });
         api.registerQuery("scope", {
-          args: { scope: "string" },
+          args: { scope: Type.String() },
           async handler(ctx, args) {
             count(`scope:${args.scope}`);
             return ctx.db.table("items").where("scope", "=", args.scope).all();
           },
         });
         api.registerQuery("byId", {
-          args: { id: "string" },
+          args: { id: Type.String() },
           async handler(ctx, args) {
             count(`id:${args.id}`);
             return ctx.db.table("items").where("_id", "=", args.id).first();
           },
         });
         api.registerQuery("raw", {
-          args: { sql: "string" },
+          args: { sql: Type.String() },
           async handler(ctx, args) {
             count(`raw:${args.sql}`);
             // Every table these reads may reach, each read whole.
@@ -352,34 +353,34 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           },
         });
         api.registerMutation("raw", {
-          args: { sql: "string" },
+          args: { sql: Type.String() },
           handler: (ctx, args) => ctx.db.sql(args.sql),
         });
         api.registerMutation("rawThenFail", {
-          args: { sql: "string" },
+          args: { sql: Type.String() },
           async handler(ctx, args) {
             await ctx.db.sql(args.sql);
             throw new Error("after the raw write");
           },
         });
         api.registerMutation("add", {
-          args: { scope: "string", name: "string" },
+          args: { scope: Type.String(), name: Type.String() },
           handler: (ctx, args) => ctx.db.table("items").insert(args),
         });
         api.registerMutation("move", {
-          args: { id: "string", scope: "string" },
+          args: { id: Type.String(), scope: Type.String() },
           handler: (ctx, args) =>
             ctx.db.table("items").update(args.id, { scope: args.scope }),
         });
         api.registerMutation("upsertScope", {
-          args: { name: "string", scope: "string" },
+          args: { name: Type.String(), scope: Type.String() },
           handler: (ctx, args) =>
             ctx.db
               .table("items")
               .upsert({ name: args.name }, { scope: args.scope }),
         });
         api.registerMutation("remove", {
-          args: { id: "string" },
+          args: { id: Type.String() },
           handler: (ctx, args) => ctx.db.table("items").delete(args.id),
         });
         api.registerMutation("addOther", {
@@ -387,7 +388,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           handler: (ctx) => ctx.db.table("other").insert({ v: "x" }),
         });
         api.registerMutation("addBAndOther", {
-          args: { raw: "boolean" },
+          args: { raw: Type.Boolean() },
           async handler(ctx, args) {
             await ctx.db.table("items").insert({ scope: "b", name: "b1" });
             if (args.raw) {
@@ -405,7 +406,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           },
         });
         api.registerMutation("rawWrite", {
-          args: { sql: "string" },
+          args: { sql: Type.String() },
           handler: (ctx, args) => ctx.db.sql(args.sql),
         });
         api.registerWebhook("raw", {

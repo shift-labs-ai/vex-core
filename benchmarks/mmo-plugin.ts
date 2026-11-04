@@ -8,6 +8,7 @@
  */
 
 import type { VexPluginAPI } from "../src/core/api.js";
+import { Type } from "../src/portable.js";
 
 export const ZONE_SIZE = 100;
 export const PARTY_SIZE = 5;
@@ -60,12 +61,12 @@ export function mmoPlugin(api: VexPluginAPI) {
 
   // ─── A player's own views ───
   api.registerQuery("self", {
-    args: { id: "string" },
+    args: { id: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("players").where("_id", "=", args.id).first(),
   });
   api.registerQuery("inventory", {
-    args: { id: "string" },
+    args: { id: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("items")
@@ -74,12 +75,12 @@ export function mmoPlugin(api: VexPluginAPI) {
         .all(),
   });
   api.registerQuery("inventoryCount", {
-    args: { id: "string" },
+    args: { id: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("items").where("playerId", "=", args.id).count(),
   });
   api.registerQuery("weapons", {
-    args: { id: "string" },
+    args: { id: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("items")
@@ -91,7 +92,7 @@ export function mmoPlugin(api: VexPluginAPI) {
 
   // ─── Views many players share ───
   api.registerQuery("zoneRoster", {
-    args: { zone: "string" },
+    args: { zone: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("players")
@@ -101,7 +102,7 @@ export function mmoPlugin(api: VexPluginAPI) {
         .all(),
   });
   api.registerQuery("nearby", {
-    args: { zone: "string", cell: "string" },
+    args: { zone: Type.String(), cell: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("players")
@@ -111,7 +112,7 @@ export function mmoPlugin(api: VexPluginAPI) {
         .all(),
   });
   api.registerQuery("zoneChat", {
-    args: { zone: "string" },
+    args: { zone: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("messages")
@@ -122,7 +123,7 @@ export function mmoPlugin(api: VexPluginAPI) {
         .all(),
   });
   api.registerQuery("party", {
-    args: { partyId: "string" },
+    args: { partyId: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("players")
@@ -131,7 +132,7 @@ export function mmoPlugin(api: VexPluginAPI) {
         .all(),
   });
   api.registerQuery("partyHp", {
-    args: { partyId: "string" },
+    args: { partyId: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("players")
@@ -140,7 +141,7 @@ export function mmoPlugin(api: VexPluginAPI) {
         .all(),
   });
   api.registerQuery("guildRoster", {
-    args: { guildId: "string" },
+    args: { guildId: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("players")
@@ -150,7 +151,7 @@ export function mmoPlugin(api: VexPluginAPI) {
         .all(),
   });
   api.registerQuery("guildChat", {
-    args: { guildId: "string" },
+    args: { guildId: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("messages")
@@ -173,7 +174,7 @@ export function mmoPlugin(api: VexPluginAPI) {
 
   // ─── Ticks of play ───
   api.registerMutation("move", {
-    args: { id: "string", x: "number", y: "number" },
+    args: { id: Type.String(), x: Type.Number(), y: Type.Number() },
     handler: (ctx, args) =>
       ctx.db.table("players").update(args.id, {
         x: args.x,
@@ -182,26 +183,26 @@ export function mmoPlugin(api: VexPluginAPI) {
       }),
   });
   api.registerMutation("damage", {
-    args: { id: "string", hp: "number" },
+    args: { id: Type.String(), hp: Type.Number() },
     handler: (ctx, args) =>
       ctx.db.table("players").update(args.id, { hp: args.hp }),
   });
   api.registerMutation("levelUp", {
-    args: { id: "string", level: "number" },
+    args: { id: Type.String(), level: Type.Number() },
     handler: (ctx, args) =>
       ctx.db.table("players").update(args.id, { level: args.level }),
   });
   api.registerMutation("say", {
     args: {
-      channel: "string",
-      playerId: "string",
-      text: "string",
-      at: "number",
+      channel: Type.String(),
+      playerId: Type.String(),
+      text: Type.String(),
+      at: Type.Number(),
     },
     handler: (ctx, args) => ctx.db.table("messages").insert(args),
   });
   api.registerMutation("loot", {
-    args: { playerId: "string", kind: "string", qty: "number" },
+    args: { playerId: Type.String(), kind: Type.String(), qty: Type.Number() },
     handler: (ctx, args) => ctx.db.table("items").insert(args),
   });
 }

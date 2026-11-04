@@ -8,6 +8,7 @@ import type {
   TableSchema,
   WebhookDef,
 } from "./types.js";
+import type { ArgsShape } from "./values.js";
 
 /**
  * What a plugin registers through. `A` is the app's access declaration
@@ -17,9 +18,12 @@ import type {
 export interface VexPluginAPI<A = undefined> {
   setName(name: string): void;
   registerTable(name: string, schema: TableSchema): void;
-  registerQuery(name: string, def: QueryDef<A>): void;
-  registerMutation(name: string, def: MutationDef<A>): void;
-  registerAction(name: string, def: ActionDef<A>): void;
+  registerQuery<S extends ArgsShape>(name: string, def: QueryDef<A, S>): void;
+  registerMutation<S extends ArgsShape>(
+    name: string,
+    def: MutationDef<A, S>,
+  ): void;
+  registerAction<S extends ArgsShape>(name: string, def: ActionDef<A, S>): void;
   registerJob(name: string, def: JobDef): void;
   registerWebhook(name: string, def: WebhookDef): void;
   use(fn: MiddlewareFn<A>): void;
@@ -47,14 +51,20 @@ export function createPluginAPI<A = undefined>(): {
     registerTable(tableName: string, schema: TableSchema) {
       tables[tableName] = schema;
     },
-    registerQuery(queryName: string, def: QueryDef<A>) {
-      queries[queryName] = def;
+    registerQuery<S extends ArgsShape>(queryName: string, def: QueryDef<A, S>) {
+      queries[queryName] = def as QueryDef<A, any>;
     },
-    registerMutation(mutationName: string, def: MutationDef<A>) {
-      mutations[mutationName] = def;
+    registerMutation<S extends ArgsShape>(
+      mutationName: string,
+      def: MutationDef<A, S>,
+    ) {
+      mutations[mutationName] = def as MutationDef<A, any>;
     },
-    registerAction(actionName: string, def: ActionDef<A>) {
-      actions[actionName] = def;
+    registerAction<S extends ArgsShape>(
+      actionName: string,
+      def: ActionDef<A, S>,
+    ) {
+      actions[actionName] = def as ActionDef<A, any>;
     },
     registerJob(jobName: string, def: JobDef) {
       jobs[jobName] = def;

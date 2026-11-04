@@ -4,122 +4,119 @@
  * it answers, which is JSON or refused.
  */
 
+import Type, { type Static, type TObject, type TSchema } from "typebox";
+import { Compile } from "typebox/compile";
 import { HttpError } from "../http/error.js";
 
-/** The type of a declared arg; `?` lets it be absent or null. */
-export type ArgType =
-  | "string"
-  | "number"
-  | "boolean"
-  | "json"
-  | "string?"
-  | "number?"
-  | "boolean?"
-  | "json?";
+/**
+ * What an operation takes: each arg's name and its schema, a TypeBox
+ * type (JSON Schema that infers as TypeScript). The handler's args are
+ * `ArgsOf` the shape.
+ */
+export type ArgsShape = Record<string, TSchema>;
 
-/** What an operation declares it takes: each arg's name and type. */
-export type ArgsDecl = Record<string, ArgType>;
+/** The args a handler receives for `S`. */
+export type ArgsOf<S extends ArgsShape> = Static<TObject<S>>;
 
-const ARG_TYPES: ReadonlySet<string> = new Set<ArgType>([
-  "string",
-  "number",
-  "boolean",
-  "json",
-  "string?",
-  "number?",
-  "boolean?",
-  "json?",
-]);
-
-/** Refuses a declaration naming a type the engine cannot check. */
-export function assertArgsDecl(
-  kind: string,
-  name: string,
-  decl: unknown,
-): asserts decl is ArgsDecl {
-  if (!isPlainObject(decl)) {
-    throw new Error(
-      `${kind} ${name} declares no args: give an object, { name: type } ({} for none)`,
-    );
-  }
-  for (const [arg, type] of Object.entries(decl)) {
-    if (typeof type !== "string" || !ARG_TYPES.has(type)) {
-      throw new Error(
-        `${kind} ${name} declares arg ${JSON.stringify(arg)} as ${JSON.stringify(type)}: an arg is ${[...ARG_TYPES].map((t) => JSON.stringify(t)).join(", ")}`,
-      );
-    }
-  }
-}
+/** An operation's args, checked: what its handler is given. */
+export type ArgsCheck = (args: unknown) => Readonly<Record<string, any>>;
 
 /**
- * The args `args` are, as `decl` declares them: each declared arg of
- * its type (an optional one absent or null), no undeclared one, and
- * every value JSON. The answer is a deep-frozen copy, so nothing that
- * runs before the handler can change what it was checked as.
+ * The check for an operation's args, compiled once: an object of
+ * exactly the declared args (none undeclared), each matching its
+ * schema, every value JSON. It answers a deep-frozen copy, so nothing
+ * that runs before the handler can change what it was checked as.
  */
-export function checkArgs(
+export function compileArgs(
   kind: string,
   name: string,
-  decl: ArgsDecl,
-  args: unknown,
-): Readonly<Record<string, any>> {
-  const given = args === undefined ? {} : args;
-  if (!isPlainObject(given)) {
-    throw new ArgsError(`${kind} ${name} takes an object of args`);
-  }
-  // Every problem, so a caller fixes them in one go.
-  const problems: string[] = [];
-  for (const key of Object.keys(given)) {
-    if (!(key in decl) && given[key] !== undefined) {
-      problems.push(`takes no arg ${JSON.stringify(key)}`);
-    }
-  }
-  const checked: Record<string, any> = {};
-  for (const [key, declared] of Object.entries(decl)) {
-    const optional = declared.endsWith("?");
-    const type = optional ? declared.slice(0, -1) : declared;
-    const value = given[key];
-    if (value === undefined || value === null) {
-      if (optional) {
-        if (value === null) checked[key] = null;
-      } else {
-        problems.push(`needs arg ${JSON.stringify(key)} (${type})`);
-      }
-      continue;
-    }
-    const ok =
-      type === "string"
-        ? typeof value === "string"
-        : type === "number"
-          ? typeof value === "number" && Number.isFinite(value)
-          : type === "boolean"
-            ? typeof value === "boolean"
-            : true;
-    if (!ok) {
-      problems.push(
-        `takes arg ${JSON.stringify(key)} as ${type}; got ${describe(value)}`,
-      );
-      continue;
-    }
-    if (type !== "json") {
-      checked[key] = value;
-      continue;
-    }
-    try {
-      checked[key] = jsonCopy(value, `arg ${JSON.stringify(key)}`);
-    } catch (error) {
-      problems.push((error as Error).message);
-    }
-  }
-  if (problems.length > 0) {
-    const takes = Object.entries(decl)
-      .map(([k, t]) => `${k}: ${t}`)
-      .join(", ");
-    throw new ArgsError(
-      `${kind} ${name} ${problems.join("; ")} (it takes { ${takes} })`,
+  shape: unknown,
+): ArgsCheck {
+  if (!isPlainObject(shape)) {
+    throw new Error(
+      `${kind} ${name} declares no args: give an object of schemas, { name: Type.String() } ({} for none)`,
     );
   }
-  return deepFreeze(checked);
+  for (const [arg, schema] of Object.entries(shape)) {
+    if (!isPlainObject(schema)) {
+      throw new Error(
+        `${kind} ${name} declares arg ${JSON.stringify(arg)} as ${JSON.stringify(schema)}: declare it with a schema, such as Type.String()`,
+      );
+    }
+  }
+  const compiled = Compile(
+    Type.Object(shape as ArgsShape, { additionalProperties: false }),
+  );
+  const takes =
+    Object.keys(shape)
+      .map((k) => JSON.stringify(k))
+      .join(", ") || "none";
+  return (args) => {
+    const given = args === undefined ? {} : args;
+    if (!isPlainObject(given)) {
+      throw new ArgsError(`${kind} ${name} takes an object of args`);
+    }
+    // An undefined value is an arg not given: the wire has none.
+    const present: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(given)) {
+      if (value !== undefined) present[key] = value;
+    }
+    if (!compiled.Check(present)) {
+      // An undeclared key is reported twice (its false schema, and the
+      // object's additionalProperties): once is enough.
+      const problems = [...compiled.Errors(present)]
+        .filter((error) => error.message !== "schema is false")
+        .map((error) => argProblem(error));
+      throw new ArgsError(
+        `${kind} ${name} ${[...new Set(problems)].join("; ")} (it takes ${takes})`,
+      );
+    }
+    return deepFreeze(jsonCopy(present, `${kind} ${name} args`));
+  };
+}
+
+/** A TypeBox error as the caller is told it. */
+function argProblem(error: {
+  keyword: string;
+  instancePath: string;
+  params: Record<string, any>;
+  message: string;
+}): string {
+  const path = error.instancePath.split("/").filter(Boolean);
+  if (error.keyword === "additionalProperties") {
+    const extra = error.params.additionalProperties ?? path[0];
+    return (Array.isArray(extra) ? extra : [extra])
+      .map((key: string) => `takes no arg ${JSON.stringify(key)}`)
+      .join("; ");
+  }
+  if (error.keyword === "required") {
+    const missing = error.params.requiredProperties ?? [];
+    return (Array.isArray(missing) ? missing : [missing])
+      .map((m: string) => `needs arg ${JSON.stringify(m)}`)
+      .join("; ");
+  }
+  const at =
+    path.length > 0
+      ? `arg ${JSON.stringify(path[0])}${path.length > 1 ? ` at /${path.slice(1).join("/")}` : ""}`
+      : "its args";
+  return `takes ${at}: ${error.message}`;
+}
+
+/** The check for an operation's answer against its `returns` schema. */
+export function compileReturns(
+  kind: string,
+  name: string,
+  schema: TSchema | undefined,
+): ((value: unknown) => void) | undefined {
+  if (schema === undefined) return undefined;
+  const compiled = Compile(schema);
+  return (value) => {
+    if (compiled.Check(value)) return;
+    const [error] = [...compiled.Errors(value)];
+    throw new TypeError(
+      `${kind} ${name} answers ${error ? `${error.instancePath || "its value"}: ${error.message}` : "against its returns schema"}`,
+    );
+  };
 }
 
 /** Args refused at the boundary: the caller's mistake, answered 400. */

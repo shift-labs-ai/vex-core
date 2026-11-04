@@ -69,9 +69,10 @@ import type {
   WebhookResponse,
 } from "./types.js";
 import {
-  type ArgsDecl,
-  assertArgsDecl,
-  checkArgs,
+  type ArgsCheck,
+  type ArgsShape,
+  compileArgs,
+  compileReturns,
   serializeJson,
 } from "./values.js";
 
@@ -411,18 +412,16 @@ function groupWritesByTable(
 // middleware without reading it, so they hold it erased (`any`): `A`
 // types what an app sees (`use`, the descriptions), and that is what
 // lets a bare `Vex` hold an engine of any declaration.
-interface RegisteredQuery {
+/** An operation as registered: its definition, and its checks compiled. */
+interface Registered<D> {
   plugin: string;
-  def: QueryDef<any>;
+  def: D;
+  args: ArgsCheck;
+  returns: ((value: unknown) => void) | undefined;
 }
-interface RegisteredMutation {
-  plugin: string;
-  def: MutationDef<any>;
-}
-interface RegisteredAction {
-  plugin: string;
-  def: ActionDef<any>;
-}
+type RegisteredQuery = Registered<QueryDef<any>>;
+type RegisteredMutation = Registered<MutationDef<any>>;
+type RegisteredAction = Registered<ActionDef<any>>;
 
 /**
  * How the engine describes an operation, wherever it does: its
@@ -431,7 +430,7 @@ interface RegisteredAction {
  */
 export interface OperationDescription<A> {
   plugin: string;
-  args: ArgsDecl;
+  args: ArgsShape;
   access: A | undefined;
 }
 
@@ -718,23 +717,35 @@ export class Vex<A = unknown> {
     for (const [name, def] of Object.entries(plugin.queries)) {
       const key = `${plugin.name}.${name}`;
       if (this.queries.has(key)) throw new Error(`Duplicate query: ${key}`);
-      assertArgsDecl("query", key, def.args);
-      this.queries.set(key, { plugin: plugin.name, def });
+      this.queries.set(key, {
+        plugin: plugin.name,
+        def,
+        args: compileArgs("query", key, def.args),
+        returns: compileReturns("query", key, def.returns),
+      });
     }
 
     for (const [name, def] of Object.entries(plugin.mutations)) {
       const key = `${plugin.name}.${name}`;
       if (this.mutations.has(key))
         throw new Error(`Duplicate mutation: ${key}`);
-      assertArgsDecl("mutation", key, def.args);
-      this.mutations.set(key, { plugin: plugin.name, def });
+      this.mutations.set(key, {
+        plugin: plugin.name,
+        def,
+        args: compileArgs("mutation", key, def.args),
+        returns: compileReturns("mutation", key, def.returns),
+      });
     }
 
     for (const [name, def] of Object.entries(plugin.actions ?? {})) {
       const key = `${plugin.name}.${name}`;
       if (this.actions.has(key)) throw new Error(`Duplicate action: ${key}`);
-      assertArgsDecl("action", key, def.args);
-      this.actions.set(key, { plugin: plugin.name, def });
+      this.actions.set(key, {
+        plugin: plugin.name,
+        def,
+        args: compileArgs("action", key, def.args),
+        returns: compileReturns("action", key, def.returns),
+      });
     }
   }
 
@@ -2023,6 +2034,7 @@ export class Vex<A = unknown> {
         return answer;
       });
     } while (group.stale);
+    reg.returns?.(result);
     return {
       result,
       measurement: this.measureReactiveResult(result, group.queryName),
@@ -2066,7 +2078,7 @@ export class Vex<A = unknown> {
   async evaluate(request: EvaluationRequest): Promise<Evaluation> {
     const reg = this.queries.get(request.name);
     if (!reg) throw new Error(`Query not found: ${request.name}`);
-    const args = checkArgs("query", request.name, reg.def.args, request.args);
+    const args = reg.args(request.args);
     const tables = new Set<string>();
     const dependencies: QueryDependency[] = [];
     const callerReads = new Set<string>();
@@ -2089,6 +2101,7 @@ export class Vex<A = unknown> {
         ectx,
       ),
     );
+    reg.returns?.(result);
     return {
       result,
       ...this.measureReactiveResult(result, request.name),
@@ -2513,7 +2526,7 @@ export class Vex<A = unknown> {
     return this.trace("query", name, parent, async (ectx, meta) => {
       const reg = this.queries.get(name);
       if (!reg) throw new Error(`Query not found: ${name}`);
-      const args = checkArgs("query", name, reg.def.args, given);
+      const args = reg.args(given);
       const recording = isTraceRecording(ectx);
       const tables = recording ? new Set<string>() : undefined;
       const dependencies = recording ? ([] as QueryDependency[]) : undefined;
@@ -2527,6 +2540,7 @@ export class Vex<A = unknown> {
         );
       });
       const { serialized } = serializeJson(result, `query ${name} answers`);
+      reg.returns?.(result);
       if (tables && dependencies) {
         meta.plugin = reg.plugin;
         meta.tables = [...tables];
@@ -2552,7 +2566,7 @@ export class Vex<A = unknown> {
     return this.trace("mutation", name, parent, async (ectx, meta) => {
       const reg = this.mutations.get(name);
       if (!reg) throw new Error(`Mutation not found: ${name}`);
-      const args = checkArgs("mutation", name, reg.def.args, given);
+      const args = reg.args(given);
       const writes: WriteDependency[] = [];
       const ctx = this.buildMutationContext(user, writes);
       const result = await this.storage.transaction(() =>
@@ -2565,6 +2579,7 @@ export class Vex<A = unknown> {
           // Refused inside the transaction, so a non-JSON answer
           // commits nothing.
           serializeJson(answer, `mutation ${name} answers`);
+          reg.returns?.(answer);
           return answer;
         }),
       );
@@ -2594,7 +2609,7 @@ export class Vex<A = unknown> {
     return this.trace("action", name, parent, async (ectx, meta) => {
       const reg = this.actions.get(name);
       if (!reg) throw new Error(`Action not found: ${name}`);
-      const args = checkArgs("action", name, reg.def.args, given);
+      const args = reg.args(given);
       signal?.throwIfAborted();
       if (isTraceRecording(ectx)) meta.plugin = reg.plugin;
       const ctx = this.buildActionContext(user, ectx, signal);
@@ -2605,6 +2620,7 @@ export class Vex<A = unknown> {
         ectx,
       );
       serializeJson(result, `action ${name} answers`);
+      reg.returns?.(result);
       return result as T;
     });
   }
@@ -2622,7 +2638,7 @@ export class Vex<A = unknown> {
     return this.trace("subscribe", name, null, async (_ectx, meta) => {
       const reg = this.queries.get(name);
       if (!reg) throw new Error(`Query not found: ${name}`);
-      const args = checkArgs("query", name, reg.def.args, given);
+      const args = reg.args(given);
       const recording = isTraceRecording(_ectx);
       const budget = this.resolveReactive(reg.def);
       if (recording) meta.reactive = budget !== false;

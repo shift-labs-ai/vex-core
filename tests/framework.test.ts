@@ -20,6 +20,7 @@ import {
   webhook,
 } from "../src/framework/define.js";
 import { scanDirectory } from "../src/framework/scanner.js";
+import { Type } from "../src/portable.js";
 
 // ─── define helpers ───
 
@@ -57,25 +58,25 @@ describe("define", () => {
 
   test("query() returns tagged query", () => {
     const handler = async () => [];
-    const q = query({ limit: "number" }, handler);
+    const q = query({ limit: Type.Number() }, handler);
     expect(isQuery(q)).toBe(true);
-    expect(q.args).toEqual({ limit: "number" });
+    expect(q.args).toEqual({ limit: Type.Number() });
     expect(q.handler).toBe(handler);
   });
 
   test("mutation() returns tagged mutation", () => {
     const handler = async () => {};
-    const m = mutation({ name: "string" }, handler);
+    const m = mutation({ name: Type.String() }, handler);
     expect(isMutation(m)).toBe(true);
-    expect(m.args).toEqual({ name: "string" });
+    expect(m.args).toEqual({ name: Type.String() });
   });
 
   test("action() returns tagged action", () => {
     const handler = async () => "done";
-    const a = action({ url: "string" }, handler);
+    const a = action({ url: Type.String() }, handler);
     expect(isAction(a)).toBe(true);
     expect(isMutation(a)).toBe(false);
-    expect(a.args).toEqual({ url: "string" });
+    expect(a.args).toEqual({ url: Type.String() });
     expect(a.handler).toBe(handler);
   });
 
@@ -159,9 +160,9 @@ describe("scanner", () => {
   test("scans query and mutation files as plugins", async () => {
     writeFile(
       "todos.ts",
-      `import { query, mutation } from "@vex/define";
+      `import { query, mutation, Type } from "@vex/define";
        export const list = query({}, async () => []);
-       export const create = mutation({ text: "string" }, async () => {});`,
+       export const create = mutation({ text: Type.String() }, async () => {});`,
     );
     const result = await scanDirectory(TMP);
     expect(result.queryCount).toBe(1);
@@ -223,12 +224,12 @@ describe("scanner", () => {
   test("action files are scanned, and the engine runs them", async () => {
     writeFile(
       "notes.ts",
-      `import { action, mutation, query, table } from "@vex/define";
+      `import { action, mutation, query, table, Type } from "@vex/define";
        export const items = table({ text: "string" });
-       export const add = mutation({ text: "string" }, (ctx, args) =>
+       export const add = mutation({ text: Type.String() }, (ctx, args) =>
          ctx.db.table("notes_items").insert({ text: args.text }));
        export const count = query({}, (ctx) => ctx.db.table("notes_items").count());
-       export const importAll = action({ texts: "json" }, async (ctx, args) => {
+       export const importAll = action({ texts: Type.Array(Type.String()) }, async (ctx, args) => {
          for (const text of args.texts) await ctx.mutate("notes.add", { text });
          return ctx.query("notes.count");
        });`,

@@ -12,6 +12,7 @@ import { UNRESTRICTED } from "../../src/core/access.js";
 import type { VexPluginAPI } from "../../src/core/api.js";
 import { quoteIdent } from "../../src/core/sql-where.js";
 import type { Filter } from "../../src/core/types.js";
+import { Type } from "../../src/portable.js";
 
 export type Terminal =
   | "all"
@@ -101,7 +102,7 @@ export function equivalencePlugin(api: VexPluginAPI) {
   });
 
   api.registerQuery("read", {
-    args: { spec: "json" },
+    args: { spec: Type.Unknown() },
     async handler(ctx, args) {
       const spec = args.spec as Spec;
       let data: unknown;
@@ -172,26 +173,26 @@ export function equivalencePlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("insert", {
-    args: { table: "string", row: "json" },
+    args: { table: Type.String(), row: Type.Unknown() },
     handler: (ctx, args) =>
       ctx.db
         .table(args.table)
         .insert({ ...(args.row as object), version: next() }),
   });
   api.registerMutation("update", {
-    args: { table: "string", id: "string", data: "json" },
+    args: { table: Type.String(), id: Type.String(), data: Type.Unknown() },
     handler: (ctx, args) =>
       ctx.db
         .table(args.table)
         .update(args.id, { ...(args.data as object), version: next() }),
   });
   api.registerMutation("touch", {
-    args: { table: "string", id: "string", data: "json" },
+    args: { table: Type.String(), id: Type.String(), data: Type.Unknown() },
     handler: (ctx, args) =>
       ctx.db.table(args.table).update(args.id, args.data as object),
   });
   api.registerMutation("upsert", {
-    args: { table: "string", keys: "json", data: "json" },
+    args: { table: Type.String(), keys: Type.Unknown(), data: Type.Unknown() },
     handler: (ctx, args) =>
       ctx.db.table(args.table).upsert(args.keys as object, {
         ...(args.data as object),
@@ -199,11 +200,11 @@ export function equivalencePlugin(api: VexPluginAPI) {
       }),
   });
   api.registerMutation("delete", {
-    args: { table: "string", id: "string" },
+    args: { table: Type.String(), id: Type.String() },
     handler: (ctx, args) => ctx.db.table(args.table).delete(args.id),
   });
   api.registerMutation("deleteWhere", {
-    args: { table: "string", filters: "json" },
+    args: { table: Type.String(), filters: Type.Unknown() },
     handler: (ctx, args) => {
       let q = ctx.db.table(args.table);
       for (const f of args.filters as Filter[])
@@ -212,7 +213,7 @@ export function equivalencePlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("rawInsert", {
-    args: { table: "string", k: "string" },
+    args: { table: Type.String(), k: Type.String() },
     handler: (ctx, args) =>
       ctx.db.sql(
         `INSERT INTO ${quoteIdent(args.table)} (_id, k, version) VALUES (?, ?, ?)`,
@@ -222,7 +223,7 @@ export function equivalencePlugin(api: VexPluginAPI) {
       ),
   });
   api.registerMutation("rawUpdate", {
-    args: { table: "string", id: "string", k: "string" },
+    args: { table: Type.String(), id: Type.String(), k: Type.String() },
     handler: (ctx, args) =>
       ctx.db.sql(
         `UPDATE ${quoteIdent(args.table)} SET k = ?, version = ? WHERE _id = ?`,
@@ -232,20 +233,20 @@ export function equivalencePlugin(api: VexPluginAPI) {
       ),
   });
   api.registerMutation("failing", {
-    args: { table: "string" },
+    args: { table: Type.String() },
     async handler(ctx, args) {
       await ctx.db.table(args.table).insert({ k: "x", version: next() });
       throw new Error("rolled back");
     },
   });
   api.registerMutation("grant", {
-    args: { userId: "string", itemId: "string" },
+    args: { userId: Type.String(), itemId: Type.String() },
     async handler(ctx, args) {
       await ctx.db.table("grants").insert(args);
     },
   });
   api.registerMutation("revoke", {
-    args: { userId: "string", itemId: "string" },
+    args: { userId: Type.String(), itemId: Type.String() },
     handler: (ctx, args) =>
       ctx.db
         .table("grants")
