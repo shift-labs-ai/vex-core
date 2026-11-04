@@ -65,7 +65,6 @@ import type {
   Scheduler,
   StoredTableSchema,
   SubscribeContext,
-  TableSchema,
   VexRuntime,
   VexUser,
   WebhookRequest,
@@ -1550,9 +1549,16 @@ export class Vex<A = unknown> {
         args: Record<string, any> = {},
         as?: { user: VexUser | null },
       ) => {
-        // As the context's caller as middleware left it, unless `as`
-        // names another, which is plain data as any caller is.
-        if (as?.user != null) serializeJson(as.user, "a caller");
+        // As the context's caller as middleware left it (whose reads
+        // its tracked view records), unless `as` names another, which
+        // is plain data as any caller is.
+        if (as?.user != null) {
+          try {
+            serializeJson(as.user, "a caller");
+          } catch (error) {
+            return Promise.reject(error);
+          }
+        }
         const caller = as ? as.user : ctx.user;
         // Its middleware runs outside the calling handler's frame, as
         // every call's does; its handler, in a frame of its own.

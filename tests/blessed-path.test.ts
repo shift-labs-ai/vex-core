@@ -1280,6 +1280,19 @@ describe("a query composes another by name (ctx.query)", () => {
       args: {},
       handler: (ctx) => ctx.query("bp.visible", { scope: "a" }, { user: null }),
     });
+    api.registerQuery("asReach", {
+      args: {},
+      handler: (ctx) =>
+        ctx
+          .query(
+            "bp.visible",
+            { scope: "a" },
+            {
+              user: { ...alice, reach: () => true } as unknown as VexUser,
+            },
+          )
+          .catch((error: Error) => `rejected: ${error.message}`),
+    });
   };
 
   test("what the called query reads is the caller's: a write it reads re-runs the subscription, one it rules out does not", async () => {
@@ -1308,6 +1321,10 @@ describe("a query composes another by name (ctx.query)", () => {
     );
     await expect(vex.query("cq.badArgs")).rejects.toThrow(
       'query bp.count takes arg "scope": must be string',
+    );
+    // A caller holding a function rejects, as every refusal does.
+    expect(await vex.query("cq.asReach")).toStartWith(
+      'rejected: a caller holds a function (at "reach")',
     );
     seen.length = 0;
     await vex.query("cq.asSystem", {}, { user: alice });
