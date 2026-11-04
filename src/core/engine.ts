@@ -499,6 +499,7 @@ export class Vex<A = unknown> {
   // share (`invalidateAfter`).
   private pendingInvalidation: PendingInvalidation | null = null;
   private evaluation: EvaluationPool | null = null;
+  private announcingStorage: StorageAdapter | null = null;
   private callerKey: (user: VexUser | null | undefined) => string =
     defaultCallerKey;
   private subIdCounter = 0;
@@ -2372,10 +2373,15 @@ export class Vex<A = unknown> {
    * The storage, for code that keeps tables of its own on it: every
    * write through it is announced as `unsafeSql`'s are, a
    * transaction's once it commits, so no write can leave a
-   * subscription unaware of it.
+   * subscription unaware of it. Every call answers the same handle.
    */
   unsafeGetStorage(): StorageAdapter {
-    const storage = this.storage;
+    this.announcingStorage ??= this.announcing(this.storage);
+    return this.announcingStorage;
+  }
+
+  /** `storage`, with every write through it announced. */
+  private announcing(storage: StorageAdapter): StorageAdapter {
     const announced =
       <F extends (...args: any[]) => Promise<any>>(write: F) =>
       async (...args: Parameters<F>) => {

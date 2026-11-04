@@ -193,6 +193,11 @@ describe("every write the engine is handed is heard", () => {
     expect(seen).toEqual([0, 1, 2]);
   });
 
+  test("the storage handle is one handle: what a caller sets on it, the next caller sees", async () => {
+    const vex = await create();
+    expect(vex.unsafeGetStorage()).toBe(vex.unsafeGetStorage());
+  });
+
   test("a tracer writing its spans through the storage does not feed on itself", async () => {
     let spans = 0;
     const holder: { vex?: Vex } = {};
