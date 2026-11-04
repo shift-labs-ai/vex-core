@@ -1451,7 +1451,8 @@ describe("handler timeout", () => {
           api.registerQuery("hang", {
             args: {},
             async handler() {
-              await new Promise((r) => setTimeout(r, 500));
+              // Waits on what never comes: no timer of its own.
+              await new Promise(() => {});
               return "done";
             },
           });

@@ -170,7 +170,11 @@ export class EvaluationPool {
   }
 
   private spawn(): Member {
-    const worker = new Worker(this.script);
+    // A worker's engine is guarded as the main thread's: the guards
+    // load before anything else in it (`guards.ts`).
+    const worker = new Worker(this.script, {
+      preload: [new URL("../guard.js", import.meta.url).href],
+    } as WorkerOptions);
     let booted: (outcome: Error | null) => void = () => {};
     const member: Member = {
       worker,

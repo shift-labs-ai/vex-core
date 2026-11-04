@@ -11,6 +11,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
+import { outsideFrame } from "../src/core/guards.js";
 
 let open: Vex[] = [];
 /** Runs after the list query's read, before it answers. */
@@ -36,7 +37,9 @@ function plugin(api: VexPluginAPI) {
       const rows = await ctx.db.table("channels").order("name", "asc").all();
       const hook = afterRead;
       afterRead = null;
-      if (hook) await hook();
+      // The test's own write, landing mid-run: made as the engine's own
+      // work, since a handler calling the engine is refused.
+      if (hook) await outsideFrame(hook);
       return rows.map((r: any) => `${r.name}:${r.started}`);
     },
   });

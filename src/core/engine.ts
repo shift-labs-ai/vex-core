@@ -16,6 +16,14 @@ import {
   transferable,
   workersAvailable,
 } from "./evaluation.js";
+import {
+  assertGuarded,
+  type FrameKind,
+  inFrame,
+  installGuards,
+  outsideFrame,
+  refuseReentry,
+} from "./guards.js";
 import { holdStatement } from "./held-read.js";
 import { id as generateId } from "./id.js";
 import { INTERNAL_TABLES } from "./internal.js";
@@ -423,7 +431,7 @@ interface PendingInvalidation {
 const nextTurn: () => Promise<void> =
   typeof setImmediate === "function"
     ? () => new Promise((resolve) => setImmediate(resolve))
-    : () => new Promise((resolve) => setTimeout(resolve, 0));
+    : () => new Promise((resolve) => ambient.setTimeout(resolve, 0));
 
 interface JobRunResult {
   status: "ok" | "error";
@@ -580,6 +588,12 @@ export class Vex<A = unknown> {
   static async create<A = undefined>(
     options: VexOptions<NoInfer<A>>,
   ): Promise<Vex<NoInfer<A>>> {
+    // Where node's built-in modules are not the app's to import, the
+    // globals are all there is, and guarding them here holds.
+    if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
+      installGuards();
+    }
+    await assertGuarded();
     const vex = new Vex<A>(options.storage);
     if (options.tracer) vex.tracer = options.tracer;
     if (options.appId) vex.appId = options.appId;
@@ -706,12 +720,12 @@ export class Vex<A = unknown> {
   ) {
     if (this.jobScheduler !== "timers" || this.cronTimers.has(cronName)) return;
     const run = () => this.executeJob(cronName, job);
-    const first = setTimeout(
+    const first = ambient.setTimeout(
       () => {
-        this.cronTimers.set(cronName, setInterval(run, ms));
+        this.cronTimers.set(cronName, ambient.setInterval(run, ms));
         run();
       },
-      Math.max(0, firstRun - Date.now()),
+      Math.max(0, firstRun - ambient.now()),
     );
     this.cronTimers.set(cronName, first);
   }
@@ -755,7 +769,10 @@ export class Vex<A = unknown> {
     // A pending run survives a restart: the job runs when it was due, or
     // one interval from now if that is sooner.
     const nextRun = enabled
-      ? Math.min(existing?.nextRun ?? Number.POSITIVE_INFINITY, Date.now() + ms)
+      ? Math.min(
+          existing?.nextRun ?? Number.POSITIVE_INFINITY,
+          ambient.now() + ms,
+        )
       : null;
     const row = {
       plugin,
@@ -804,7 +821,7 @@ export class Vex<A = unknown> {
       if (!row) throw new Error(`Job not found in DB: ${name}`);
 
       if (enabled && ms > 0) {
-        const nextRun = Date.now() + ms;
+        const nextRun = ambient.now() + ms;
         await this.storage.update("_jobs", row._id, { enabled: 1, nextRun });
         if (this.isCurrentJob(name, handler)) {
           this.startJobTimer(name, handler, ms, nextRun);
@@ -845,7 +862,7 @@ export class Vex<A = unknown> {
     cronName: string,
     job: JobDef,
   ): Promise<JobRunResult> {
-    const startTime = Date.now();
+    const startTime = ambient.now();
     const timeoutMs = job.timeoutMs ?? 0;
     const maxRetries = job.retries ?? 0;
     const retryDelay = job.retryDelayMs ?? 1000;
@@ -889,7 +906,7 @@ export class Vex<A = unknown> {
         if (timeoutMs > 0) {
           let timer: ReturnType<typeof setTimeout> | undefined;
           const timeout = new Promise<never>((_, reject) => {
-            timer = setTimeout(
+            timer = ambient.setTimeout(
               () =>
                 reject(
                   new Error(`Job ${cronName} timed out after ${timeoutMs}ms`),
@@ -909,7 +926,7 @@ export class Vex<A = unknown> {
         const result: JobRunResult = {
           status: "ok",
           error: null,
-          durationMs: Date.now() - startTime,
+          durationMs: ambient.now() - startTime,
         };
         if (row) {
           await this.storage.update("_jobs", row._id, {
@@ -929,7 +946,7 @@ export class Vex<A = unknown> {
         lastResult = {
           status: "error",
           error: errMsg,
-          durationMs: Date.now() - startTime,
+          durationMs: ambient.now() - startTime,
         };
         if (row) {
           await this.storage.update("_jobs", row._id, {
@@ -945,7 +962,7 @@ export class Vex<A = unknown> {
 
         // A closed engine starts no further attempt.
         if (attempt < maxRetries && !this.closing) {
-          await new Promise((r) => setTimeout(r, retryDelay));
+          await new Promise((r) => ambient.setTimeout(r, retryDelay));
         }
         if (this.closing) break;
       }
@@ -973,7 +990,7 @@ export class Vex<A = unknown> {
    * into one.
    */
   async runDueJobs(
-    now = Date.now(),
+    now = ambient.now(),
   ): Promise<Array<JobRunResult & { name: string }>> {
     this.assertOpen();
     const results: Array<JobRunResult & { name: string }> = [];
@@ -1016,9 +1033,13 @@ export class Vex<A = unknown> {
     // Read at call time: middleware may have told the context more.
     const as = (): CallContext => ({ parent, user: ctx.user });
     const ctx: ActionContext = {
-      query: (name, args = {}) => this.query(name, args, as()),
-      mutate: (name, args = {}) => this.mutate(name, args, as()),
-      action: (name, args = {}) => this.action(name, args, { ...as(), signal }),
+      // Each call is the action's own, through its context.
+      query: (name, args = {}) =>
+        outsideFrame(() => this.query(name, args, as())),
+      mutate: (name, args = {}) =>
+        outsideFrame(() => this.mutate(name, args, as())),
+      action: (name, args = {}) =>
+        outsideFrame(() => this.action(name, args, { ...as(), signal })),
       runtime: this.runtime(),
       user: user ?? undefined,
       signal,
@@ -1537,7 +1558,7 @@ export class Vex<A = unknown> {
     return Promise.race([
       promise,
       new Promise<never>((_, reject) =>
-        setTimeout(
+        ambient.setTimeout(
           () =>
             reject(
               new Error(`Handler timed out after ${this.handlerTimeoutMs}ms`),
@@ -1559,8 +1580,11 @@ export class Vex<A = unknown> {
     handler: () => Promise<any> | any,
     ectx: ExecContext,
   ): Promise<any> {
+    // The middleware and the handler run in the handler's frame
+    // (`guards.ts`); a webhook writes as a mutation does.
+    const kind: FrameKind = info.type === "webhook" ? "mutation" : info.type;
     const run = () => {
-      const result = Promise.resolve(handler());
+      const result = Promise.resolve(inFrame(kind, info.name, handler));
       return info.type === "action" ? result : this.withTimeout(result);
     };
     if (this.middleware.length === 0) {
@@ -1569,8 +1593,10 @@ export class Vex<A = unknown> {
     return this.trace("middleware", info.name, ectx, (mwEctx) => {
       let i = 0;
       const chain = (): Promise<any> | any => {
-        if (i < this.middleware.length)
-          return this.middleware[i++](ctx, info, chain);
+        if (i < this.middleware.length) {
+          const middleware = this.middleware[i++]!;
+          return inFrame(kind, info.name, () => middleware(ctx, info, chain));
+        }
         return this.trace("handler", info.name, mwEctx, run);
       };
       return chain();
@@ -2129,7 +2155,7 @@ export class Vex<A = unknown> {
     this.clockTimer = null;
     this.clockAt = soonest;
     if (this.closing || soonest === Number.POSITIVE_INFINITY) return;
-    this.clockTimer = setTimeout(
+    this.clockTimer = ambient.setTimeout(
       () => void this.clockTick(),
       Math.max(0, soonest - ambient.now()),
     );
@@ -2206,6 +2232,7 @@ export class Vex<A = unknown> {
     given: Record<string, any> = {},
     callCtx?: ExecContext | CallContext,
   ): Promise<T> {
+    refuseReentry("vex.query");
     const { parent, user } = normalizeCallContext(callCtx);
     return this.trace("query", name, parent, async (ectx, meta) => {
       const reg = this.queries.get(name);
@@ -2242,6 +2269,7 @@ export class Vex<A = unknown> {
     given: Record<string, any> = {},
     callCtx?: ExecContext | CallContext,
   ): Promise<T> {
+    refuseReentry("vex.mutate");
     const { parent, user } = normalizeCallContext(callCtx);
     return this.trace("mutation", name, parent, async (ectx, meta) => {
       const reg = this.mutations.get(name);
@@ -2283,6 +2311,7 @@ export class Vex<A = unknown> {
     given: Record<string, any> = {},
     callCtx?: ExecContext | CallContext,
   ): Promise<T> {
+    refuseReentry("vex.action");
     const { parent, user, signal } = normalizeCallContext(callCtx);
     return this.trace("action", name, parent, async (ectx, meta) => {
       const reg = this.actions.get(name);
@@ -2308,6 +2337,7 @@ export class Vex<A = unknown> {
     callback: SubscriptionCallback,
     callCtx?: SubscribeContext,
   ): Promise<() => void> {
+    refuseReentry("vex.subscribe");
     this.assertOpen();
     const { user } = callCtx ? normalizeCallContext(callCtx) : {};
     const subId = `sub_${++this.subIdCounter}`;
