@@ -30,14 +30,14 @@ afterEach(async () => {
 function plugin(api: VexPluginAPI) {
   api.setName("ps");
   api.registerTable("notes", {
-    columns: { body: { type: "string" } },
+    columns: { body: Type.String() },
     published: true,
   });
   api.registerTable("keys", {
-    columns: { token: { type: "string", index: true } },
+    columns: { token: Type.String({ index: true }) },
   });
   api.registerTable("docs", {
-    columns: { ownerId: { type: "string" }, title: { type: "string" } },
+    columns: { ownerId: Type.String(), title: Type.String() },
     published: true,
     access: {
       prepare: (user) => (!user || user.isAdmin ? UNRESTRICTED : user.id),
@@ -94,14 +94,14 @@ describe("publishedSql", () => {
       {
         name: "docs",
         columns: {
-          _id: { type: "string" },
-          ownerId: { type: "string" },
-          title: { type: "string" },
+          _id: Type.String(),
+          ownerId: Type.String(),
+          title: Type.String(),
         },
       },
       {
         name: "notes",
-        columns: { _id: { type: "string" }, body: { type: "string" } },
+        columns: { _id: Type.String(), body: Type.String() },
       },
     ]);
   });

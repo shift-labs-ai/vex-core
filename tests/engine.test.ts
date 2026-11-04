@@ -15,9 +15,9 @@ function kvPlugin(api: VexPluginAPI) {
   api.setName("kv");
   api.registerTable("kv", {
     columns: {
-      scope: { type: "string", index: true },
-      key: { type: "string" },
-      value: { type: "json" },
+      scope: Type.String({ index: true }),
+      key: Type.String(),
+      value: Type.Unknown(),
     },
     unique: [["scope", "key"]],
   });
@@ -171,7 +171,7 @@ describe("subscriptions", () => {
         (api: VexPluginAPI) => {
           api.setName("secure");
           api.registerTable("events", {
-            columns: { value: { type: "string" } },
+            columns: { value: Type.String() },
           });
           api.registerQuery("viewer", {
             args: {},
@@ -219,9 +219,9 @@ describe("mutation context chaining", () => {
           api.setName("t");
           api.registerTable("items", {
             columns: {
-              category: { type: "string" },
-              status: { type: "string" },
-              name: { type: "string" },
+              category: Type.String(),
+              status: Type.String(),
+              name: Type.String(),
             },
           });
           api.registerMutation("add", {
@@ -299,8 +299,8 @@ describe("custom plugin", () => {
           api.setName("todo");
           api.registerTable("todos", {
             columns: {
-              text: { type: "string" },
-              done: { type: "boolean" },
+              text: Type.String(),
+              done: Type.Boolean(),
             },
           });
           api.registerMutation("add", {
@@ -340,7 +340,7 @@ describe("webhooks", () => {
         (api: VexPluginAPI) => {
           api.setName("billing");
           api.registerTable("payments", {
-            columns: { amount: { type: "number" }, status: { type: "string" } },
+            columns: { amount: Type.Number(), status: Type.String() },
           });
           api.registerMutation("paid", {
             args: { amount: Type.Number() },
@@ -581,7 +581,7 @@ describe("middleware", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("test");
-          api.registerTable("items", { columns: { name: { type: "string" } } });
+          api.registerTable("items", { columns: { name: Type.String() } });
           api.registerQuery("list", {
             args: {},
             handler: async (ctx) => ctx.db.table("items").all(),
@@ -609,7 +609,7 @@ describe("middleware", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("test");
-          api.registerTable("items", { columns: { name: { type: "string" } } });
+          api.registerTable("items", { columns: { name: Type.String() } });
           api.registerMutation("add", {
             args: { name: Type.String() },
             handler: async (ctx, args) =>
@@ -640,7 +640,7 @@ describe("plugin name collisions", () => {
           (api: VexPluginAPI) => {
             api.setName("items");
             api.registerTable("items", {
-              columns: { name: { type: "string" } },
+              columns: { name: Type.String() },
             });
             api.registerQuery("list", {
               args: {},
@@ -667,7 +667,7 @@ describe("plugin name collisions", () => {
           (api: VexPluginAPI) => {
             api.setName("items");
             api.registerTable("items", {
-              columns: { name: { type: "string" } },
+              columns: { name: Type.String() },
             });
             api.registerMutation("add", {
               args: { name: Type.String() },
@@ -696,13 +696,13 @@ describe("plugin name collisions", () => {
           (api: VexPluginAPI) => {
             api.setName("a");
             api.registerTable("runs", {
-              columns: { name: { type: "string" } },
+              columns: { name: Type.String() },
             });
           },
           (api: VexPluginAPI) => {
             api.setName("b");
             api.registerTable("runs", {
-              columns: { other: { type: "string" } },
+              columns: { other: Type.String() },
             });
           },
         ],
@@ -718,7 +718,7 @@ describe("plugin name collisions", () => {
         api.setName(name);
         api.registerTable(table, {
           renamedFrom,
-          columns: { name: { type: "string" } },
+          columns: { name: Type.String() },
         });
       };
     const create = (...plugins: Array<(api: VexPluginAPI) => void>) =>
@@ -765,7 +765,7 @@ describe("plugin name collisions", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("users");
-          api.registerTable("users", { columns: { name: { type: "string" } } });
+          api.registerTable("users", { columns: { name: Type.String() } });
           api.registerQuery("list", {
             args: {},
             handler: async (ctx) => ctx.db.table("users").all(),
@@ -774,7 +774,7 @@ describe("plugin name collisions", () => {
         (api: VexPluginAPI) => {
           api.setName("posts");
           api.registerTable("posts", {
-            columns: { title: { type: "string" } },
+            columns: { title: Type.String() },
           });
           api.registerQuery("list", {
             args: {},
@@ -1034,7 +1034,7 @@ describe("jobs", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("shutdown");
-          api.registerTable("marks", { columns: { at: { type: "number" } } });
+          api.registerTable("marks", { columns: { at: Type.Number() } });
           api.registerQuery("count", {
             args: {},
             handler: (ctx) => ctx.db.table("marks").count(),
@@ -1220,8 +1220,8 @@ describe("trace metadata", () => {
           api.setName("safe");
           api.registerTable("documents", {
             columns: {
-              workspaceId: { type: "string" },
-              content: { type: "string" },
+              workspaceId: Type.String(),
+              content: Type.String(),
             },
           });
           api.registerQuery("read", {
@@ -1417,7 +1417,7 @@ describe("trace metadata", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("echo");
-          api.registerTable("items", { columns: { text: { type: "string" } } });
+          api.registerTable("items", { columns: { text: Type.String() } });
           api.registerQuery("get", {
             args: { text: Type.String(), token: Type.String() },
             handler: async (_ctx, args) => args.text.length,
@@ -1518,7 +1518,7 @@ describe("writes by row id", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("del");
-          api.registerTable("rows", { columns: { name: { type: "string" } } });
+          api.registerTable("rows", { columns: { name: Type.String() } });
           api.registerMutation("deleteRead", {
             args: { name: Type.String() },
             async handler(ctx, args) {

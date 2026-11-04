@@ -1,4 +1,4 @@
-import type { QueryBuilder, TableSchema } from "./types.js";
+import type { QueryBuilder, StoredTableSchema } from "./types.js";
 
 /**
  * A table name that stands for any table: a raw read that reads no table
@@ -33,7 +33,7 @@ export type ReadOnlyRead =
 
 export interface StorageAdapter {
   readonly name: string;
-  ensureTable(name: string, schema: TableSchema): Promise<void> | void;
+  ensureTable(name: string, schema: StoredTableSchema): Promise<void> | void;
   insert(table: string, row: Record<string, any>): Promise<string>;
   /**
    * Updates the row matching `keys` with `data`, or inserts both; a
@@ -83,6 +83,6 @@ export interface StorageAdapter {
    * engine lists them for each raw read that holds a table.
    */
   viewNames?(): string[] | Promise<string[]>;
-  getSchema(table: string): TableSchema | null;
+  getSchema(table: string): StoredTableSchema | null;
   close(): Promise<void> | void;
 }

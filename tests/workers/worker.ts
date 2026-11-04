@@ -12,7 +12,7 @@ export class TestStore extends DurableObject {}
 function counterPlugin(api: VexPluginAPI) {
   api.setName("counter");
   api.registerTable("counters", {
-    columns: { key: { type: "string" }, value: { type: "number" } },
+    columns: { key: Type.String(), value: Type.Number() },
   });
   api.registerMutation("set", {
     args: { key: Type.String(), value: Type.Number() },
@@ -44,7 +44,7 @@ export class App extends DurableObject {
 
 function tickerPlugin(api: VexPluginAPI) {
   api.setName("ticker");
-  api.registerTable("ticks", { columns: { at: { type: "number" } } });
+  api.registerTable("ticks", { columns: { at: Type.Number() } });
   api.registerMutation("record", {
     args: {},
     handler: (ctx) => ctx.db.table("ticks").insert({ at: ctx.now() }),

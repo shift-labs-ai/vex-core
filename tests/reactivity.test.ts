@@ -29,14 +29,14 @@ function reactivityPlugin(api: VexPluginAPI) {
   api.setName("rx");
   api.registerTable("items", {
     columns: {
-      scope: { type: "string", index: true },
-      kind: { type: "string", index: true },
-      name: { type: "string" },
-      score: { type: "number", optional: true },
-      body: { type: "json", optional: true },
+      scope: Type.String({ index: true }),
+      kind: Type.String({ index: true }),
+      name: Type.String(),
+      score: Type.Optional(Type.Number()),
+      body: Type.Optional(Type.Unknown()),
     },
   });
-  api.registerTable("audit", { columns: { value: { type: "string" } } });
+  api.registerTable("audit", { columns: { value: Type.String() } });
   api.registerQuery("list", {
     args: { scope: Type.String() },
     async handler(ctx, args) {

@@ -18,7 +18,7 @@ type Access = { permission: string } | "system";
 
 function notesPlugin(api: VexPluginAPI<Access>) {
   api.setName("notes");
-  api.registerTable("notes", { columns: { text: { type: "string" } } });
+  api.registerTable("notes", { columns: { text: Type.String() } });
   api.registerQuery("list", {
     args: {},
     access: { permission: "notes.read" },

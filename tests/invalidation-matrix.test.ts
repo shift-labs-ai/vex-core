@@ -409,8 +409,9 @@ const WRITES: Record<string, Write> = {
     await ctx.db.table("t").update(ids.A1, { kind: "k4" });
   },
   "read only (no write)": (ctx) => ctx.db.table("t").count(),
-  "update A1 n -> '5' (text twin)": (ctx, ids) =>
-    ctx.db.table("t").update(ids.A1, { n: "5" }),
+  // A text twin in a number column: only raw SQL can write one.
+  "raw update A1 n -> '5' (text twin)": (ctx, ids) =>
+    ctx.db.sql("UPDATE t SET n = '5' WHERE _id = ?", ids.A1),
   "update missing id": (ctx) => ctx.db.table("t").update("nope", { kind: "x" }),
   "delete missing id": (ctx) => ctx.db.table("t").delete("nope"),
   "upsert keys{scope a,kind k} data{kind q} (key changes)": (ctx) =>
@@ -463,16 +464,16 @@ function matrixPlugin(api: VexPluginAPI) {
   api.setName("m");
   api.registerTable("t", {
     columns: {
-      scope: { type: "string", index: true },
-      kind: { type: "string", index: true },
-      name: { type: "string" },
-      n: { type: "number", optional: true },
-      flag: { type: "boolean", optional: true },
+      scope: Type.String({ index: true }),
+      kind: Type.String({ index: true }),
+      name: Type.String(),
+      n: Type.Optional(Type.Number()),
+      flag: Type.Optional(Type.Boolean()),
     },
   });
-  api.registerTable("u", { columns: { name: { type: "string" } } });
+  api.registerTable("u", { columns: { name: Type.String() } });
   api.registerTable("g", {
-    columns: { title: { type: "string" } },
+    columns: { title: Type.String() },
     access: {
       async prepare(user, db) {
         if (!user) return UNRESTRICTED;
@@ -491,8 +492,8 @@ function matrixPlugin(api: VexPluginAPI) {
   });
   api.registerTable("grants", {
     columns: {
-      userId: { type: "string", index: true },
-      itemId: { type: "string", index: true },
+      userId: Type.String({ index: true }),
+      itemId: Type.String({ index: true }),
     },
   });
   api.registerQuery("q", {

@@ -45,25 +45,25 @@ export function scalingPlugin(api: VexPluginAPI) {
   api.setName("sc");
   api.registerTable("items", {
     columns: {
-      scope: { type: "string", index: true },
-      n: { type: "number" },
-      version: { type: "number" },
+      scope: Type.String({ index: true }),
+      n: Type.Number(),
+      version: Type.Number(),
     },
   });
   api.registerTable("governed", {
-    columns: { title: { type: "string" }, version: { type: "number" } },
+    columns: { title: Type.String(), version: Type.Number() },
     access: governedAccess,
   });
   api.registerTable("grants", {
     columns: {
-      userId: { type: "string", index: true },
-      itemId: { type: "string", index: true },
+      userId: Type.String({ index: true }),
+      itemId: Type.String({ index: true }),
     },
   });
   api.registerTable("knobs", {
     columns: {
-      key: { type: "string", index: true },
-      value: { type: "number" },
+      key: Type.String({ index: true }),
+      value: Type.Number(),
     },
     unique: [["key"]],
   });

@@ -7,7 +7,7 @@ import {
   statementKind,
 } from "../core/sql-text.js";
 import type { StorageAdapter } from "../core/storage.js";
-import type { TableSchema } from "../core/types.js";
+import type { StoredTableSchema } from "../core/types.js";
 import { createQueryBuilder, type DbExec } from "./shared.js";
 import {
   bulkInsertRows,
@@ -616,7 +616,7 @@ export function sqliteAdapter(
   return {
     name: "sqlite",
 
-    ensureTable(name: string, schema: TableSchema) {
+    ensureTable(name: string, schema: StoredTableSchema) {
       if (readonly) {
         if (existingTableName(migrationDriver, name) === undefined) {
           throw new Error(

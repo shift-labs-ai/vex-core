@@ -85,19 +85,19 @@ function versionOf(rows: unknown): number | null {
 export function equivalencePlugin(api: VexPluginAPI) {
   api.setName("eq");
   const columns = {
-    s: { type: "string" as const, optional: true, index: true },
-    n: { type: "number" as const, optional: true },
-    b: { type: "boolean" as const, optional: true },
-    j: { type: "json" as const, optional: true },
-    k: { type: "string" as const, index: true },
-    version: { type: "number" as const },
+    s: Type.Optional(Type.String({ index: true })),
+    n: Type.Optional(Type.Number()),
+    b: Type.Optional(Type.Boolean()),
+    j: Type.Optional(Type.Unknown()),
+    k: Type.String({ index: true }),
+    version: Type.Number(),
   };
   api.registerTable("t", { columns });
   api.registerTable("g", { columns, access: governed });
   api.registerTable("grants", {
     columns: {
-      userId: { type: "string", index: true },
-      itemId: { type: "string", index: true },
+      userId: Type.String({ index: true }),
+      itemId: Type.String({ index: true }),
     },
   });
 
@@ -212,13 +212,24 @@ export function equivalencePlugin(api: VexPluginAPI) {
       return q.delete();
     },
   });
+  // Raw SQL may leave a value's affinity twin in a column (`"5"` in a
+  // number column): what no schema-checked write can.
   api.registerMutation("rawInsert", {
-    args: { table: Type.String(), k: Type.String() },
+    args: {
+      table: Type.String(),
+      k: Type.String(),
+      s: Type.Unknown(),
+      n: Type.Unknown(),
+      b: Type.Unknown(),
+    },
     handler: (ctx, args) =>
       ctx.db.sql(
-        `INSERT INTO ${quoteIdent(args.table)} (_id, k, version) VALUES (?, ?, ?)`,
+        `INSERT INTO ${quoteIdent(args.table)} (_id, k, s, n, b, version) VALUES (?, ?, ?, ?, ?, ?)`,
         `raw${next()}`,
         args.k,
+        args.s,
+        args.n,
+        args.b,
         version,
       ),
   });

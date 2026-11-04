@@ -27,7 +27,7 @@ let failNext = false;
 
 function plugin(api: VexPluginAPI) {
   api.setName("sch");
-  api.registerTable("notes", { columns: { text: { type: "string" } } });
+  api.registerTable("notes", { columns: { text: Type.String() } });
   api.registerMutation("note", {
     args: { text: Type.String(), delayMs: Type.Number(), fail: Type.Boolean() },
     async handler(ctx, args) {

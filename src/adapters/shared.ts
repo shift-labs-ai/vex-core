@@ -6,7 +6,7 @@ import type {
   Filter,
   GroupByBuilder,
   QueryBuilder,
-  TableSchema,
+  StoredTableSchema,
 } from "../core/types.js";
 
 export { buildWhereClause, quoteIdent } from "../core/sql-where.js";
@@ -20,14 +20,14 @@ interface RowTransform {
 // boolean columns need per-row work, and most tables have none. ensureTable
 // registers a fresh schema object on every (re)registration, so migrations
 // invalidate naturally and the WeakMap cannot outlive the schemas it keys.
-const rowTransformPlans = new WeakMap<TableSchema, RowTransform[]>();
+const rowTransformPlans = new WeakMap<StoredTableSchema, RowTransform[]>();
 
-function rowTransforms(schema: TableSchema): RowTransform[] {
+function rowTransforms(schema: StoredTableSchema): RowTransform[] {
   let plan = rowTransformPlans.get(schema);
   if (!plan) {
     plan = [];
     for (const [column, def] of Object.entries(schema.columns)) {
-      if (def.type === "json" || def.type === "any") {
+      if (def.type === "json") {
         plan.push({ column, kind: "json" });
       } else if (def.type === "boolean") {
         plan.push({ column, kind: "boolean" });
@@ -40,7 +40,7 @@ function rowTransforms(schema: TableSchema): RowTransform[] {
 
 export function deserializeRow(
   row: Record<string, any>,
-  schema: TableSchema | undefined,
+  schema: StoredTableSchema | undefined,
 ): Record<string, any> {
   if (!schema) return row;
   for (const { column, kind } of rowTransforms(schema)) {
@@ -62,7 +62,7 @@ export interface DbExec {
   all(sql: string, params: any[]): Promise<any[]>;
   /** A write; the adapter records which tables it changed. */
   run(sql: string, params: any[]): Promise<{ changes: number }>;
-  schemas: Map<string, TableSchema>;
+  schemas: Map<string, StoredTableSchema>;
 }
 
 export function createQueryBuilder(exec: DbExec, table: string): QueryBuilder {

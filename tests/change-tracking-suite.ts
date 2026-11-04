@@ -16,16 +16,19 @@ import { UNRESTRICTED } from "../src/core/access.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { ANY_TABLE, type StorageAdapter } from "../src/core/storage.js";
+import { storedTable } from "../src/core/tables.js";
 import { rawSql } from "../src/internal.js";
 import { Type } from "../src/portable.js";
 
 type CreateStorage = () => Promise<StorageAdapter> | StorageAdapter;
 
 const columns = {
-  scope: { type: "string" as const, index: true },
-  name: { type: "string" as const },
-  n: { type: "number" as const, optional: true },
+  scope: Type.String({ index: true }),
+  name: Type.String(),
+  n: Type.Optional(Type.Number()),
 };
+// As storage keeps them: what an adapter is handed directly.
+const stored = storedTable("items", { columns }).columns;
 
 /** Runs `write` and answers the tables the adapter reports it changed. */
 async function changedBy(
@@ -41,7 +44,8 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
   describe(`${name}: change tracking`, () => {
     async function adapterWith(...tables: string[]) {
       const adapter = await create();
-      for (const table of tables) await adapter.ensureTable(table, { columns });
+      for (const table of tables)
+        await adapter.ensureTable(table, { columns: stored });
       return adapter;
     }
 
@@ -240,7 +244,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
         "INSERT INTO old_items (_id, scope, name) VALUES ('0', 's', 'x')",
       );
       await adapter.ensureTable("items", {
-        columns,
+        columns: stored,
         renamedFrom: ["old_items"],
       });
       expect(
@@ -316,9 +320,9 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
       function plugin(api: VexPluginAPI) {
         api.setName("ct");
         api.registerTable("items", { columns });
-        api.registerTable("other", { columns: { v: { type: "string" } } });
+        api.registerTable("other", { columns: { v: Type.String() } });
         api.registerTable("secrets", {
-          columns: { v: { type: "string", index: true } },
+          columns: { v: Type.String({ index: true }) },
           access: { prepare: () => UNRESTRICTED, row: () => true },
         });
         api.registerQuery("scope", {

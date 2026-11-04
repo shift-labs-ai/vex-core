@@ -34,7 +34,9 @@ beforeAll(async () => {
     plugins: [
       {
         name: "items",
-        tables: { items: { columns: { name: "string", value: "number" } } },
+        tables: {
+          items: { columns: { name: Type.String(), value: Type.Number() } },
+        },
         queries: {
           list: {
             args: {},
@@ -956,7 +958,7 @@ describe("WebSocket subscription end", () => {
       plugins: [
         {
           name: "b",
-          tables: { rows: { columns: { v: "number" } } },
+          tables: { rows: { columns: { v: Type.Number() } } },
           queries: {
             small: {
               args: {},

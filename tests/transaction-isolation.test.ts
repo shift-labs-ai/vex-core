@@ -39,7 +39,7 @@ function peerValues(): string[] {
 
 function registerRows(api: VexPluginAPI) {
   api.registerTable("rows", {
-    columns: { v: { type: "string", index: true } },
+    columns: { v: Type.String({ index: true }) },
   });
 }
 

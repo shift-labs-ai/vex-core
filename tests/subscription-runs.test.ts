@@ -29,7 +29,7 @@ afterEach(async () => {
 function plugin(api: VexPluginAPI) {
   api.setName("ch");
   api.registerTable("channels", {
-    columns: { name: { type: "string" }, started: { type: "boolean" } },
+    columns: { name: Type.String(), started: Type.Boolean() },
   });
   api.registerQuery("list", {
     args: {},
@@ -99,7 +99,7 @@ describe("subscriptions see writes landing during a run (SHFT-2545)", () => {
         plugin,
         (api: VexPluginAPI) => {
           api.setName("other");
-          api.registerTable("notes", { columns: { text: { type: "string" } } });
+          api.registerTable("notes", { columns: { text: Type.String() } });
           api.registerMutation("add", {
             args: { text: Type.String() },
             handler: (ctx, args) => ctx.db.table("notes").insert(args),

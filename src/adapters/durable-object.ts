@@ -33,7 +33,7 @@ import {
   statementKind,
 } from "../core/sql-text.js";
 import type { StorageAdapter } from "../core/storage.js";
-import type { TableSchema } from "../core/types.js";
+import type { StoredTableSchema } from "../core/types.js";
 import { createQueryBuilder, type DbExec } from "./shared.js";
 import {
   bulkInsertRows,
@@ -189,7 +189,7 @@ export function durableObjectAdapter(
   return {
     name: "durable-object",
 
-    ensureTable(name: string, schema: TableSchema) {
+    ensureTable(name: string, schema: StoredTableSchema) {
       open();
       state.registerSchema(
         name,

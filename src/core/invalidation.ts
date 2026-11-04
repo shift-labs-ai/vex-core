@@ -169,7 +169,6 @@ function affinityOf(type: ColumnType | undefined): Affinity {
       return "numeric";
     case "string":
     case "json":
-    case "any":
       return "text";
     default:
       return "unknown";

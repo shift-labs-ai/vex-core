@@ -23,7 +23,7 @@ const vex = await Vex.create({
     (api) => {
       api.setName("counter");
       api.registerTable("counters", {
-        columns: { key: { type: "string" }, value: { type: "number" } },
+        columns: { key: Type.String(), value: Type.Number() },
       });
       api.registerMutation("set", {
         args: { key: Type.String(), value: Type.Number() },
@@ -46,6 +46,21 @@ await vex.query("counter.list");
 
 const unsub = await vex.subscribe("counter.list", {}, (rows) => {
   console.log("changed:", rows);
+});
+```
+
+## Tables
+
+A table declares each column as a TypeBox schema: what the column holds (`Type.Optional` lets it hold nothing, `default` fills an insert that omits it), and what the table does with it (`index`, `renamedFrom`). Every write passes the columns: an insert gives each required column, an update any of them, each of its type, no undeclared one, and JSON columns hold plain data. Storage keeps each column as its SQLite type (strings as TEXT, numbers as REAL, booleans as 0 or 1, anything else as JSON text).
+
+```ts
+api.registerTable("cards", {
+  columns: {
+    title: Type.String({ index: true }),
+    votes: Type.Number({ default: 0 }),
+    note: Type.Optional(Type.String()),
+    meta: Type.Optional(Type.Object({ tags: Type.Array(Type.String()) })),
+  },
 });
 ```
 
@@ -145,12 +160,12 @@ A run with nothing to do reads only row counts, and SQLite limits how many rows 
 api.registerTable("tasks", {
   renamedFrom: ["todos"],
   columns: {
-    title: { type: "string", renamedFrom: ["text"] },
+    title: Type.String({ renamedFrom: ["text"] }),
     done: { type: "boolean" },
   },
 });
 
-// File-based: table({ title: "string" }, { renamedFrom: ["chat_todos"] })
+// File-based: table({ title: Type.String() }, { renamedFrom: ["chat_todos"] })
 ```
 
 - A previous name that exists, where the current one does not, is renamed in place with its data and indexes.
@@ -338,7 +353,7 @@ A table can declare who sees its rows. Every query-context read of it (queries, 
 
 ```ts
 api.registerTable("docs", {
-  columns: { ownerId: { type: "string", index: true }, title: { type: "string" } },
+  columns: { ownerId: Type.String({ index: true }), title: Type.String() },
   access: {
     // Once per operation: UNRESTRICTED, or what `row` decides by.
     async prepare(user, db) {
@@ -369,7 +384,7 @@ Flat files, no config. Use `scanDirectory` to turn a folder into plugins.
 ```ts
 // schema.ts
 import { table } from "vex-core/framework";
-export const todos = table({ text: "string", done: "boolean" });
+export const todos = table({ text: Type.String(), done: Type.Boolean() });
 
 // todos.ts
 import { action, query, mutation } from "vex-core/framework";

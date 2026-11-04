@@ -26,7 +26,7 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
 import type { VexUser } from "../src/core/types.js";
-import { rawBulkInsert } from "../src/internal.js";
+import { rawBulkInsert, rawSql } from "../src/internal.js";
 import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
@@ -74,19 +74,19 @@ function plugin(api: VexPluginAPI) {
   api.setName("s");
   api.registerTable("sessions", {
     columns: {
-      title: { type: "string" },
-      platform: { type: "string", index: true },
-      n: { type: "number", optional: true },
+      title: Type.String(),
+      platform: Type.String({ index: true }),
+      n: Type.Optional(Type.Number()),
     },
   });
   api.registerTable("grants", {
     columns: {
-      userId: { type: "string", index: true },
-      sessionId: { type: "string", index: true },
+      userId: Type.String({ index: true }),
+      sessionId: Type.String({ index: true }),
     },
   });
   api.registerTable("governed", {
-    columns: { title: { type: "string" } },
+    columns: { title: Type.String() },
     access: bySessionGrant,
   });
 
@@ -643,31 +643,34 @@ describe("invalidation narrowing (SHFT-2537)", () => {
     expect(pass().judged).toBe(3);
   });
 
-  test("an update writing a value's affinity twin changes nothing", async () => {
+  test("an update writing the value a stored affinity twin already is changes nothing", async () => {
     const vex = await create();
     const id = await vex.mutate("s.open", {
       title: "a",
       platform: "web",
       n: 5,
     });
+    // Raw SQL can leave `"5"` in the number column; no schema-checked
+    // write can.
+    await rawSql(vex, "UPDATE sessions SET n = '5' WHERE _id = ?", id);
     await watch(vex, "all");
     const all = ran("all");
-    // `"5"` in a number column is 5: the row is as it was.
-    await vex.mutate("s.touch", { table: "sessions", id, data: { n: "5" } });
+    // 5 over `"5"`: to SQLite the row is as it was.
+    await vex.mutate("s.touch", { table: "sessions", id, data: { n: 5 } });
     expect(ran("all")).toBe(all);
-    await vex.mutate("s.touch", { table: "sessions", id, data: { n: "5.5" } });
+    await vex.mutate("s.touch", { table: "sessions", id, data: { n: 5.5 } });
     expect(ran("all")).toBe(all + 1);
   });
 
-  test("SQL affinity, not ===, decides a miss: NULL spellings and numeric text", async () => {
+  test("NULL never matches a comparison, and a matching value re-runs", async () => {
     const vex = await create();
     await watch(vex, "small"); // n < 10
     const small = ran("small");
     // `n: null` is NULL: `n < 10` never matches NULL, skipped.
     await vex.mutate("s.open", { title: "x", platform: "web", n: null });
     expect(ran("small")).toBe(small);
-    // `"5"` in a REAL column is 5: it matches, re-run.
-    await vex.mutate("s.open", { title: "y", platform: "web", n: "5" });
+    // 5 matches `n < 10`: re-run.
+    await vex.mutate("s.open", { title: "y", platform: "web", n: 5 });
     expect(ran("small")).toBe(small + 1);
   });
 

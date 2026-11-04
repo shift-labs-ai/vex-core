@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import { Vex } from "../src/core/engine.js";
+import { storedTable } from "../src/core/tables.js";
 import {
   action,
   isAction,
@@ -26,7 +27,7 @@ import { Type } from "../src/portable.js";
 
 describe("define", () => {
   test("table() returns tagged table schema", () => {
-    const t = table({ name: "string", age: "number" });
+    const t = table({ name: Type.String(), age: Type.Number() });
     expect(isTable(t)).toBe(true);
     expect(t.columns.name.type).toBe("string");
     expect(t.columns.age.type).toBe("number");
@@ -34,8 +35,8 @@ describe("define", () => {
   });
 
   test("table() with column options", () => {
-    const t = table({ email: { type: "string", index: true, optional: true } });
-    expect(t.columns.email).toEqual({
+    const t = table({ email: Type.Optional(Type.String({ index: true })) });
+    expect(storedTable("t", t).columns.email).toEqual({
       type: "string",
       index: true,
       optional: true,
@@ -44,7 +45,7 @@ describe("define", () => {
 
   test("table() takes table options and every column option", () => {
     const t = table(
-      { title: { type: "string", default: "", renamedFrom: ["text"] } },
+      { title: Type.String({ default: "", renamedFrom: ["text"] }) },
       { renamedFrom: ["chat_msgs"], unique: [["title"]] },
     );
     expect(t.renamedFrom).toEqual(["chat_msgs"]);
@@ -146,9 +147,9 @@ describe("scanner", () => {
   test("scans schema.ts for tables", async () => {
     writeFile(
       "schema.ts",
-      `import { table } from "@vex/define";
-       export const users = table({ name: "string" });
-       export const posts = table({ title: "string" });`,
+      `import { table, Type } from "@vex/define";
+       export const users = table({ name: Type.String() });
+       export const posts = table({ title: Type.String() });`,
     );
     const result = await scanDirectory(TMP);
     expect(result.tableCount).toBe(2);
@@ -176,7 +177,7 @@ describe("scanner", () => {
   test("subdirectories become dot-namespaced plugins", async () => {
     writeFile(
       "api/users.ts",
-      `import { query } from "@vex/define";
+      `import { query, Type } from "@vex/define";
        export const list = query({}, async () => []);`,
     );
     const result = await scanDirectory(TMP);
@@ -188,7 +189,7 @@ describe("scanner", () => {
   test("deeply nested files", async () => {
     writeFile(
       "api/v2/admin/stats.ts",
-      `import { query } from "@vex/define";
+      `import { query, Type } from "@vex/define";
        export const count = query({}, async () => 42);`,
     );
     const result = await scanDirectory(TMP);
@@ -199,17 +200,17 @@ describe("scanner", () => {
   test("middleware.ts applies globally to first plugin with handlers", async () => {
     writeFile(
       "schema.ts",
-      `import { table } from "@vex/define";
-       export const items = table({ name: "string" });`,
+      `import { table, Type } from "@vex/define";
+       export const items = table({ name: Type.String() });`,
     );
     writeFile(
       "middleware.ts",
-      `import { middleware } from "@vex/define";
+      `import { middleware, Type } from "@vex/define";
        export const auth = middleware(async (ctx, info, next) => next());`,
     );
     writeFile(
       "items.ts",
-      `import { query } from "@vex/define";
+      `import { query, Type } from "@vex/define";
        export const list = query({}, async () => []);`,
     );
     const result = await scanDirectory(TMP);
@@ -225,7 +226,7 @@ describe("scanner", () => {
     writeFile(
       "notes.ts",
       `import { action, mutation, query, table, Type } from "@vex/define";
-       export const items = table({ text: "string" });
+       export const items = table({ text: Type.String() });
        export const add = mutation({ text: Type.String() }, (ctx, args) =>
          ctx.db.table("notes_items").insert({ text: args.text }));
        export const count = query({}, (ctx) => ctx.db.table("notes_items").count());
@@ -254,12 +255,12 @@ describe("scanner", () => {
   test("middleware reaches an app of actions alone", async () => {
     writeFile(
       "middleware.ts",
-      `import { middleware } from "@vex/define";
+      `import { middleware, Type } from "@vex/define";
        export const auth = middleware(async (ctx, info, next) => next());`,
     );
     writeFile(
       "jobs.ts",
-      `import { action } from "@vex/define";
+      `import { action, Type } from "@vex/define";
        export const run = action({}, async () => "ran");`,
     );
     const result = await scanDirectory(TMP);
@@ -270,12 +271,12 @@ describe("scanner", () => {
   test("skips .test.ts files", async () => {
     writeFile(
       "todos.ts",
-      `import { query } from "@vex/define";
+      `import { query, Type } from "@vex/define";
        export const list = query({}, async () => []);`,
     );
     writeFile(
       "todos.test.ts",
-      `import { query } from "@vex/define";
+      `import { query, Type } from "@vex/define";
        export const shouldNotAppear = query({}, async () => []);`,
     );
     const result = await scanDirectory(TMP);
@@ -300,7 +301,7 @@ describe("scanner", () => {
   test("webhooks and jobs get scanned", async () => {
     writeFile(
       "hooks.ts",
-      `import { webhook, job } from "@vex/define";
+      `import { webhook, job, Type } from "@vex/define";
        export const stripe = webhook("/stripe", async () => ({ status: 200 }));
        export const cleanup = job("0 * * * *", async () => {});`,
     );
@@ -315,8 +316,8 @@ describe("scanner", () => {
   test("tables in non-schema files get prefixed with plugin name", async () => {
     writeFile(
       "chat.ts",
-      `import { table, query } from "@vex/define";
-       export const messages = table({ text: "string" });
+      `import { table, query, Type } from "@vex/define";
+       export const messages = table({ text: Type.String() });
        export const list = query({}, async () => []);`,
     );
     const result = await scanDirectory(TMP);
@@ -327,10 +328,10 @@ describe("scanner", () => {
   test("definitions keep every option except the definition tag", async () => {
     writeFile(
       "chat.ts",
-      `import { query, table } from "@vex/define";
+      `import { query, table, Type } from "@vex/define";
        const access = { prepare: () => null, filter: () => true };
        export const messages = table(
-         { text: { type: "string", renamedFrom: ["body"] } },
+         { text: Type.String({ renamedFrom: ["body"] }) },
          { renamedFrom: ["chat_msgs"], unique: [["text"]], access },
        );
        export const exportAll = { ...query({}, async () => []), reactive: false };`,

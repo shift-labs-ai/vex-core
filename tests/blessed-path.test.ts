@@ -37,8 +37,8 @@ function plugin(api: VexPluginAPI) {
   api.setName("bp");
   api.registerTable("items", {
     columns: {
-      scope: { type: "string", index: true },
-      n: { type: "number" },
+      scope: Type.String({ index: true }),
+      n: Type.Number(),
     },
   });
   // What a caller sees depends on its fence, not only its id.
@@ -971,4 +971,86 @@ test("an action's call may name its caller, as the app decides", async () => {
   });
   await vex.action("as.run", {}, { user: alice });
   expect(seen).toEqual(["alice", "system"]);
+});
+
+describe("a table's columns are schemas, and every write passes them", () => {
+  const rows = (api: VexPluginAPI) => {
+    api.setName("rows");
+    api.registerTable("cards", {
+      columns: {
+        title: Type.String(),
+        votes: Type.Number({ default: 0 }),
+        note: Type.Optional(Type.String()),
+        meta: Type.Optional(Type.Object({ tags: Type.Array(Type.String()) })),
+      },
+    });
+    api.registerMutation("insert", {
+      args: { row: Type.Unknown() },
+      handler: (ctx, args) =>
+        ctx.db.table("cards").insert(args.row as Record<string, unknown>),
+    });
+    api.registerMutation("update", {
+      args: { id: Type.String(), data: Type.Unknown() },
+      handler: async (ctx, args) => {
+        await ctx.db
+          .table("cards")
+          .update(args.id, args.data as Record<string, unknown>);
+        return null;
+      },
+    });
+    api.registerQuery("one", {
+      args: { id: Type.String() },
+      handler: (ctx, args) =>
+        ctx.db.table("cards").where("_id", "=", args.id).first(),
+    });
+  };
+
+  test("an insert gives each required column, of its type, and no undeclared one; a default may be omitted", async () => {
+    const vex = await create({ plugins: [rows] });
+    const id = await vex.mutate("rows.insert", {
+      row: { title: "a", meta: { tags: ["x"] } },
+    });
+    expect(await vex.query("rows.one", { id })).toMatchObject({
+      title: "a",
+      votes: 0,
+      meta: { tags: ["x"] },
+    });
+    for (const [row, message] of [
+      [{}, 'needs column "title"'],
+      [{ title: 1 }, 'column "title": must be string'],
+      [{ title: "a", extra: 1 }, 'has no column "extra"'],
+      [{ title: "a", meta: { tags: [1] } }, 'column "meta"'],
+    ] as const) {
+      await expect(vex.mutate("rows.insert", { row })).rejects.toThrow(message);
+    }
+  });
+
+  test("an update gives any of the columns, each of its type; none commits a refused write", async () => {
+    const vex = await create({ plugins: [rows] });
+    const id = await vex.mutate("rows.insert", { row: { title: "a" } });
+    await vex.mutate("rows.update", { id, data: { votes: 3, note: null } });
+    expect(await vex.query("rows.one", { id })).toMatchObject({
+      title: "a",
+      votes: 3,
+    });
+    await expect(
+      vex.mutate("rows.update", { id, data: { votes: "3" } }),
+    ).rejects.toThrow('update into cards: column "votes": must be number');
+    expect(await vex.query("rows.one", { id })).toMatchObject({ votes: 3 });
+  });
+
+  test("a column declared in the old form is refused, saying how to declare it", async () => {
+    await expect(
+      create({
+        plugins: [
+          (api: VexPluginAPI) => {
+            api.setName("old");
+            api.registerTable("t", {
+              columns: { x: { type: "json" } as any },
+            });
+          },
+        ],
+      }),
+    ).rejects.toThrow('declares column "x" in the old form');
+  });
 });

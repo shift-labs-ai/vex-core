@@ -12,8 +12,8 @@ function ledgerPlugin(api: VexPluginAPI) {
   api.setName("ledger");
   api.registerTable("entries", {
     columns: {
-      account: { type: "string", index: true },
-      amount: { type: "number" },
+      account: Type.String({ index: true }),
+      amount: Type.Number(),
     },
   });
   api.registerQuery("balance", {

@@ -6,6 +6,7 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import { Vex } from "../src/core/engine.js";
 import { ANY_TABLE } from "../src/core/storage.js";
 import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 import { changeTrackingSuite } from "./change-tracking-suite.js";
 
 changeTrackingSuite("sqlite (memory)", () => sqliteAdapter(":memory:"));
@@ -53,7 +54,7 @@ describe("sqlite (file): a subscription over a table created by raw SQL", () => 
       plugins: [
         (api) => {
           api.setName("t");
-          api.registerTable("items", { columns: { v: { type: "string" } } });
+          api.registerTable("items", { columns: { v: Type.String() } });
           api.registerQuery("loose", {
             args: {},
             async handler(ctx) {

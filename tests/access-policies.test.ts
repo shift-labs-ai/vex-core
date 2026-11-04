@@ -64,16 +64,16 @@ function docsPlugin(api: VexPluginAPI) {
   api.setName("dx");
   api.registerTable("grants", {
     columns: {
-      userId: { type: "string", index: true },
-      docId: { type: "string", index: true },
+      userId: Type.String({ index: true }),
+      docId: Type.String({ index: true }),
     },
   });
   api.registerTable("docs", {
     columns: {
-      ownerId: { type: "string", index: true },
-      title: { type: "string" },
-      kind: { type: "string" },
-      score: { type: "number", optional: true },
+      ownerId: Type.String({ index: true }),
+      title: Type.String(),
+      kind: Type.String(),
+      score: Type.Optional(Type.Number()),
     },
     access: {
       async prepare(user, db) {
@@ -103,10 +103,10 @@ function docsPlugin(api: VexPluginAPI) {
   for (const oracle of ["mirror", "mirrorAll"]) {
     api.registerTable(oracle, {
       columns: {
-        ownerId: { type: "string", index: true },
-        title: { type: "string" },
-        kind: { type: "string" },
-        score: { type: "number", optional: true },
+        ownerId: Type.String({ index: true }),
+        title: Type.String(),
+        kind: Type.String(),
+        score: Type.Optional(Type.Number()),
       },
     });
   }
@@ -114,8 +114,8 @@ function docsPlugin(api: VexPluginAPI) {
   // both must resolve two independent prepared contexts.
   api.registerTable("pets", {
     columns: {
-      ownerId: { type: "string", index: true },
-      name: { type: "string" },
+      ownerId: Type.String({ index: true }),
+      name: Type.String(),
     },
     access: {
       prepare(user) {
@@ -130,7 +130,7 @@ function docsPlugin(api: VexPluginAPI) {
   // A governed table whose policy fails — failures must reject the
   // operation, never fail open.
   api.registerTable("vault", {
-    columns: { name: { type: "string" } },
+    columns: { name: Type.String() },
     access: {
       prepare(user) {
         if (!user) return UNRESTRICTED;

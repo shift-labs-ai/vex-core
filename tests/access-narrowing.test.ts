@@ -100,12 +100,12 @@ const nothing: TableAccessPolicy<Prepared> = {
 };
 
 const DOC_COLUMNS = {
-  ownerId: { type: "string" as const, index: true },
-  title: { type: "string" as const },
-  kind: { type: "string" as const },
-  score: { type: "number" as const, optional: true },
+  ownerId: Type.String({ index: true }),
+  title: Type.String(),
+  kind: Type.String(),
+  score: Type.Optional(Type.Number()),
   /** The heavy column no window asks for. */
-  body: { type: "string" as const, optional: true },
+  body: Type.Optional(Type.String()),
 };
 
 const GOVERNED = { docs: exact, loose, unsaid, hidden: nothing } as const;
@@ -115,8 +115,8 @@ function plugin(api: VexPluginAPI) {
   api.setName("nx");
   api.registerTable("grants", {
     columns: {
-      userId: { type: "string", index: true },
-      docId: { type: "string", index: true },
+      userId: Type.String({ index: true }),
+      docId: Type.String({ index: true }),
     },
   });
   for (const [name, access] of Object.entries(GOVERNED)) {

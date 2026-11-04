@@ -56,11 +56,19 @@ const VALUES: Record<string, unknown[]> = {
   k: ["x", "y", "z"],
   version: [0, 1, 5],
 };
+// What a mutation may write: each column's own type (a table's schema
+// refuses the rest), or nothing.
 const WRITE_VALUES: Record<string, unknown[]> = {
   ...VALUES,
-  n: [...VALUES.n, "5", "5.0", undefined],
-  s: [...VALUES.s, 5, undefined],
-  b: [...VALUES.b, 1, 0],
+  n: [...VALUES.n, undefined],
+  s: [...VALUES.s, undefined],
+};
+// What raw SQL may leave in a column besides: each value's affinity
+// twin, which reads as the same value to SQLite and not to `===`.
+const TWINS: Record<string, unknown[]> = {
+  n: ["5", "5.0", null],
+  s: [5, null],
+  b: [1, 0, null],
 };
 const OPERATORS: Filter["operator"][] = ["=", "!=", "IN", "<", ">", "<=", ">="];
 const TERMINALS: Terminal[] = [
@@ -306,7 +314,13 @@ async function run(mode: Mode, seed: number) {
         filters: [filter(random, pool)],
       });
     if (roll < 0.8)
-      return vex.mutate("eq.rawInsert", { table, k: pick(random, VALUES.k) });
+      return vex.mutate("eq.rawInsert", {
+        table,
+        k: pick(random, VALUES.k),
+        s: pick(random, TWINS.s),
+        n: pick(random, TWINS.n),
+        b: pick(random, TWINS.b),
+      });
     if (roll < 0.86)
       return vex.mutate("eq.rawUpdate", {
         table,
@@ -363,6 +377,10 @@ async function run(mode: Mode, seed: number) {
     // (a first row is a window of one): only an unwindowed read's
     // falls on a delete alone.
     if (w.spec.limit !== undefined || w.spec.terminal === "first") continue;
+    // On the governed table a grant shows a row at the version it has
+    // and a revoke hides one: what a caller sees can fall in version
+    // with no write. Only an ungoverned read's rows arrive by writes.
+    if (w.spec.table === "g") continue;
     for (let i = 1; i < w.deliveries.length; i++) {
       const prev = w.deliveries[i - 1];
       const cur = w.deliveries[i];

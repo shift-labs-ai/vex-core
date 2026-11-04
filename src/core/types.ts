@@ -3,9 +3,29 @@ import type { TableAccessPolicy } from "./access.js";
 import type { ExecContext } from "./tracer.js";
 import type { ArgsOf, ArgsShape } from "./values.js";
 
-export type ColumnType = "string" | "number" | "boolean" | "json" | "any";
+/** How storage keeps a column: its storage type. */
+export type ColumnType = "string" | "number" | "boolean" | "json";
 
-export interface ColumnDef {
+/**
+ * A column as an app declares it: a TypeBox schema (what values it
+ * holds; `Type.Optional` lets it hold none), with what the table does
+ * with it. `default` is the schema's: the value an insert that omits
+ * the column gives it.
+ */
+export type ColumnDef = TSchema & {
+  index?: boolean;
+  /**
+   * Every name this column has had before. When the table has a column
+   * by one of them and none by this name, that column is renamed in
+   * place, keeping its data. When the table has neither, the migration
+   * fails: a new table is created under the current names, so a previous
+   * name that matches nothing is a mistake.
+   */
+  renamedFrom?: string[];
+};
+
+/** A column as storage keeps it (`tables.ts` derives it). */
+export interface StoredColumn {
   type: ColumnType;
   index?: boolean;
   optional?: boolean;
@@ -19,6 +39,11 @@ export interface ColumnDef {
    */
   renamedFrom?: string[];
 }
+
+/** A table as storage keeps it: each column's storage type. */
+export type StoredTableSchema = Omit<TableSchema, "columns"> & {
+  columns: Record<string, StoredColumn>;
+};
 
 export interface TableSchema {
   columns: Record<string, ColumnDef>;

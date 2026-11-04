@@ -17,6 +17,7 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { JobDef } from "../src/core/types.js";
 import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 afterEach(async () => {
@@ -33,7 +34,7 @@ async function engine(
     plugins: [
       (api: VexPluginAPI) => {
         api.setName("t");
-        api.registerTable("items", { columns: { v: { type: "string" } } });
+        api.registerTable("items", { columns: { v: Type.String() } });
         // Reads nothing: it would succeed on a closed engine's storage.
         api.registerQuery("pure", { args: {}, handler: () => 1 });
         api.registerMutation("add", {

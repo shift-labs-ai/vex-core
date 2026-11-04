@@ -26,7 +26,7 @@ afterEach(async () => {
 function plugin(api: VexPluginAPI) {
   api.setName("c");
   api.registerTable("items", {
-    columns: { scope: { type: "string", index: true }, n: { type: "number" } },
+    columns: { scope: Type.String({ index: true }), n: Type.Number() },
   });
   api.registerQuery("sum", {
     args: { scope: Type.String() },

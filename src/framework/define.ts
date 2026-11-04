@@ -1,7 +1,6 @@
 import type {
   ActionContext,
   ColumnDef,
-  ColumnType,
   MiddlewareFn,
   MutationContext,
   QueryContext,
@@ -63,26 +62,16 @@ export interface VexJob {
   retryDelayMs?: number;
 }
 
-type ColumnInput = string | (Omit<ColumnDef, "type"> & { type: string });
-
 /**
- * A table. Its SQL name is its export name in `schema.ts` and
- * `<plugin>_<export>` in any other file; `options.renamedFrom` lists
- * previous SQL names.
+ * A table: a TypeBox schema per column. Its SQL name is its export
+ * name in `schema.ts` and `<plugin>_<export>` in any other file;
+ * `options.renamedFrom` lists previous SQL names.
  */
 export function table(
-  columns: Record<string, ColumnInput>,
+  columns: Record<string, ColumnDef>,
   options: Omit<TableSchema, "columns"> = {},
 ): VexTable {
-  const normalized: TableSchema["columns"] = {};
-  for (const [name, def] of Object.entries(columns)) {
-    normalized[name] =
-      typeof def === "string"
-        ? { type: def as ColumnType }
-        : { ...def, type: def.type as ColumnType };
-  }
-
-  return { [KIND]: "table", ...options, columns: normalized };
+  return { [KIND]: "table", ...options, columns };
 }
 
 /** A definition without its kind tag: the plain def the engine registers. */

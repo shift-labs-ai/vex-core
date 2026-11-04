@@ -33,6 +33,7 @@ import {
   type ViewDefinition,
 } from "./sql-text.js";
 import { ANY_TABLE, CLOCK, type StorageAdapter } from "./storage.js";
+import { type RowChecks, rowChecks, storedTable } from "./tables.js";
 import {
   describeQueryDependencies,
   describeWrites,
@@ -62,6 +63,7 @@ import type {
   ReactiveBudget,
   Reads,
   Scheduler,
+  StoredTableSchema,
   SubscribeContext,
   TableSchema,
   VexRuntime,
@@ -581,6 +583,8 @@ export class Vex<A = unknown> {
   // callers alike in every field its runs read.
   private readonly families = new Map<string, Set<SubscriptionGroup>>();
   private groupSerial = 0;
+  // Each plugin table's write checks (tables.ts).
+  private readonly rowChecks = new Map<string, RowChecks>();
   // The share of runs `purityCheck` repeats.
   private purity = 0;
   private subIdCounter = 0;
@@ -718,7 +722,8 @@ export class Vex<A = unknown> {
     for (const [tableName, schema] of Object.entries(plugin.tables)) {
       this.tables.add(tableName);
       if (schema.access) this.accessPolicies.set(tableName, schema.access);
-      await this.storage.ensureTable(tableName, schema);
+      this.rowChecks.set(tableName, rowChecks(tableName, schema));
+      await this.storage.ensureTable(tableName, storedTable(tableName, schema));
     }
 
     for (const [name, def] of Object.entries(plugin.queries)) {
@@ -1759,6 +1764,7 @@ export class Vex<A = unknown> {
               // with the id it is given here, an update's or upsert's
               // columns left as they were, a delete's whole row.
               insert: (row) => {
+                self.rowChecks.get(name)?.insert(row);
                 const _id = row._id ?? generateId(12);
                 const full = { ...row, _id };
                 writes?.push({
@@ -1769,6 +1775,7 @@ export class Vex<A = unknown> {
                 return adapter.insert(name, full);
               },
               upsert: async (keys, data) => {
+                self.rowChecks.get(name)?.update({ ...keys, ...data });
                 const _id = generateId(12);
                 if (recording) {
                   let lookup = adapter.query(name);
@@ -1789,6 +1796,7 @@ export class Vex<A = unknown> {
                 return adapter.upsert(name, keys, data, _id);
               },
               update: async (id, data) => {
+                self.rowChecks.get(name)?.update(data);
                 const target = rowId(name, "update", id);
                 writes?.push(updateWrite(target, await held(target), data));
                 return adapter.update(name, target, data);
@@ -3174,7 +3182,7 @@ function claimTableNames<A>(plugins: PluginDef<A>[]): void {
 
 /** A schema's columns as it declares them. */
 function declaredColumns(
-  schema: TableSchema | null,
+  schema: StoredTableSchema | null,
 ): Record<string, DescribedColumn> {
   const columns: Record<string, DescribedColumn> = {};
   for (const [name, def] of Object.entries(schema?.columns ?? {})) {

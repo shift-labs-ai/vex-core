@@ -22,13 +22,13 @@ function plugin(api: VexPluginAPI) {
   api.setName("h");
   api.registerTable("messages", {
     columns: {
-      sessionId: { type: "string", index: true },
-      text: { type: "string" },
-      at: { type: "number" },
+      sessionId: Type.String({ index: true }),
+      text: Type.String(),
+      at: Type.Number(),
     },
     indexes: [["idx_messages_sessionId_at", ["sessionId", "at"]]],
   });
-  api.registerTable("sessions", { columns: { title: { type: "string" } } });
+  api.registerTable("sessions", { columns: { title: Type.String() } });
   // Reads the whole table, held to one session: hears only that one.
   api.registerQuery("count", {
     args: { sessionId: Type.String() },

@@ -8,6 +8,7 @@ import { afterEach, expect, test } from "bun:test";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
+import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 afterEach(async () => {
@@ -22,7 +23,7 @@ test("a handler calling a captured engine is refused; an action's ctx calls are 
     plugins: [
       (api: VexPluginAPI) => {
         api.setName("re");
-        api.registerTable("items", { columns: { n: { type: "number" } } });
+        api.registerTable("items", { columns: { n: Type.Number() } });
         api.registerQuery("count", {
           args: {},
           handler: (ctx) => ctx.db.table("items").count(),

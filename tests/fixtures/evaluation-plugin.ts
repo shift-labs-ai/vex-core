@@ -29,16 +29,16 @@ export function evaluationPlugin(api: VexPluginAPI) {
   api.setName("ev");
   api.registerTable("items", {
     columns: {
-      scope: { type: "string", index: true },
-      name: { type: "string" },
-      when: { type: "number", optional: true },
+      scope: Type.String({ index: true }),
+      name: Type.String(),
+      when: Type.Optional(Type.Number()),
     },
     access: itemsAccess,
   });
   api.registerTable("grants", {
     columns: {
-      userId: { type: "string", index: true },
-      itemId: { type: "string", index: true },
+      userId: Type.String({ index: true }),
+      itemId: Type.String({ index: true }),
     },
   });
   api.registerQuery("list", {
