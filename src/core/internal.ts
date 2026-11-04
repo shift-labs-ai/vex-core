@@ -1,9 +1,6 @@
 import type { StoredTableSchema } from "./types.js";
 
-/**
- * Built-in tables and queries managed by the engine itself.
- * These are not plugins — they're infrastructure the engine needs to operate.
- */
+/** The tables the engine keeps, as storage keeps them. */
 
 export const INTERNAL_TABLES: Record<string, StoredTableSchema> = {
   // Each migration applied, by id (VexOptions.migrations).

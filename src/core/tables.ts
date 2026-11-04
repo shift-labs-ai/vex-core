@@ -12,7 +12,12 @@ import type {
   StoredTableSchema,
   TableSchema,
 } from "./types.js";
-import { serializeJson } from "./values.js";
+import {
+  type ProblemWords,
+  refuseUnlessSchema,
+  schemaProblems,
+  serializeJson,
+} from "./values.js";
 
 const OPTIONAL = "~optional";
 
@@ -35,24 +40,18 @@ function storageType(schema: Record<string, any>): ColumnType {
   return "json";
 }
 
-/** `schema` as storage keeps it; an undeclarable column is refused. */
+/** `schema` as storage keeps it; a column that is not a schema is refused. */
 export function storedTable(
   name: string,
   schema: TableSchema,
 ): StoredTableSchema {
   const columns: Record<string, StoredColumn> = {};
   for (const [column, def] of Object.entries(schema.columns ?? {})) {
+    refuseUnlessSchema(
+      def,
+      `table ${name} declares column ${JSON.stringify(column)}`,
+    );
     const d = def as Record<string, any>;
-    if (d === null || typeof d !== "object") {
-      throw new Error(
-        `table ${name} declares column ${JSON.stringify(column)} as ${JSON.stringify(def)}: declare it with a schema, such as Type.String()`,
-      );
-    }
-    if (d.type === "json" || d.type === "any" || "optional" in d) {
-      throw new Error(
-        `table ${name} declares column ${JSON.stringify(column)} in the old form (${JSON.stringify(d)}): declare it with a schema, such as Type.Unknown() for JSON, and Type.Optional(...) for an optional column`,
-      );
-    }
     columns[column] = {
       type: storageType(d),
       ...(nullable(d) ? { optional: true } : {}),
@@ -64,6 +63,13 @@ export function storedTable(
   const { columns: _columns, ...rest } = schema;
   return { ...rest, columns };
 }
+
+/** How a row's columns are told apart in a write's refusal. */
+const COLUMN_WORDS: ProblemWords = {
+  undeclared: (column) => `has no column ${JSON.stringify(column)}`,
+  missing: (column) => `needs column ${JSON.stringify(column)}`,
+  refused: (path, message) => `column ${JSON.stringify(path[0])}: ${message}`,
+};
 
 /** The checks writes to a table pass. */
 export interface RowChecks {
@@ -82,12 +88,10 @@ export function rowChecks(name: string, schema: TableSchema): RowChecks {
   const properties: Record<string, TSchema> = { _id: Type.String() };
   const required: string[] = [];
   for (const [column, def] of Object.entries(schema.columns ?? {})) {
-    const d = def as Record<string, any>;
+    const optional = nullable(def);
     // Null is how storage reads an empty optional column back.
-    properties[column] = nullable(d)
-      ? Type.Union([def as TSchema, Type.Null()])
-      : (def as TSchema);
-    if (!nullable(d) && d.default === undefined) required.push(column);
+    properties[column] = optional ? Type.Union([def, Type.Null()]) : def;
+    if (!optional && def.default === undefined) required.push(column);
   }
   const whole = Compile(
     Type.Object(
@@ -119,36 +123,8 @@ export function rowChecks(name: string, schema: TableSchema): RowChecks {
     }
     serializeJson(present, `${kind} into ${name}`);
     if (compiled.Check(present)) return;
-    const problems = [...compiled.Errors(present)]
-      .filter((e) => e.message !== "schema is false")
-      .map((e) => {
-        if (e.keyword === "additionalProperties") {
-          const extra = e.params.additionalProperties;
-          return (Array.isArray(extra) ? extra : [extra])
-            .map((c: string) => `has no column ${JSON.stringify(c)}`)
-            .join("; ");
-        }
-        if (e.keyword === "required") {
-          const missing = e.params.requiredProperties;
-          return (Array.isArray(missing) ? missing : [missing])
-            .map((c: string) => `needs column ${JSON.stringify(c)}`)
-            .join("; ");
-        }
-        const column = e.instancePath.split("/").filter(Boolean)[0];
-        return `column ${JSON.stringify(column)}: ${e.message}`;
-      })
-      // A nullable column's schema is a union: its branch errors and
-      // the union's say one thing, the first branch's.
-      .filter((problem, i, all) => {
-        const column = problem.match(/^column ("[^"]*")/)?.[1];
-        return (
-          !column ||
-          all.findIndex((p) => p.startsWith(`column ${column}`)) === i
-        );
-      });
-    throw new TypeError(
-      `${kind} into ${name}: ${[...new Set(problems)].join("; ")}`,
-    );
+    const problems = schemaProblems(compiled, present, COLUMN_WORDS);
+    throw new TypeError(`${kind} into ${name}: ${problems.join("; ")}`);
   };
   return {
     insert: (row) => check(whole, "insert", row),

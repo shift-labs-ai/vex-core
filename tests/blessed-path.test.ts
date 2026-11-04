@@ -132,10 +132,10 @@ describe("callers share a run only when nothing tells them apart", () => {
       vex.subscribe("bp.visible", { scope: "a" }, () => {}, {
         user: withReach,
       }),
-    ).rejects.toThrow("a caller is plain data");
+    ).rejects.toThrow('a caller holds a function (at "reach")');
     await expect(
       vex.query("bp.visible", { scope: "a" }, { user: withReach }),
-    ).rejects.toThrow("a caller is plain data");
+    ).rejects.toThrow('a caller holds a function (at "reach")');
   });
 
   test("callers differing only in fields the query never reads share one run", async () => {
@@ -1051,6 +1051,141 @@ describe("a table's columns are schemas, and every write passes them", () => {
           },
         ],
       }),
-    ).rejects.toThrow('declares column "x" in the old form');
+    ).rejects.toThrow(
+      'table t declares column "x" as {"type":"json"}: declare it with a schema',
+    );
+  });
+});
+
+describe("the engine's tables are the engine's", () => {
+  const forger = (api: VexPluginAPI) => {
+    api.setName("forge");
+    api.registerMutation("write", {
+      args: { table: Type.String() },
+      handler: async (ctx, args) => {
+        await ctx.db.table(args.table).insert({ name: "x" });
+        return null;
+      },
+    });
+    api.registerMutation("raw", {
+      args: { sql: Type.String() },
+      handler: (ctx, args) => ctx.db.sql(args.sql),
+    });
+    api.registerQuery("read", {
+      args: { table: Type.String() },
+      handler: (ctx, args) => ctx.db.table(args.table).all(),
+    });
+    api.registerQuery("rawRead", {
+      args: { table: Type.String() },
+      handler: (ctx, args) =>
+        ctx.db.sql({ [args.table]: "all" }, `SELECT * FROM ${args.table}`),
+    });
+  };
+
+  test("no handler writes one; none reads _scheduled, which says whom each schedule runs as", async () => {
+    const vex = await create({ plugins: [forger] });
+    for (const table of ["_scheduled", "_SCHEDULED", "_jobs", "_migrations"]) {
+      await expect(vex.mutate("forge.write", { table })).rejects.toThrow(
+        `ctx.db ${table.toLowerCase() === "_scheduled" ? "reads and writes" : "writes"} no ${table}`,
+      );
+    }
+    await expect(
+      vex.mutate("forge.raw", {
+        sql: "INSERT INTO _scheduled (_id, name, kind, args, runAt, status, createdAt) VALUES ('x', 'a.b', 'mutation', '{}', 0, 'pending', 0)",
+      }),
+    ).rejects.toThrow("ctx.db.sql reads and writes no _scheduled");
+    await expect(
+      vex.mutate("forge.raw", { sql: "SELECT * FROM _Scheduled" }),
+    ).rejects.toThrow("ctx.db.sql reads and writes no _scheduled");
+    await expect(
+      vex.mutate("forge.raw", { sql: "DELETE FROM _migrations" }),
+    ).rejects.toThrow("writes no table the engine keeps (_migrations)");
+    await expect(
+      vex.query("forge.read", { table: "_scheduled" }),
+    ).rejects.toThrow("ctx.db reads and writes no _scheduled");
+    await expect(
+      vex.query("forge.rawRead", { table: "_scheduled" }),
+    ).rejects.toThrow("ctx.db reads and writes no _scheduled");
+    // What the engine keeps of its jobs is readable: an app lists them.
+    expect(await vex.query("forge.read", { table: "_jobs" })).toEqual([]);
+  });
+});
+
+describe("only a schema Type builds declares an arg or a return", () => {
+  test("an old-form arg or return is refused as the engine starts, saying how to declare it", async () => {
+    const declaring = (declare: (api: VexPluginAPI) => void) =>
+      create({
+        plugins: [
+          (api: VexPluginAPI) => {
+            api.setName("old");
+            declare(api);
+          },
+        ],
+      });
+    await expect(
+      declaring((api) =>
+        api.registerQuery("q", {
+          args: { n: { type: "number", optional: true } as any },
+          handler: () => null,
+        }),
+      ),
+    ).rejects.toThrow(
+      'query old.q declares arg "n" as {"type":"number","optional":true}: declare it with a schema',
+    );
+    await expect(
+      declaring((api) =>
+        api.registerQuery("r", {
+          args: {},
+          returns: { type: "string" } as any,
+          handler: () => "x",
+        }),
+      ),
+    ).rejects.toThrow("query old.r declares what it returns as");
+  });
+
+  test("a nullable arg is refused once, by its first branch", async () => {
+    const vex = await create({
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("nul");
+          api.registerQuery("q", {
+            args: { n: Type.Union([Type.Number(), Type.Null()]) },
+            handler: (_ctx, args) => args.n,
+          });
+        },
+      ],
+    });
+    await expect(vex.query("nul.q", { n: "5" })).rejects.toThrow(
+      /^query nul\.q takes arg "n": must be number \(it takes "n"\)$/,
+    );
+  });
+});
+
+describe("every caller is handed one value: the answer's JSON reading", () => {
+  test("a call's answer, like a subscription's, drops what JSON does not say", async () => {
+    const vex = await create({
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("ans");
+          api.registerQuery("q", {
+            args: {},
+            handler: () => ({ kept: 1, dropped: undefined, zero: -0 }),
+          });
+          api.registerMutation("m", {
+            args: {},
+            handler: () => ({ dropped: undefined }),
+          });
+        },
+      ],
+    });
+    const answer = await vex.query("ans.q");
+    expect(Object.keys(answer)).toEqual(["kept", "zero"]);
+    expect(Object.is(answer.zero, 0)).toBe(true);
+    expect(Object.keys(await vex.mutate("ans.m"))).toEqual([]);
+    let heard: any;
+    await vex.subscribe("ans.q", {}, (value) => {
+      heard = value;
+    });
+    expect(heard).toEqual(answer);
   });
 });

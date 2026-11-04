@@ -1,10 +1,11 @@
 /**
  * The handler a call is running in, as async context: a query,
- * mutation or action handler (and the middleware around it) runs in
- * its frame, so a handler calling the engine directly, rather than
- * through its context, is refused. What a handler reads and writes
- * goes through its context, which tracks it, decides it and answers it
- * as its caller.
+ * mutation or action handler runs in its frame, so a handler calling
+ * the engine directly, rather than through its context, is refused.
+ * What a handler reads and writes goes through its context, which
+ * tracks it, decides it and answers it as its caller. Middleware runs
+ * outside the frame: it is the app's authority, and may ask the
+ * engine how to decide.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";

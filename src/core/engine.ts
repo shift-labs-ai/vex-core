@@ -162,42 +162,23 @@ interface Subscription {
 }
 
 /**
- * A value as JSON with every object's keys sorted, so two values with
- * the same data spell alike; null when it holds anything JSON cannot
- * say (a function, a symbol, a cycle).
+ * A JSON value with every object's keys sorted, so two values with the
+ * same data spell alike. Args and callers are JSON by the time they
+ * are keyed (`compileArgs`, `normalizeCallContext`).
  */
-function canonical(value: unknown, seen = new Set<object>()): string | null {
+function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") {
-    if (
-      typeof value === "function" ||
-      typeof value === "symbol" ||
-      typeof value === "bigint"
-    )
-      return null;
     return value === undefined ? "null" : JSON.stringify(value);
   }
-  if (seen.has(value)) return null;
-  seen.add(value);
-  try {
-    if (typeof (value as { toJSON?: unknown }).toJSON === "function") {
-      return canonical((value as { toJSON(): unknown }).toJSON(), seen);
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  const entries: string[] = [];
+  for (const key of Object.keys(value).sort()) {
+    const item = (value as Record<string, unknown>)[key];
+    if (item !== undefined) {
+      entries.push(`${JSON.stringify(key)}:${canonical(item)}`);
     }
-    if (Array.isArray(value)) {
-      const items = value.map((item) => canonical(item, seen));
-      return items.includes(null) ? null : `[${items.join(",")}]`;
-    }
-    const entries: string[] = [];
-    for (const key of Object.keys(value).sort()) {
-      const item = (value as Record<string, unknown>)[key];
-      if (item === undefined) continue;
-      const spelled = canonical(item, seen);
-      if (spelled === null) return null;
-      entries.push(`${JSON.stringify(key)}:${spelled}`);
-    }
-    return `{${entries.join(",")}}`;
-  } finally {
-    seen.delete(value);
   }
+  return `{${entries.join(",")}}`;
 }
 
 /**
@@ -210,12 +191,12 @@ function callerSeen(
   reads: ReadonlySet<string> | null,
 ): string {
   if (user == null) return "none";
-  if (reads === null) return canonical(user) ?? "";
+  if (reads === null) return canonical(user);
   const seen: Record<string, unknown> = {};
   for (const key of reads) {
     if (Object.hasOwn(user, key)) seen[key] = (user as any)[key];
   }
-  return canonical(seen) ?? "";
+  return canonical(seen);
 }
 
 /**
@@ -243,11 +224,37 @@ function trackedCaller(user: VexUser, reads: Set<string>): VexUser {
   });
 }
 
-/** A measured result as a joiner hears it: its serialized form, read. */
-function parsed(measurement: ReactiveMeasurement): unknown {
-  return measurement.serialized === undefined
+/** An answer as JSON says it (`serializeJson`). */
+interface Json {
+  serialized: string | undefined;
+  /** Whether the answer is its own JSON reading. */
+  exact: boolean;
+}
+
+/**
+ * `result` as an operation answers it: JSON data, refused otherwise,
+ * and what its `returns` schema allows.
+ */
+function checkedAnswer(
+  what: string,
+  returns: ((value: unknown) => void) | undefined,
+  result: unknown,
+): Json {
+  const json = serializeJson(result, `${what} answers`);
+  returns?.(result);
+  return json;
+}
+
+/** An answer read back from its JSON: what a joiner hears of a run it did not see. */
+function parsed(json: Json): unknown {
+  return json.serialized === undefined
     ? undefined
-    : JSON.parse(measurement.serialized);
+    : JSON.parse(json.serialized);
+}
+
+/** The value every caller is handed: the answer's JSON reading. */
+function reading(result: unknown, json: Json): unknown {
+  return json.exact ? result : parsed(json);
 }
 
 /**
@@ -448,13 +455,10 @@ function describeOperation<A>(
 }
 
 /** A reactive result as subscriptions compare and budget it. */
-interface ReactiveMeasurement {
+interface ReactiveMeasurement extends Json {
   hash: number;
   resultRows: number | undefined;
   resultBytes: number;
-  serialized: string | undefined;
-  /** Whether the result is its own JSON reading (`serializeJson`). */
-  exact: boolean;
 }
 
 /**
@@ -722,8 +726,10 @@ export class Vex<A = unknown> {
     for (const [tableName, schema] of Object.entries(plugin.tables)) {
       this.tables.add(tableName);
       if (schema.access) this.accessPolicies.set(tableName, schema.access);
+      // Refuses a column that is not a schema before compiling checks.
+      const stored = storedTable(tableName, schema);
       this.rowChecks.set(tableName, rowChecks(tableName, schema));
-      await this.storage.ensureTable(tableName, storedTable(tableName, schema));
+      await this.storage.ensureTable(tableName, stored);
     }
 
     for (const [name, def] of Object.entries(plugin.queries)) {
@@ -1139,10 +1145,11 @@ export class Vex<A = unknown> {
   }
 
   /**
-   * A scheduler for `user`: each schedule is a row of `_scheduled`,
-   * written through the storage the caller is in, so a mutation's is
-   * part of its transaction. `afterCommit` arms the timer once the
-   * row can be seen.
+   * A scheduler for `user`, the caller as the call was made (what
+   * middleware adds to it is decided again when the function runs):
+   * each schedule is a row of `_scheduled`, written through the
+   * storage the caller is in, so a mutation's is part of its
+   * transaction. `afterCommit` arms the timer once the row can be seen.
    */
   private scheduler(
     user: VexUser | null | undefined,
@@ -1153,28 +1160,24 @@ export class Vex<A = unknown> {
       name: string,
       args: Record<string, any> = {},
     ) => {
-      const kind = this.queries.has(name)
-        ? "query"
-        : this.mutations.has(name)
-          ? "mutation"
-          : this.actions.has(name)
-            ? "action"
-            : null;
-      if (!kind) throw new Error(`Cannot schedule ${name}: no such operation`);
+      // What runs later has effects: a mutation or an action.
+      const mutation = this.mutations.get(name);
+      const reg = mutation ?? this.actions.get(name);
+      if (!reg) {
+        throw new Error(
+          `Cannot schedule ${name}: no mutation or action of that name`,
+        );
+      }
       if (!Number.isFinite(runAt)) {
         throw new TypeError("A schedule's time is a finite number of ms");
       }
-      const reg =
-        this.queries.get(name) ??
-        this.mutations.get(name) ??
-        this.actions.get(name)!;
       // Its args are checked now, not when it runs.
       const checked = reg.args(args);
       const id = generateId(12);
       await this.storage.insert("_scheduled", {
         _id: id,
         name,
-        kind,
+        kind: mutation ? "mutation" : "action",
         args: checked,
         caller: user ?? null,
         runAt,
@@ -1204,10 +1207,16 @@ export class Vex<A = unknown> {
     return row?.at ?? null;
   }
 
-  /** Sets the one timer for the soonest pending scheduled function. */
+  /**
+   * Sets the one timer for the soonest pending scheduled function. A
+   * pass that fails is logged; the next schedule arms the timer again.
+   */
   private armScheduled(): void {
     if (this.closing || this.jobScheduler !== "timers") return;
-    void this.nextScheduled().then((at) => {
+    const failed = (error: unknown) => {
+      if (!this.closing) console.error("[vex] scheduled functions:", error);
+    };
+    this.nextScheduled().then((at) => {
       if (at === null || this.closing) return;
       if (this.scheduleTimer && at >= this.scheduleAt) return;
       if (this.scheduleTimer) clearTimeout(this.scheduleTimer);
@@ -1216,26 +1225,34 @@ export class Vex<A = unknown> {
         () => {
           this.scheduleTimer = null;
           this.scheduleAt = Number.POSITIVE_INFINITY;
-          void this.runDueScheduled(Date.now()).then(() => this.armScheduled());
+          this.runDueScheduled(Date.now()).then(
+            () => this.armScheduled(),
+            failed,
+          );
         },
         Math.max(0, at - Date.now()),
       );
-    });
+    }, failed);
   }
 
   /**
    * Runs every pending scheduled function due by `now`, one after
    * another, each once, as the caller who scheduled it: done, or failed
-   * with its error.
+   * with its error. A finished one is kept `SCHEDULED_KEPT_MS`, then
+   * deleted.
    */
   private runDueScheduled(now: number): Promise<void> {
     // One pass at a time; a pass asked for meanwhile joins it.
     if (this.scheduledRun) return this.scheduledRun;
     const pass = (async () => {
+      await this.storage.rawQuery(
+        "DELETE FROM _scheduled WHERE status IN ('done', 'failed') AND finishedAt < ?",
+        now - SCHEDULED_KEPT_MS,
+      );
       const due = await this.storage.rawQuery<{
         _id: string;
         name: string;
-        kind: "query" | "mutation" | "action";
+        kind: "mutation" | "action";
         args: string;
         caller: string | null;
       }>(
@@ -1250,10 +1267,9 @@ export class Vex<A = unknown> {
           ? (JSON.parse(row.caller) as VexUser)
           : undefined;
         try {
-          if (row.kind === "query") await this.query(row.name, args, { user });
-          else if (row.kind === "mutation")
+          if (row.kind === "mutation") {
             await this.mutate(row.name, args, { user });
-          else await this.action(row.name, args, { user });
+          } else await this.action(row.name, args, { user });
           await this.storage.update("_scheduled", row._id, {
             status: "done",
             finishedAt: Date.now(),
@@ -1406,6 +1422,10 @@ export class Vex<A = unknown> {
       }
       const held = Object.keys(reads).filter((t) => reads[t] !== "all");
       const read = (tables: string[], views: string[]): Promise<T[]> => {
+        const hidden = tables.flatMap(
+          (table) => engineTableRefusal(table, false) ?? [],
+        );
+        if (hidden.length > 0) return Promise.reject(new Error(hidden[0]));
         const governed = tables.filter((table) =>
           self.accessPolicies.has(table),
         );
@@ -1445,6 +1465,8 @@ export class Vex<A = unknown> {
     ctx = {
       db: {
         table(name: string) {
+          const refused = engineTableRefusal(name, false);
+          if (refused) throw new Error(refused);
           const policy = self.accessPolicies.get(name);
           if (!policy) return baseBuilder(name);
           return guardQueryBuilder(name, baseBuilder(name), policy, () =>
@@ -1700,6 +1722,13 @@ export class Vex<A = unknown> {
           return self.storage.rawQuery<T>(sql, ...params);
         },
         table(name: string): MutationTable {
+          const hidden = engineTableRefusal(name, false);
+          if (hidden) throw new Error(hidden);
+          // Refused at the write, so the engine's tables stay readable.
+          const writable = () => {
+            const refused = engineTableRefusal(name, true);
+            if (refused) throw new Error(refused);
+          };
           const adapter = self.storage;
           const recording = writes !== undefined;
           const held = (id: string) =>
@@ -1764,6 +1793,7 @@ export class Vex<A = unknown> {
               // with the id it is given here, an update's or upsert's
               // columns left as they were, a delete's whole row.
               insert: (row) => {
+                writable();
                 self.rowChecks.get(name)?.insert(row);
                 const _id = row._id ?? generateId(12);
                 const full = { ...row, _id };
@@ -1775,6 +1805,7 @@ export class Vex<A = unknown> {
                 return adapter.insert(name, full);
               },
               upsert: async (keys, data) => {
+                writable();
                 self.rowChecks.get(name)?.update({ ...keys, ...data });
                 const _id = generateId(12);
                 if (recording) {
@@ -1796,6 +1827,7 @@ export class Vex<A = unknown> {
                 return adapter.upsert(name, keys, data, _id);
               },
               update: async (id, data) => {
+                writable();
                 self.rowChecks.get(name)?.update(data);
                 const target = rowId(name, "update", id);
                 writes?.push(updateWrite(target, await held(target), data));
@@ -1806,6 +1838,7 @@ export class Vex<A = unknown> {
               // string: read as "no argument", a missing id would empty
               // the table.
               delete: async (...args: [id?: string]) => {
+                writable();
                 if (args.length === 0) {
                   if (recording) {
                     // The rows about to go, each as it is: every row
@@ -1908,12 +1941,8 @@ export class Vex<A = unknown> {
 
   private measureReactiveResult(
     result: any,
-    name: string,
+    { serialized, exact }: Json,
   ): ReactiveMeasurement {
-    const { serialized, exact } = serializeJson(
-      result,
-      `query ${name} answers`,
-    );
     // An undefined result measures as the literal "undefined".
     const measured = serialized ?? "undefined";
     const resultRows = Array.isArray(result)
@@ -2209,11 +2238,8 @@ export class Vex<A = unknown> {
         return answer;
       });
     } while (group.stale);
-    reg.returns?.(result);
-    return {
-      result,
-      measurement: this.measureReactiveResult(result, group.queryName),
-    };
+    const json = checkedAnswer(`query ${group.queryName}`, reg.returns, result);
+    return { result, measurement: this.measureReactiveResult(result, json) };
   }
 
   /**
@@ -2276,10 +2302,10 @@ export class Vex<A = unknown> {
         ectx,
       ),
     );
-    reg.returns?.(result);
+    const json = checkedAnswer(`query ${request.name}`, reg.returns, result);
     return {
       result,
-      ...this.measureReactiveResult(result, request.name),
+      ...this.measureReactiveResult(result, json),
       tables: [...tables],
       dependencies,
       callerReads: [...callerReads],
@@ -2657,7 +2683,7 @@ export class Vex<A = unknown> {
   ): void {
     // Every member hears one value: the result itself when it is its
     // own JSON reading, else that reading, which a joiner hears too.
-    const answer = measurement.exact ? result : parsed(measurement);
+    const answer = reading(result, measurement);
     for (const sub of group.members) {
       if (measurement.hash === sub.lastHash) continue;
       sub.lastHash = measurement.hash;
@@ -2714,8 +2740,7 @@ export class Vex<A = unknown> {
           ectx,
         );
       });
-      const { serialized } = serializeJson(result, `query ${name} answers`);
-      reg.returns?.(result);
+      const json = checkedAnswer(`query ${name}`, reg.returns, result);
       if (tables && dependencies) {
         meta.plugin = reg.plugin;
         meta.tables = [...tables];
@@ -2725,9 +2750,9 @@ export class Vex<A = unknown> {
           meta.resultRows = (result as any).rows?.length;
         // Same convention as measureReactiveResult: undefined results
         // are counted as the literal "undefined".
-        meta.resultBytes = utf8ByteLength(serialized ?? "undefined");
+        meta.resultBytes = utf8ByteLength(json.serialized ?? "undefined");
       }
-      return result as T;
+      return reading(result, json) as T;
     });
   }
 
@@ -2751,13 +2776,14 @@ export class Vex<A = unknown> {
           { type: "mutation", name, args, access: reg.def.access },
           () => reg.def.handler(ctx, args),
           ectx,
-        ).then((answer) => {
-          // Refused inside the transaction, so a non-JSON answer
-          // commits nothing.
-          serializeJson(answer, `mutation ${name} answers`);
-          reg.returns?.(answer);
-          return answer;
-        }),
+        ).then((answer) =>
+          // Checked inside the transaction: a refused answer commits
+          // nothing.
+          reading(
+            answer,
+            checkedAnswer(`mutation ${name}`, reg.returns, answer),
+          ),
+        ),
       );
       if (isTraceRecording(ectx)) {
         meta.plugin = reg.plugin;
@@ -2796,9 +2822,10 @@ export class Vex<A = unknown> {
         () => reg.def.handler(ctx, args),
         ectx,
       );
-      serializeJson(result, `action ${name} answers`);
-      reg.returns?.(result);
-      return result as T;
+      return reading(
+        result,
+        checkedAnswer(`action ${name}`, reg.returns, result),
+      ) as T;
     });
   }
 
@@ -2841,7 +2868,10 @@ export class Vex<A = unknown> {
       this.subscriptions.set(subId, sub);
       try {
         const { result, measurement } = group.last
-          ? { result: parsed(group.last), measurement: group.last }
+          ? {
+              result: parsed(group.last),
+              measurement: group.last,
+            }
           : await this.runGroup(group, reg, _ectx);
         if (recording) {
           meta.resultRows = measurement.resultRows;
@@ -2860,7 +2890,7 @@ export class Vex<A = unknown> {
         sub.lastHash = measurement.hash;
         deliverSubscriptionResult(
           callback,
-          measurement.exact ? result : parsed(measurement),
+          reading(result, measurement),
           measurement.serialized,
         );
       } catch (err) {
@@ -3016,11 +3046,6 @@ export class Vex<A = unknown> {
     };
   }
 
-  /**
-   * Invalidates for writes the engine did not make itself, so did not
-   * record: whatever the storage reports changed, judged whole. Not
-   * traced, since a tracer may itself write through the storage.
-   */
   /** Raw access for `vex-core/internal`; no public name reaches it. */
   [RAW](): RawAccess {
     return {
@@ -3030,6 +3055,11 @@ export class Vex<A = unknown> {
     };
   }
 
+  /**
+   * Invalidates for writes the engine did not make itself, so did not
+   * record: whatever the storage reports changed, judged whole. Not
+   * traced, since a tracer may itself write through the storage.
+   */
   private announceWrites(): Promise<void> {
     return this.invalidateAfter(noopExecCtx);
   }
@@ -3223,11 +3253,9 @@ function normalizeCallContext(callCtx?: ExecContext | CallContext): {
     return { parent: callCtx as ExecContext };
   }
   const cc = callCtx as CallContext;
-  if (cc.user != null && canonical(cc.user) === null) {
-    throw new TypeError(
-      "a caller is plain data: a function, symbol or cycle in it is state no query could track",
-    );
-  }
+  // A caller is plain data: what its runs read of it is keyed, and
+  // it crosses to a worker and into a schedule.
+  if (cc.user != null) serializeJson(cc.user, "a caller");
   return { parent: cc.parent, user: cc.user, signal: cc.signal };
 }
 
@@ -3250,19 +3278,46 @@ function parseSchedule(schedule: string): number {
 const NO_VIEWS: string[] = [];
 const WORD = /[\w$]/;
 
-// The tables the engine writes itself. `_spans` is provided for an
-// app's tracer to keep, and is the app's to write.
-const ENGINE_TABLES = ["_jobs", "_migrations"];
+// The tables the engine writes itself, and of them the one no handler
+// reads either: `_scheduled` holds each schedule's caller and args, and
+// a row written there would run as whoever it names. `_spans` is
+// provided for an app's tracer to keep, and is the app's to write.
+const ENGINE_TABLES = ["_jobs", "_migrations", "_scheduled"];
+const ENGINE_PRIVATE_TABLES = ["_scheduled"];
+
+// How long a finished scheduled function is kept: what ran, and how
+// it ended.
+const SCHEDULED_KEPT_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Why a handler is refused `table` through `ctx.db`, or null: an
+ * engine table is the engine's to write, and `_scheduled` its alone.
+ * Names compare as SQLite's do, ignoring case.
+ */
+function engineTableRefusal(table: string, writes: boolean): string | null {
+  const name = table.toLowerCase();
+  if (ENGINE_PRIVATE_TABLES.includes(name)) {
+    return `ctx.db reads and writes no ${table}: it is the engine's`;
+  }
+  if (writes && ENGINE_TABLES.includes(name)) {
+    return `ctx.db writes no ${table}: the engine keeps it`;
+  }
+  return null;
+}
 
 /**
  * Why a mutation's raw SQL is refused, or null: each statement reads
  * or changes rows (SELECT, VALUES, WITH, INSERT, UPDATE, DELETE,
  * REPLACE), never the schema, a PRAGMA, an attached database or the
- * transaction the mutation runs in, and writes no table the engine
- * keeps for itself.
+ * transaction the mutation runs in; it writes no table the engine
+ * keeps, and touches none it keeps to itself.
  */
 function rawWriteRefusal(sql: string): string | null {
   for (const statement of splitStatements(sql)) {
+    const hidden = namesIn(statement, ENGINE_PRIVATE_TABLES);
+    if (hidden.length > 0) {
+      return `ctx.db.sql reads and writes no ${hidden.join(", ")}: it is the engine's`;
+    }
     const kind = statementKind(statement);
     if (kind === "other") {
       const word = statement.trim().split(/\s+/)[0]?.toUpperCase() ?? "";

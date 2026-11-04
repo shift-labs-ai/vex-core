@@ -16,7 +16,7 @@ interface RowTransform {
   kind: "json" | "boolean";
 }
 
-// Deserialization plans are cached per schema object: only json/any and
+// Deserialization plans are cached per schema object: only json and
 // boolean columns need per-row work, and most tables have none. ensureTable
 // registers a fresh schema object on every (re)registration, so migrations
 // invalidate naturally and the WeakMap cannot outlive the schemas it keys.

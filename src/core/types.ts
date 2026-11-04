@@ -12,6 +12,7 @@ export type ColumnType = "string" | "number" | "boolean" | "json";
  * the column gives it.
  */
 export type ColumnDef = Schema & {
+  default?: unknown;
   index?: boolean;
   /**
    * Every name this column has had before. When the table has a column
@@ -29,13 +30,7 @@ export interface StoredColumn {
   index?: boolean;
   optional?: boolean;
   default?: any;
-  /**
-   * Every name this column has had before. When the table has a column
-   * by one of them and none by this name, that column is renamed in
-   * place, keeping its data. When the table has neither, the migration
-   * fails: a new table is created under the current names, so a previous
-   * name that matches nothing is a mistake.
-   */
+  /** As {@link ColumnDef.renamedFrom}. */
   renamedFrom?: string[];
 }
 
@@ -287,10 +282,11 @@ export interface QueryContext {
 }
 
 /**
- * Functions to run later, as the caller who scheduled them: a query,
- * mutation or action by name, with its args. In a mutation a schedule
- * is part of its transaction (it happens only if the mutation commits);
- * in an action it happens when called. Each runs once.
+ * Functions to run later, as the caller who scheduled them: a mutation
+ * or action by name, with its args, checked when scheduled. In a
+ * mutation a schedule is part of its transaction (it happens only if
+ * the mutation commits); in an action it happens when called. Each
+ * runs once; a finished one is kept a week.
  */
 export interface Scheduler {
   /** Runs `name` after `ms` milliseconds; its scheduled id. */

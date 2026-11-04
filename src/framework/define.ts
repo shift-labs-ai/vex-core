@@ -8,7 +8,7 @@ import type {
   WebhookRequest,
   WebhookResponse,
 } from "../core/types.js";
-import type { ArgsShape } from "../core/values.js";
+import type { ArgsOf, ArgsShape } from "../core/values.js";
 
 const KIND = Symbol.for("vex.kind");
 
@@ -16,28 +16,23 @@ export interface VexTable extends TableSchema {
   [KIND]: "table";
 }
 
-export interface VexQuery {
+/** A file's query: its args' schemas, and a handler typed from them. */
+export interface VexQuery<S extends ArgsShape = any> {
   [KIND]: "query";
-  args: ArgsShape;
-  handler: (ctx: QueryContext, args: Record<string, any>) => Promise<any> | any;
+  args: S;
+  handler: (ctx: QueryContext, args: ArgsOf<S>) => Promise<any> | any;
 }
 
-export interface VexMutation {
+export interface VexMutation<S extends ArgsShape = any> {
   [KIND]: "mutation";
-  args: ArgsShape;
-  handler: (
-    ctx: MutationContext,
-    args: Record<string, any>,
-  ) => Promise<any> | any;
+  args: S;
+  handler: (ctx: MutationContext, args: ArgsOf<S>) => Promise<any> | any;
 }
 
-export interface VexAction {
+export interface VexAction<S extends ArgsShape = any> {
   [KIND]: "action";
-  args: ArgsShape;
-  handler: (
-    ctx: ActionContext,
-    args: Record<string, any>,
-  ) => Promise<any> | any;
+  args: S;
+  handler: (ctx: ActionContext, args: ArgsOf<S>) => Promise<any> | any;
 }
 
 export interface VexWebhook {
@@ -82,21 +77,24 @@ export function untag<T extends { [KIND]: string }>(
   return plain;
 }
 
-export function query(args: ArgsShape, handler: VexQuery["handler"]): VexQuery {
+export function query<S extends ArgsShape>(
+  args: S,
+  handler: VexQuery<S>["handler"],
+): VexQuery<S> {
   return { [KIND]: "query", args, handler };
 }
 
-export function mutation(
-  args: ArgsShape,
-  handler: VexMutation["handler"],
-): VexMutation {
+export function mutation<S extends ArgsShape>(
+  args: S,
+  handler: VexMutation<S>["handler"],
+): VexMutation<S> {
   return { [KIND]: "mutation", args, handler };
 }
 
-export function action(
-  args: ArgsShape,
-  handler: VexAction["handler"],
-): VexAction {
+export function action<S extends ArgsShape>(
+  args: S,
+  handler: VexAction<S>["handler"],
+): VexAction<S> {
   return { [KIND]: "action", args, handler };
 }
 

@@ -6,7 +6,7 @@
  * Durable Objects".
  */
 
-export type { Static, TSchema } from "typebox";
+export type { Static } from "typebox";
 // The schema language: TypeBox, re-exported so an app holds the
 // engine's own version.
 export { default as Type } from "typebox";

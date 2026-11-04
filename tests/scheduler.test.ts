@@ -50,6 +50,14 @@ function plugin(api: VexPluginAPI) {
     args: {},
     handler: (ctx) => ctx.scheduler.runAfter(0, "sch.send", { wrong: 1 }),
   });
+  api.registerQuery("list", {
+    args: {},
+    handler: (ctx) => ctx.db.table("notes").all(),
+  });
+  api.registerMutation("scheduleQuery", {
+    args: {},
+    handler: (ctx) => ctx.scheduler.runAfter(0, "sch.list"),
+  });
   api.registerAction("send", {
     args: { note: Type.String() },
     handler: (ctx, args) => {
@@ -187,6 +195,28 @@ describe("a scheduled function runs at most once", () => {
       },
     ]);
     expect(effects).toEqual([]);
+  });
+});
+
+describe("what is scheduled, and what is kept", () => {
+  test("only a mutation or an action is scheduled: a query's answer would reach no one", async () => {
+    const vex = await engine();
+    await expect(vex.mutate("sch.scheduleQuery")).rejects.toThrow(
+      "Cannot schedule sch.list: no mutation or action of that name",
+    );
+  });
+
+  test("a finished one is kept a week, then deleted", async () => {
+    effects.length = 0;
+    const vex = await engine({ jobScheduler: "external" });
+    await vex.mutate("sch.note", { text: "kept", delayMs: 0, fail: false });
+    await vex.runDueJobs(Date.now());
+    expect((await statuses(vex)).map((row) => row.status)).toEqual(["done"]);
+    const day = 24 * 60 * 60 * 1000;
+    await vex.runDueJobs(Date.now() + 6 * day);
+    expect(await statuses(vex)).toHaveLength(1);
+    await vex.runDueJobs(Date.now() + 8 * day);
+    expect(await statuses(vex)).toEqual([]);
   });
 });
 

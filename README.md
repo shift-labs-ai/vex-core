@@ -81,7 +81,8 @@ api.registerMutation("rename", {
 ```
 
 - A call with an undeclared arg, a missing one, or one of the wrong type is refused, with every problem named (HTTP answers 400). `Type.Optional` means the arg may be absent; `null` is a value its schema must allow (`Type.Union([Type.String(), Type.Null()])`).
-- Args and answers are JSON values: plain objects, arrays, strings, finite numbers, booleans, null. A `Date`, `Map`, class instance or function is refused, since a client could not receive it. An answer against a declared `returns` is refused too; a refused mutation commits nothing.
+- Args and answers are JSON values: plain objects, arrays, strings, finite numbers, booleans, null. A `Date`, `Map`, class instance or function is refused, since a client could not receive it. An answer against a declared `returns` is refused too; a refused mutation commits nothing. Every caller, in process or over the wire, a call or a subscription, is handed the answer as JSON reads it back (an `undefined` property gone, `-0` as `0`).
+- A declaration is a schema `Type` builds: a plain object such as `{ type: "string" }` is refused as the engine starts, and does not compile.
 
 ## Cloudflare Durable Objects
 
@@ -279,7 +280,9 @@ api.registerMutation("invite", {
 });
 ```
 
-`runAfter(ms, name, args)` and `runAt(time, name, args)` schedule a query, mutation or action by name, its args checked when scheduled; `cancel(id)` removes one not yet started. Each runs once, as the caller who scheduled it, and is recorded `done` or `failed` in `_scheduled`. One that was running when the engine stopped is failed at the next start, never run again. An action schedules too, outside any transaction. With `jobScheduler: "external"`, `nextJobRun()` and `runDueJobs()` include them.
+`runAfter(ms, name, args)` and `runAt(time, name, args)` schedule a mutation or action by name, its args checked when scheduled; `cancel(id)` removes one not yet started. Each runs once, as the caller who scheduled it (middleware decides the run as it decides any call), and is recorded `done` or `failed` in `_scheduled`, kept a week. One that was running when the engine stopped is failed at the next start, never run again. An action schedules too, outside any transaction. With `jobScheduler: "external"`, `nextJobRun()` and `runDueJobs()` include them.
+
+The engine's tables (`_jobs`, `_migrations`, `_scheduled`) are its own to write: `ctx.db` refuses a write to one, through the builder or SQL. `_scheduled` is not read through `ctx.db` either, since each row names the caller it runs as.
 
 ## Operation access
 

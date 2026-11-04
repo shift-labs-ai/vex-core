@@ -15,6 +15,78 @@ import { HttpError } from "../http/error.js";
  */
 export type Schema = TSchema & { readonly "~kind": string };
 
+/** Whether `value` is a schema `Type` built: it carries its `~kind`. */
+export function isSchema(value: unknown): value is Schema {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    typeof (value as { "~kind"?: unknown })["~kind"] === "string"
+  );
+}
+
+/**
+ * Refuses what is not a schema `Type` built, naming where it is
+ * declared (`what`, such as `query q declares arg "x"`).
+ */
+export function refuseUnlessSchema(
+  value: unknown,
+  what: string,
+): asserts value is Schema {
+  if (isSchema(value)) return;
+  throw new Error(
+    `${what} as ${JSON.stringify(value)}: declare it with a schema, such as Type.String(), Type.Optional(Type.Number()), or Type.Unknown() for JSON`,
+  );
+}
+
+/** How a value's problems are told: the words for its parts. */
+export interface ProblemWords {
+  /** A key no schema declares. */
+  undeclared(key: string): string;
+  /** A declared key the value lacks. */
+  missing(key: string): string;
+  /** A part (`path[0]`, at the rest of `path`) its schema refuses. */
+  refused(path: string[], message: string): string;
+}
+
+/**
+ * Why `compiled` refuses `value`, one problem per part: an undeclared
+ * key is told once (not also as its false schema), and a union's
+ * branch errors, which say one thing, as its first.
+ */
+export function schemaProblems(
+  compiled: ReturnType<typeof Compile>,
+  value: unknown,
+  words: ProblemWords,
+): string[] {
+  const problems: string[] = [];
+  const told = new Set<string>();
+  for (const error of compiled.Errors(value)) {
+    if (error.message === "schema is false") continue;
+    const path = error.instancePath.split("/").filter(Boolean);
+    const params = error.params as Record<string, unknown>;
+    if (error.keyword === "additionalProperties") {
+      for (const key of keys(params.additionalProperties ?? path[0])) {
+        problems.push(words.undeclared(key));
+      }
+    } else if (error.keyword === "required") {
+      for (const key of keys(params.requiredProperties)) {
+        problems.push(words.missing(key));
+      }
+    } else {
+      const part = path[0] ?? "";
+      if (told.has(part)) continue;
+      told.add(part);
+      problems.push(words.refused(path, error.message));
+    }
+  }
+  return [...new Set(problems)];
+}
+
+function keys(value: unknown): string[] {
+  if (value === undefined) return [];
+  return (Array.isArray(value) ? value : [value]).map(String);
+}
+
 /**
  * What an operation takes: each arg's name and its schema, a TypeBox
  * type (JSON Schema that infers as TypeScript). The handler's args are
@@ -45,11 +117,10 @@ export function compileArgs(
     );
   }
   for (const [arg, schema] of Object.entries(shape)) {
-    if (!isPlainObject(schema)) {
-      throw new Error(
-        `${kind} ${name} declares arg ${JSON.stringify(arg)} as ${JSON.stringify(schema)}: declare it with a schema, such as Type.String()`,
-      );
-    }
+    refuseUnlessSchema(
+      schema,
+      `${kind} ${name} declares arg ${JSON.stringify(arg)}`,
+    );
   }
   const compiled = Compile(
     Type.Object(shape as ArgsShape, { additionalProperties: false }),
@@ -69,62 +140,48 @@ export function compileArgs(
       if (value !== undefined) present[key] = value;
     }
     if (!compiled.Check(present)) {
-      // An undeclared key is reported twice (its false schema, and the
-      // object's additionalProperties): once is enough.
-      const problems = [...compiled.Errors(present)]
-        .filter((error) => error.message !== "schema is false")
-        .map((error) => argProblem(error));
+      const problems = schemaProblems(compiled, present, ARG_WORDS);
       throw new ArgsError(
-        `${kind} ${name} ${[...new Set(problems)].join("; ")} (it takes ${takes})`,
+        `${kind} ${name} ${problems.join("; ")} (it takes ${takes})`,
       );
     }
     return deepFreeze(jsonCopy(present, `${kind} ${name} args`));
   };
 }
 
-/** A TypeBox error as the caller is told it. */
-function argProblem(error: {
-  keyword: string;
-  instancePath: string;
-  params: Record<string, any>;
-  message: string;
-}): string {
-  const path = error.instancePath.split("/").filter(Boolean);
-  if (error.keyword === "additionalProperties") {
-    const extra = error.params.additionalProperties ?? path[0];
-    return (Array.isArray(extra) ? extra : [extra])
-      .map((key: string) => `takes no arg ${JSON.stringify(key)}`)
-      .join("; ");
-  }
-  if (error.keyword === "required") {
-    const missing = error.params.requiredProperties ?? [];
-    return (Array.isArray(missing) ? missing : [missing])
-      .map((m: string) => `needs arg ${JSON.stringify(m)}`)
-      .join("; ");
-  }
-  const at =
-    path.length > 0
-      ? `arg ${JSON.stringify(path[0])}${path.length > 1 ? ` at /${path.slice(1).join("/")}` : ""}`
-      : "its args";
-  return `takes ${at}: ${error.message}`;
-}
+/** How an operation's args are told apart in its refusal. */
+const ARG_WORDS: ProblemWords = {
+  undeclared: (key) => `takes no arg ${JSON.stringify(key)}`,
+  missing: (key) => `needs arg ${JSON.stringify(key)}`,
+  refused: (path, message) =>
+    path.length === 0
+      ? `takes its args: ${message}`
+      : `takes arg ${JSON.stringify(path[0])}${path.length > 1 ? ` at /${path.slice(1).join("/")}` : ""}: ${message}`,
+};
 
 /** The check for an operation's answer against its `returns` schema. */
 export function compileReturns(
   kind: string,
   name: string,
-  schema: TSchema | undefined,
+  schema: unknown,
 ): ((value: unknown) => void) | undefined {
   if (schema === undefined) return undefined;
+  refuseUnlessSchema(schema, `${kind} ${name} declares what it returns`);
   const compiled = Compile(schema);
   return (value) => {
     if (compiled.Check(value)) return;
-    const [error] = [...compiled.Errors(value)];
-    throw new TypeError(
-      `${kind} ${name} answers ${error ? `${error.instancePath || "its value"}: ${error.message}` : "against its returns schema"}`,
-    );
+    const problems = schemaProblems(compiled, value, RETURN_WORDS);
+    throw new TypeError(`${kind} ${name} answers ${problems.join("; ")}`);
   };
 }
+
+/** How an answer's parts are told apart when its `returns` refuses it. */
+const RETURN_WORDS: ProblemWords = {
+  undeclared: (key) => `with ${JSON.stringify(key)}, which it does not return`,
+  missing: (key) => `without ${JSON.stringify(key)}`,
+  refused: (path, message) =>
+    `${path.length > 0 ? `/${path.join("/")}` : "its value"}: ${message}`,
+};
 
 /** Args refused at the boundary: the caller's mistake, answered 400. */
 export class ArgsError extends HttpError {
