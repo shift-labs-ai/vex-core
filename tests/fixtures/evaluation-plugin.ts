@@ -26,7 +26,7 @@ const itemsAccess: TableAccessPolicy<{ ids: string[] }> = {
   }),
 };
 
-export function evaluationPlugin(api: VexPluginAPI) {
+export default function evaluationPlugin(api: VexPluginAPI) {
   api.setName("ev");
   api.registerTable("items", {
     columns: {
@@ -112,6 +112,15 @@ export function evaluationPlugin(api: VexPluginAPI) {
       throw new HttpError(403, "not yours", { body: { code: "NOT_YOURS" } });
     },
   });
+  // A refusal whose body carries what no thread boundary copies.
+  api.registerQuery("forbiddenOddly", {
+    args: {},
+    handler: () => {
+      throw new HttpError(403, "not yours", {
+        body: { code: "NOT_YOURS", explain: () => "why" },
+      });
+    },
+  });
   api.registerMutation("add", {
     args: { scope: Type.String(), name: Type.String() },
     handler: (ctx, args) => ctx.db.table("items").insert(args),
@@ -128,6 +137,3 @@ export function evaluationPlugin(api: VexPluginAPI) {
       ctx.db.table("items").update(args.id, { name: args.name }),
   });
 }
-
-/** Given by module, as evaluation workers import it. */
-export default evaluationPlugin;

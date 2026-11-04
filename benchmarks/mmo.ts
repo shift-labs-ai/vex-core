@@ -30,7 +30,6 @@ import {
   cellOf,
   guildOf,
   ITEMS_PER_PLAYER,
-  mmoPlugin,
   partyOf,
   playerId,
   zoneOf,

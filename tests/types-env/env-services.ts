@@ -39,7 +39,8 @@ export const wrongEnv: VexOptions = {
   services: { hostManager },
 };
 
-declare module "../../src/core/types.js" {
+// As an app does: through the package entry (`vex-core`).
+declare module "../../src/portable.js" {
   interface VexEnv {
     sessionRoot: string;
   }

@@ -82,7 +82,7 @@ function versionOf(rows: unknown): number | null {
   return null;
 }
 
-export function equivalencePlugin(api: VexPluginAPI) {
+export default function equivalencePlugin(api: VexPluginAPI) {
   api.setName("eq");
   const columns = {
     s: Type.Optional(Type.String({ index: true })),
@@ -266,6 +266,3 @@ export function equivalencePlugin(api: VexPluginAPI) {
         .delete(),
   });
 }
-
-/** Given by module, as evaluation workers import it. */
-export default equivalencePlugin;

@@ -41,7 +41,7 @@ const governedAccess: TableAccessPolicy<{ ids: string[] }> = {
   }),
 };
 
-export function scalingPlugin(api: VexPluginAPI) {
+export default function scalingPlugin(api: VexPluginAPI) {
   api.setName("sc");
   api.registerTable("items", {
     columns: {
@@ -247,6 +247,3 @@ export function scalingPlugin(api: VexPluginAPI) {
     },
   });
 }
-
-/** Given by module, as evaluation workers import it. */
-export default scalingPlugin;

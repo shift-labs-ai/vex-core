@@ -25,7 +25,7 @@ export const CELL = 100;
 export const cellOf = (x: number, y: number) =>
   `${Math.floor(x / CELL)}:${Math.floor(y / CELL)}`;
 
-export function mmoPlugin(api: VexPluginAPI) {
+export default function mmoPlugin(api: VexPluginAPI) {
   api.setName("mmo");
   api.registerTable("players", {
     columns: {
@@ -205,6 +205,3 @@ export function mmoPlugin(api: VexPluginAPI) {
     handler: (ctx, args) => ctx.db.table("items").insert(args),
   });
 }
-
-/** Given by module, as evaluation workers import it. */
-export default mmoPlugin;

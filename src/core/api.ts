@@ -34,8 +34,14 @@ export interface VexPluginAPI<A = undefined> {
 
 export type PluginFunction<A = undefined> = (api: VexPluginAPI<A>) => void;
 
+/**
+ * The env of an app that gives none, and of a plugin resolved outside
+ * an engine: its types then require none.
+ */
+export const NO_ENV = Object.freeze({}) as Readonly<VexEnv>;
+
 export function createPluginAPI<A = undefined>(
-  env: Readonly<VexEnv> = EMPTY_ENV,
+  env: Readonly<VexEnv> = NO_ENV,
 ): {
   api: VexPluginAPI<A>;
   resolve: () => PluginDef<A>;
@@ -99,12 +105,9 @@ export function createPluginAPI<A = undefined>(
   return { api, resolve };
 }
 
-// A plugin resolved outside an engine (a test, a scan) reads none.
-const EMPTY_ENV = Object.freeze({}) as Readonly<VexEnv>;
-
 export function resolvePlugin<A = undefined>(
   input: PluginFunction<A> | PluginDef<A>,
-  env: Readonly<VexEnv> = EMPTY_ENV,
+  env: Readonly<VexEnv> = NO_ENV,
 ): PluginDef<A> {
   if (typeof input === "function") {
     const { api, resolve } = createPluginAPI<A>(env);

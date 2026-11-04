@@ -144,7 +144,7 @@ export function compileArgs(
         `${kind} ${name} ${problems.join("; ")} (it takes ${takes})`,
       );
     }
-    return deepFreeze(jsonCopy(present, `${kind} ${name} args`));
+    return frozenJson(present, `${kind} ${name} args`);
   };
 }
 

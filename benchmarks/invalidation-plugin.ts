@@ -46,7 +46,7 @@ const sessionsAccess: TableAccessPolicy<Grants> = {
   }),
 };
 
-export function benchmarkPlugin(api: VexPluginAPI) {
+export default function benchmarkPlugin(api: VexPluginAPI) {
   api.setName("b");
   api.registerTable("sessions", {
     columns: {
@@ -160,6 +160,3 @@ export function benchmarkPlugin(api: VexPluginAPI) {
     },
   });
 }
-
-/** Given by module, as evaluation workers import it. */
-export default benchmarkPlugin;

@@ -30,7 +30,7 @@ export interface EvaluationOptions {
   offloadAboveMs?: number;
 }
 
-/** A subscription's query, as a worker runs it. */
+/** A query run, as a worker runs it: a subscription's or a one-shot. */
 export interface EvaluationRequest {
   name: string;
   args: Record<string, any>;
@@ -80,7 +80,11 @@ export interface CrossedError {
   };
 }
 
-/** `error` as it crosses (`CrossedError`). */
+/**
+ * `error` as it crosses (`CrossedError`): plain data, which every
+ * thread boundary copies. An HttpError's body crosses as HTTP sends
+ * it, its JSON reading; one JSON cannot say crosses as its message.
+ */
 export function crossing(error: unknown): CrossedError {
   if (isHttpError(error)) {
     return {
@@ -88,8 +92,8 @@ export function crossing(error: unknown): CrossedError {
       message: error.message,
       http: {
         status: error.status,
-        body: error.body,
-        headers: error.headers,
+        body: sent(error.body, error.message),
+        headers: { ...error.headers },
         expose: error.expose,
       },
     };
@@ -99,16 +103,26 @@ export function crossing(error: unknown): CrossedError {
     : { name: "Error", message: String(error) };
 }
 
-/** The error `crossed` describes, rebuilt on this side. */
-export function crossed(crossed: CrossedError): Error {
-  const error = crossed.http
-    ? new HttpError(crossed.http.status, crossed.message, {
-        body: crossed.http.body,
-        headers: crossed.http.headers,
-        expose: crossed.http.expose,
+/** `body` as an HTTP response says it. */
+function sent(body: unknown, message: string): unknown {
+  try {
+    const json = JSON.stringify(body);
+    return json === undefined ? undefined : JSON.parse(json);
+  } catch {
+    return { error: message };
+  }
+}
+
+/** The error `shape` describes, rebuilt on this side. */
+export function crossed(shape: CrossedError): Error {
+  const error = shape.http
+    ? new HttpError(shape.http.status, shape.message, {
+        body: shape.http.body,
+        headers: shape.http.headers,
+        expose: shape.http.expose,
       })
-    : new Error(crossed.message);
-  error.name = crossed.name;
+    : new Error(shape.message);
+  error.name = shape.name;
   return error;
 }
 

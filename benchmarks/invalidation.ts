@@ -23,7 +23,7 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
 import type { VexUser } from "../src/core/types.js";
-import { benchmarkPlugin, HANDLER_MS } from "./invalidation-plugin.js";
+import { HANDLER_MS } from "./invalidation-plugin.js";
 
 const USERS = Number(process.env.BENCH_USERS ?? 35);
 const CONVERSATIONS = Number(process.env.BENCH_CONVERSATIONS ?? 6);

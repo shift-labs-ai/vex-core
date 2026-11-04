@@ -6,7 +6,7 @@ import {
   UNRESTRICTED,
 } from "./access.js";
 import type { PluginFunction } from "./api.js";
-import { resolvePlugin } from "./api.js";
+import { NO_ENV, resolvePlugin } from "./api.js";
 import {
   type Evaluation,
   type EvaluationOptions,
@@ -528,11 +528,6 @@ interface JobRunResult {
 }
 
 /**
- * `A` is the app's access declaration (`OperationAccess`): what every
- * query, mutation and action of every plugin must declare. Unchosen,
- * there is none to declare.
- */
-/**
  * `env` and `services`, each required once the app declares a field
  * it must hold (`VexEnv`, `VexServices`), optional while it declares
  * none.
@@ -544,6 +539,11 @@ type HostOptions = (Partial<VexEnv> extends VexEnv
     ? { services?: VexServices }
     : { services: VexServices });
 
+/**
+ * `A` is the app's access declaration (`OperationAccess`): what every
+ * query, mutation and action of every plugin must declare. Unchosen,
+ * there is none to declare.
+ */
 export type VexOptions<A = undefined> = EngineOptions<A> & HostOptions;
 
 /**
@@ -658,7 +658,7 @@ export class Vex<A = unknown> {
   private evaluation: EvaluationPool | null = null;
   // What a query's runs cost, in ms, averaged over its recent runs
   // wherever they ran; and the queries whose runs the pool takes
-  // (`offloads`).
+  // (`poolFor`, `noteCost`).
   private readonly readCost = new Map<string, number>();
   private readonly offloading = new Set<string>();
   private offloadAboveMs = 2;
@@ -683,9 +683,6 @@ export class Vex<A = unknown> {
   private purity = 0;
   // The app's settings and the host's capabilities (`VexOptions`).
   private env: Readonly<VexEnv> = NO_ENV;
-  // Each plugin's module, in order, when every plugin was given by
-  // one (`PluginModule`); null when any was given by value.
-  private pluginModules: string[] | null = null;
   private services: VexServices = NO_SERVICES;
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
@@ -776,7 +773,6 @@ export class Vex<A = unknown> {
     vex.env = settings(options.env);
     vex.services = options.services ?? NO_SERVICES;
     const given = await loadPlugins(options.plugins);
-    vex.pluginModules = given.modules;
     const plugins = given.plugins.map((plugin) =>
       resolvePlugin(plugin, vex.env),
     );
@@ -801,11 +797,7 @@ export class Vex<A = unknown> {
     // After every table is ensured: a worker's read-only engine
     // registers the tables it finds, and refuses one it does not.
     if (options.evaluation && options.evaluation.workers > 0) {
-      const { plugins: modules, reader } = readsElsewhere(
-        vex.pluginModules,
-        options.plugins.length,
-        vex.storage,
-      );
+      const reader = readsElsewhere(given, vex.storage);
       const offloadAbove = options.evaluation.offloadAboveMs ?? 2;
       if (!(offloadAbove >= 0)) {
         throw new TypeError(
@@ -818,7 +810,7 @@ export class Vex<A = unknown> {
           new URL("./evaluation-worker.js", import.meta.url),
           options.evaluation.workers,
           {
-            plugins: modules,
+            plugins: given.modules,
             env: vex.env,
             reader,
             handlerTimeoutMs: vex.handlerTimeoutMs,
@@ -2995,16 +2987,8 @@ export class Vex<A = unknown> {
         const evaluation = await pool.run({ name, args, user });
         this.noteCost(name, evaluation.durationMs);
         if (recording) {
-          meta.plugin = reg.plugin;
           meta.offThread = true;
-          meta.tables = evaluation.tables;
-          meta.dependencies = describeQueryDependencies(
-            evaluation.dependencies,
-          );
-          if (evaluation.resultRows !== undefined) {
-            meta.resultRows = evaluation.resultRows;
-          }
-          meta.resultBytes = evaluation.resultBytes;
+          recordRead(meta, reg.plugin, evaluation);
         }
         return reading(evaluation.result, evaluation) as T;
       }
@@ -3026,14 +3010,14 @@ export class Vex<A = unknown> {
       this.noteCost(name, performance.now() - began);
       const json = checkedAnswer(`query ${name}`, reg.returns, result);
       if (tables && dependencies) {
-        meta.plugin = reg.plugin;
-        meta.tables = [...tables];
-        meta.dependencies = describeQueryDependencies(dependencies);
-        const rows = rowsOf(result);
-        if (rows !== undefined) meta.resultRows = rows;
-        // Same convention as measureReactiveResult: undefined results
-        // are counted as the literal "undefined".
-        meta.resultBytes = utf8ByteLength(json.serialized ?? "undefined");
+        recordRead(meta, reg.plugin, {
+          tables: [...tables],
+          dependencies,
+          resultRows: rowsOf(result),
+          // As `measureReactiveResult` counts it: an undefined result
+          // is the literal "undefined".
+          resultBytes: utf8ByteLength(json.serialized ?? "undefined"),
+        });
       }
       return reading(result, json) as T;
     });
@@ -3562,28 +3546,48 @@ function parseSchedule(schedule: string): number {
 }
 
 const NONE: string[] = [];
-// What an app that gives none holds: its types then require none
+// The services of an app that gives none: its types then require none
 // (`HostOptions`).
-const NO_ENV = Object.freeze({}) as Readonly<VexEnv>;
 const NO_SERVICES = Object.freeze({}) as VexServices;
 
-/**
- * The plugins `given` names, each module's imported, in order; and
- * every module's reference when all were given by one.
- */
+/** A one-shot read as its trace records it, wherever it ran. */
+function recordRead(
+  meta: Record<string, any>,
+  plugin: string,
+  read: {
+    tables: string[];
+    dependencies: QueryDependency[];
+    resultRows: number | undefined;
+    resultBytes: number;
+  },
+): void {
+  meta.plugin = plugin;
+  meta.tables = read.tables;
+  meta.dependencies = describeQueryDependencies(read.dependencies);
+  if (read.resultRows !== undefined) meta.resultRows = read.resultRows;
+  meta.resultBytes = read.resultBytes;
+}
+
+/** The app's plugins as `loadPlugins` found them. */
+interface LoadedPlugins<A> {
+  plugins: Array<PluginFunction<A> | PluginDef<A>>;
+  /** Each module given, in order. */
+  modules: string[];
+  /** How many plugins were given by value, which no module names. */
+  byValue: number;
+}
+
+/** The plugins `given` names, in order, each module's imported. */
 async function loadPlugins<A>(
   given: ReadonlyArray<PluginFunction<A> | PluginDef<A> | PluginModule>,
-): Promise<{
-  plugins: Array<PluginFunction<A> | PluginDef<A>>;
-  modules: string[] | null;
-}> {
+): Promise<LoadedPlugins<A>> {
   const plugins: Array<PluginFunction<A> | PluginDef<A>> = [];
   const modules: string[] = [];
-  let byValue = false;
+  let byValue = 0;
   for (const entry of given) {
     if (!(entry instanceof URL) && typeof entry !== "string") {
       plugins.push(entry);
-      byValue = true;
+      byValue++;
       continue;
     }
     const specifier = entry instanceof URL ? entry.href : entry;
@@ -3602,7 +3606,7 @@ async function loadPlugins<A>(
     plugins.push(...each);
     modules.push(specifier);
   }
-  return { plugins, modules: byValue ? null : modules };
+  return { plugins, modules, byValue };
 }
 
 function isPlugin(
@@ -3620,17 +3624,17 @@ function isPlugin(
 }
 
 /**
- * What a worker builds its engine from, or why it cannot: every
- * plugin by module, and a storage another thread can open to read.
+ * How a worker opens the storage, once it is clear a worker can build
+ * the engine: every plugin given by module, and a storage another
+ * thread can open to read.
  */
-function readsElsewhere(
-  modules: string[] | null,
-  given: number,
+function readsElsewhere<A>(
+  given: LoadedPlugins<A>,
   storage: StorageAdapter,
-): { plugins: string[]; reader: StorageReader } {
-  if (!modules) {
+): StorageReader {
+  if (given.byValue > 0) {
     throw new Error(
-      `evaluation workers build their engine from the app's plugins, so each is given by module (PluginModule): of ${given}, some are given by value`,
+      `evaluation workers build their engine from the app's plugins, so each is given by module (PluginModule): ${given.byValue} given by value`,
     );
   }
   const reader = storage.reader?.() ?? null;
@@ -3639,7 +3643,7 @@ function readsElsewhere(
       "evaluation workers open the storage from another thread, which this one cannot be (a database in memory, or one with no reader())",
     );
   }
-  return { plugins: modules, reader };
+  return reader;
 }
 
 /** `env` as every context reads it: plain data, copied and frozen. */
@@ -3650,6 +3654,7 @@ function settings(env: VexEnv | undefined): Readonly<VexEnv> {
   }
   return frozenJson(env, "env");
 }
+
 const WORD = /[\w$]/;
 
 // The tables the engine writes itself, and of them the one no handler

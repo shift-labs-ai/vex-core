@@ -260,6 +260,11 @@ describe("evaluation workers", () => {
     );
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ code: "NOT_YOURS" });
+    // Its body crosses as HTTP would send it, its JSON reading, even
+    // when it holds what a thread boundary cannot copy.
+    expect(
+      await vex.query("ev.forbiddenOddly").catch((e: unknown) => e),
+    ).toMatchObject({ status: 403, body: { code: "NOT_YOURS" } });
     // An args refusal stays a 400 wherever the args are checked.
     await expect(vex.query("ev.names", { scope: 1 })).rejects.toMatchObject({
       status: 400,
@@ -303,20 +308,20 @@ describe("evaluation workers", () => {
     await vex.subscribe("ev.names", { scope: "a" }, () => {});
     expect(meta("subscribe").at(-1)?.offThread).toBe(false);
   });
-});
 
-test("a file-based app is a plugin module too, and its reads run in the pool", async () => {
-  const vex = await Vex.create({
-    plugins: [new URL("./fixtures/refs/scanned.ts", import.meta.url)],
-    storage: sqliteAdapter(databasePath()),
-    evaluation: { workers: 1, offloadAboveMs: 0 },
-    tracer: { onSpan: (span) => spans.push(span) },
+  test("a file-based app is a plugin module too, and its reads run in the pool", async () => {
+    const vex = await Vex.create({
+      plugins: [new URL("./fixtures/refs/scanned.ts", import.meta.url)],
+      storage: sqliteAdapter(databasePath()),
+      evaluation: { workers: 1, offloadAboveMs: 0 },
+      tracer: { onSpan: (span) => spans.push(span) },
+    });
+    open.push(vex);
+    await vex.mutate("todos.add", { text: "b" });
+    await vex.mutate("todos.add", { text: "a" });
+    expect(await vex.query("todos.list")).toEqual(["a", "b"]);
+    expect(meta("query").at(-1)?.offThread).toBe(true);
   });
-  open.push(vex);
-  await vex.mutate("todos.add", { text: "b" });
-  await vex.mutate("todos.add", { text: "a" });
-  expect(await vex.query("todos.list")).toEqual(["a", "b"]);
-  expect(meta("query").at(-1)?.offThread).toBe(true);
 });
 
 describe("what a worker needs, or the engine refuses to start", () => {
@@ -329,7 +334,7 @@ describe("what a worker needs, or the engine refuses to start", () => {
         evaluation: { workers: 1 },
       }),
     ).rejects.toThrow(
-      "evaluation workers build their engine from the app's plugins, so each is given by module (PluginModule): of 1, some are given by value",
+      "evaluation workers build their engine from the app's plugins, so each is given by module (PluginModule): 1 given by value",
     );
   });
 

@@ -22,7 +22,6 @@ import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
 import type { VexUser } from "../src/core/types.js";
 import { rawBulkInsert } from "../src/internal.js";
-import { benchmarkPlugin } from "./invalidation-plugin.js";
 
 const PLAYERS = (process.env.BENCH_PLAYERS ?? "1000,5000,20000")
   .split(",")

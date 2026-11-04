@@ -1,22 +1,27 @@
 /**
  * The invalidation benchmark across engines and scales, in one table.
  *
- * Each engine is a git ref checked out into a temporary worktree with
- * this directory's benchmark copied in, so every engine runs the same
- * scenarios. Configurations vary the people, the handler cost and the
- * burst; the current tree runs with and without evaluation workers.
+ * Each engine is a git ref checked out into a temporary worktree, and
+ * runs the benchmark as written for its own API: the one it carries,
+ * or, for a ref older than the benchmark, the one `BENCH_LEGACY` (a
+ * ref) carries. Every version of the benchmark runs the same scenarios
+ * under the same names. Configurations vary the people, the handler
+ * cost and the burst; the current tree runs with and without
+ * evaluation workers.
  *
- *   bun benchmarks/compare.ts                      # markdown to stdout
- *   BENCH_REFS=v0.21.0,v0.22.1 BENCH_OUT=report.md bun benchmarks/compare.ts
+ *   bun benchmarks/compare.ts                      # this tree, markdown to stdout
+ *   BENCH_REFS=v0.22.1 BENCH_LEGACY=98bc8ff BENCH_OUT=report.md bun benchmarks/compare.ts
  */
 
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const ROOT = new URL("..", import.meta.url).pathname;
-const REFS = (process.env.BENCH_REFS ?? "v0.21.0,v0.22.1").split(",");
+const REFS = (process.env.BENCH_REFS ?? "").split(",").filter(Boolean);
+/** The ref whose benchmark a ref without one of its own runs. */
+const LEGACY = process.env.BENCH_LEGACY;
 const ROUNDS = process.env.BENCH_ROUNDS ?? "5";
 const OUT = process.env.BENCH_OUT;
 
@@ -59,14 +64,23 @@ function git(...args: string[]): string {
   return run.stdout.trim();
 }
 
-/** A worktree at `ref` carrying this tree's benchmark. */
+/** A worktree at `ref`, carrying a benchmark written for its API. */
 function checkout(ref: string, into: string): string {
   const dir = join(into, ref.replace(/[^\w.-]/g, "_"));
   git("worktree", "add", "--detach", "-q", dir, ref);
-  rmSync(join(dir, "benchmarks"), { recursive: true, force: true });
-  cpSync(join(ROOT, "benchmarks"), join(dir, "benchmarks"), {
-    recursive: true,
-  });
+  if (!existsSync(join(dir, "benchmarks", "invalidation.ts"))) {
+    if (!LEGACY) {
+      throw new Error(
+        `${ref} has no benchmark of its own: name a ref whose benchmark runs on its API (BENCH_LEGACY=<ref>)`,
+      );
+    }
+    const extract = spawnSync(
+      "sh",
+      ["-c", `git archive "${LEGACY}" benchmarks | tar -x -C "${dir}"`],
+      { cwd: ROOT },
+    );
+    if (extract.status !== 0) throw new Error(String(extract.stderr));
+  }
   spawnSync("bun", ["install", "--silent"], { cwd: dir });
   return dir;
 }
