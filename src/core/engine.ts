@@ -29,7 +29,12 @@ import { id as generateId } from "./id.js";
 import { INTERNAL_TABLES } from "./internal.js";
 import { equalityKey, sameValue, writeMayAffect } from "./invalidation.js";
 import { hashResult, utf8ByteLength } from "./result-measure.js";
-import { statementKind, tablesRead, type ViewDefinition } from "./sql-text.js";
+import {
+  splitStatements,
+  statementKind,
+  tablesRead,
+  type ViewDefinition,
+} from "./sql-text.js";
 import { ANY_TABLE, CLOCK, type StorageAdapter } from "./storage.js";
 import {
   describeQueryDependencies,
@@ -1133,7 +1138,7 @@ export class Vex<A = unknown> {
         }
         // A view reads its base tables by their own names, past the
         // expressions that hold them: a held read names no view.
-        const named = held.length > 0 ? viewsNamed(sql, views) : NO_VIEWS;
+        const named = held.length > 0 ? namesIn(sql, views) : NO_VIEWS;
         if (named.length > 0) {
           return Promise.reject(
             new Error(
@@ -1409,6 +1414,8 @@ export class Vex<A = unknown> {
           sql: string,
           ...params: any[]
         ): Promise<T[]> {
+          const refused = rawWriteRefusal(sql);
+          if (refused) return Promise.reject(new Error(refused));
           if (statementKind(sql) !== "read" && !writes?.includes(RAW_WRITE))
             writes?.push(RAW_WRITE);
           return self.storage.rawQuery<T>(sql, ...params);
@@ -2790,17 +2797,44 @@ function parseSchedule(schedule: string): number {
 const NO_VIEWS: string[] = [];
 const WORD = /[\w$]/;
 
+const ENGINE_TABLES = Object.keys(INTERNAL_TABLES);
+
 /**
- * The views of `views` that `sql` names as a word. A statement reaches
- * a view only by naming it (a view naming another is reached through
- * the first); a name inside a string literal counts too, so nothing is
- * missed and more than needed may be refused.
+ * Why a mutation's raw SQL is refused, or null: each statement reads
+ * or changes rows (SELECT, VALUES, WITH, INSERT, UPDATE, DELETE,
+ * REPLACE), never the schema, a PRAGMA, an attached database or the
+ * transaction the mutation runs in, and writes no table the engine
+ * keeps for itself.
  */
-function viewsNamed(sql: string, views: string[]): string[] {
-  if (views.length === 0) return NO_VIEWS;
+function rawWriteRefusal(sql: string): string | null {
+  for (const statement of splitStatements(sql)) {
+    const kind = statementKind(statement);
+    if (kind === "other") {
+      const word = statement.trim().split(/\s+/)[0]?.toUpperCase() ?? "";
+      return `ctx.db.sql in a mutation reads and changes rows; ${word || "this statement"} is refused (schema changes are migrations)`;
+    }
+    if (kind !== "read") {
+      const named = namesIn(statement, ENGINE_TABLES);
+      if (named.length > 0) {
+        return `ctx.db.sql in a mutation writes no table the engine keeps (${named.join(", ")})`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The names of `names` that `sql` holds as a whole word, any case. A
+ * statement reaches a view or a table only by naming it (a view naming
+ * another is reached through the first); a name inside a string
+ * literal counts too, so nothing is missed and more than needed may
+ * be refused.
+ */
+function namesIn(sql: string, names: string[]): string[] {
+  if (names.length === 0) return NO_VIEWS;
   const text = sql.toLowerCase();
-  return views.filter((view) => {
-    const name = view.toLowerCase();
+  return names.filter((candidate) => {
+    const name = candidate.toLowerCase();
     for (
       let at = text.indexOf(name);
       at !== -1;

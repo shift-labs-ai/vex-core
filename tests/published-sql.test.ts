@@ -58,9 +58,6 @@ function plugin(api: VexPluginAPI) {
       await ctx.db.table("keys").insert({ token: "secret" });
       await ctx.db.table("docs").insert({ ownerId: "alice", title: "mine" });
       await ctx.db.table("docs").insert({ ownerId: "bob", title: "his" });
-      await ctx.db.sql(
-        "CREATE VIEW IF NOT EXISTS key_view AS SELECT token FROM keys",
-      );
     },
   });
   api.registerMutation("key", {
@@ -77,6 +74,10 @@ async function boot(storage: StorageAdapter = sqliteAdapter(":memory:")) {
   const vex = await Vex.create({ plugins: [plugin], storage });
   open.push(vex);
   await vex.mutate("ps.seed", {});
+  // Schema is not a mutation's to change: the view is the setup's.
+  await vex.unsafeSql(
+    "CREATE VIEW IF NOT EXISTS key_view AS SELECT token FROM keys",
+  );
   return vex;
 }
 

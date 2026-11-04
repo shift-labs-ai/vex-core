@@ -276,27 +276,6 @@ describe("the views a held read is checked against are the schema's own", () => 
     ).rejects.toThrow("through a view (late)");
   });
 
-  test("a view created by a mutation's raw SQL is seen", async () => {
-    const vex = await create({
-      plugins: [
-        plugin,
-        (api: VexPluginAPI) => {
-          api.setName("ddl");
-          api.registerMutation("view", {
-            args: {},
-            handler: (ctx) =>
-              ctx.db.sql("CREATE VIEW by_mutation AS SELECT * FROM items"),
-          });
-        },
-      ],
-    });
-    await vex.query("bp.raw", { reads: held, sql: "SELECT 1 FROM items" });
-    await vex.mutate("ddl.view", {});
-    await expect(
-      vex.query("bp.raw", { reads: held, sql: "SELECT * FROM by_mutation" }),
-    ).rejects.toThrow("through a view (by_mutation)");
-  });
-
   test("a name that only contains a view's name is not the view", async () => {
     const vex = await create();
     await vex.unsafeSql("CREATE VIEW it AS SELECT * FROM items");
@@ -627,5 +606,53 @@ describe("time and chance are the context's, and a query's time is reactive", ()
     stop();
     await Bun.sleep(1100);
     expect(heard).toHaveLength(1);
+  });
+});
+
+describe("a mutation's raw SQL reads and changes rows, nothing else", () => {
+  const raw = (api: VexPluginAPI) => {
+    api.setName("rw");
+    api.registerMutation("run", {
+      args: { sql: "string" },
+      handler: (ctx, args) => ctx.db.sql(args.sql),
+    });
+  };
+
+  test("DML on the app's tables runs", async () => {
+    const vex = await create({ plugins: [plugin, raw] });
+    await vex.mutate("rw.run", {
+      sql: "INSERT INTO items (_id, scope, n) VALUES ('r1', 'a', 1)",
+    });
+    await vex.mutate("rw.run", {
+      sql: "UPDATE items SET n = 2 WHERE _id = 'r1'",
+    });
+    await vex.mutate("rw.run", {
+      sql: "WITH t AS (SELECT 'r1' AS id) DELETE FROM items WHERE _id IN (SELECT id FROM t)",
+    });
+    expect(await vex.query("bp.count", { scope: "a", extra: null })).toBe(0);
+  });
+
+  test("schema, PRAGMA, attachments, transaction control and the engine's tables are refused, and nothing commits", async () => {
+    const vex = await create({ plugins: [plugin, raw] });
+    for (const sql of [
+      "CREATE VIEW v AS SELECT * FROM items",
+      "DROP TABLE items",
+      "ALTER TABLE items ADD COLUMN x TEXT",
+      "PRAGMA writable_schema = 1",
+      "ATTACH DATABASE ':memory:' AS other",
+      "BEGIN",
+      "COMMIT",
+      "SAVEPOINT s",
+      "VACUUM",
+      "INSERT INTO items (_id, scope, n) VALUES ('ok', 'a', 1); DROP TABLE items",
+    ]) {
+      await expect(vex.mutate("rw.run", { sql })).rejects.toThrow(
+        "ctx.db.sql in a mutation reads and changes rows",
+      );
+    }
+    await expect(
+      vex.mutate("rw.run", { sql: "DELETE FROM _jobs" }),
+    ).rejects.toThrow("writes no table the engine keeps (_jobs)");
+    expect(await vex.query("bp.count", { scope: "a", extra: null })).toBe(0);
   });
 });
