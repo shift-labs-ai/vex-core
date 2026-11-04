@@ -15,10 +15,12 @@ import type { ReactiveBudget, VexEnv, VexUser } from "./types.js";
  * flight, delivery, writes, actions.
  *
  * A run's answer crosses back as a copy, which costs the main thread;
- * a run cheaper than that is cheaper here. So the pool takes a query's
- * runs, subscriptions' and one-shot calls' alike, once they cost more
- * than `offloadAboveMs`, measured over its recent runs wherever they
- * ran, and hands them back once they cost under half of it.
+ * a run cheaper than that is cheaper there. So the pool takes a
+ * query's runs, subscriptions' and one-shot calls' alike, once they
+ * cost more than `offloadAboveMs`, and hands them back once they cost
+ * under half of it. A run is measured in a worker, where it runs
+ * alone: the pool takes a query's first run to measure it, and one in
+ * every few of a query it handed back, to measure it again.
  */
 export interface EvaluationOptions {
   /** How many workers read; none reads on the main thread. */

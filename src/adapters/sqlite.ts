@@ -126,8 +126,9 @@ export interface SqliteOptions {
    * Open the database to read only: another adapter owns its writes
    * and its schema. `ensureTable` registers each table's schema and
    * refuses one the database lacks; every write refuses; planner
-   * statistics are read, never gathered. What the other adapter
-   * commits is visible to each read after it.
+   * statistics are read, never gathered; reads run on its one
+   * connection. What the other adapter commits is visible to each
+   * read after it.
    */
   readonly?: boolean;
 }
@@ -242,7 +243,9 @@ export function sqliteAdapter(
       // with them.
       gatherStatistics(db);
     }
-    readConnections = openReadConnections(path, opts);
+    // The pool keeps reads off a writer's open transaction; a read-only
+    // adapter has none, so it reads on its one connection.
+    readConnections = readonly ? [] : openReadConnections(path, opts);
   } catch (error) {
     db.close();
     throw error;

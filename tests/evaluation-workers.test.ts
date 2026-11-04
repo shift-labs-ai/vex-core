@@ -261,7 +261,9 @@ describe("evaluation workers", () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ code: "NOT_YOURS" });
     // Its body crosses as HTTP would send it, its JSON reading, even
-    // when it holds what a thread boundary cannot copy.
+    // when it holds what a thread boundary cannot copy. Read first,
+    // then matched: Bun 1.4.2's `expect(p).rejects` does not settle on a
+    // worker's reply after an earlier one in the same test.
     expect(
       await vex.query("ev.forbiddenOddly").catch((e: unknown) => e),
     ).toMatchObject({ status: 403, body: { code: "NOT_YOURS" } });
@@ -271,34 +273,66 @@ describe("evaluation workers", () => {
     });
   });
 
-  test("the pool takes a query once its runs cost past offloadAboveMs, and hands it back once they cost under half", async () => {
+  test("a query's first run is measured in the pool; a cheap one stays here, measured again one run in 32", async () => {
     const vex = await create(1, { offloadAboveMs: 5 });
     const ran = () => meta("query").at(-1)?.offThread === true;
-    // Cheap: here, always.
-    for (let i = 0; i < 3; i++) await vex.query("ev.names", { scope: "a" });
-    expect(ran()).toBe(false);
-    // Costly: its first run here measures it; the next goes to the pool.
-    await vex.query("ev.slow", { ms: 20 });
-    expect(ran()).toBe(false);
-    await vex.query("ev.slow", { ms: 20 });
+    await vex.query("ev.names", { scope: "a" });
     expect(ran()).toBe(true);
-    // Cheap again: its average falls a third of the way each run, and
-    // under 2.5 ms it returns here.
-    let back = 0;
-    for (let i = 0; i < 12 && ran(); i++) {
+    const here: boolean[] = [];
+    for (let i = 0; i < 31; i++) {
+      await vex.query("ev.names", { scope: "a" });
+      here.push(!ran());
+    }
+    expect(here.every(Boolean)).toBe(true);
+    await vex.query("ev.names", { scope: "a" });
+    expect(ran()).toBe(true);
+    await vex.query("ev.names", { scope: "a" });
+    expect(ran()).toBe(false);
+  });
+
+  test("a costly query stays in the pool, and comes back once its runs cost under half of offloadAboveMs", async () => {
+    const vex = await create(1, { offloadAboveMs: 5 });
+    const ran = () => meta("query").at(-1)?.offThread === true;
+    for (let i = 0; i < 3; i++) {
+      await vex.query("ev.slow", { ms: 20 });
+      expect(ran()).toBe(true);
+    }
+    // Its average falls a third of the way each run, and under 2.5 ms
+    // it returns here.
+    let runs = 0;
+    while (ran() && runs < 12) {
       await vex.query("ev.slow", { ms: 0 });
-      back = i + 1;
+      runs++;
     }
     expect(ran()).toBe(false);
-    expect(back).toBeGreaterThan(1);
+    expect(runs).toBeGreaterThan(1);
+  });
+
+  test("a cheap query kept here moves to the pool once a measuring run finds it costly", async () => {
+    const vex = await create(1, { offloadAboveMs: 5 });
+    const ran = () => meta("query").at(-1)?.offThread === true;
+    await vex.query("ev.slow", { ms: 0 });
+    for (let i = 0; i < 31; i++) await vex.query("ev.slow", { ms: 0 });
+    expect(ran()).toBe(false);
+    // The 32nd run here is measured in the pool, and it has grown.
+    await vex.query("ev.slow", { ms: 20 });
+    expect(ran()).toBe(true);
+    await vex.query("ev.slow", { ms: 20 });
+    expect(ran()).toBe(true);
   });
 
   test("a subscription's runs follow the same rule", async () => {
     const vex = await create(1, { offloadAboveMs: 5 });
+    await vex.subscribe("ev.names", { scope: "a" }, () => {});
+    expect(meta("subscribe").at(-1)?.offThread).toBe(true);
     await vex.subscribe("ev.slow", { ms: 20 }, () => {});
-    expect(meta("subscribe").at(-1)?.offThread).toBe(false);
+    expect(meta("subscribe").at(-1)?.offThread).toBe(true);
+    spans.length = 0;
     await vex.mutate("ev.add", { scope: "a", name: "one" });
-    expect(meta("invalidation").at(-1)?.offThread).toBe(1);
+    // Both re-run: the cheap one here, the costly one in the pool.
+    expect(meta("invalidation").at(-1)).toEqual(
+      expect.objectContaining({ affectedGroups: 2, offThread: 1 }),
+    );
   });
 
   test("under purityCheck every read runs here, where the check repeats it", async () => {

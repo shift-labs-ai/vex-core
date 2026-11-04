@@ -657,10 +657,12 @@ export class Vex<A = unknown> {
   private pendingInvalidation: PendingInvalidation | null = null;
   private evaluation: EvaluationPool | null = null;
   // What a query's runs cost, in ms, averaged over its recent runs
-  // wherever they ran; and the queries whose runs the pool takes
-  // (`poolFor`, `noteCost`).
+  // in a worker; the queries whose runs the pool takes; and, for each
+  // kept here, its runs since one was last measured (`poolFor`,
+  // `noteCost`).
   private readonly readCost = new Map<string, number>();
   private readonly offloading = new Set<string>();
+  private readonly runsHere = new Map<string, number>();
   private offloadAboveMs = 2;
   private announcingStorage: StorageAdapter | null = null;
   // Groups whose answers hold until a time (`clockUntil`), and the one
@@ -1704,18 +1706,35 @@ export class Vex<A = unknown> {
       return Promise.reject(error);
     }
     return this.trace("query", name, parent, async (ectx) => {
-      const ctx = this.buildQueryContext(ectx, user, tracking);
-      const result = await this.runMiddleware(
-        ctx,
-        { type: "query", name, args, access: reg.def.access },
-        () => reg.def.handler(ctx, args),
-        ectx,
-      );
+      const result = await this.runRead(reg, name, args, user, ectx, tracking);
       return reading(
         result,
         checkedAnswer(`query ${name}`, reg.returns, result),
       );
     });
+  }
+
+  /**
+   * One run of query `name`: its handler inside every middleware, as
+   * `user`, what it reads recorded where `tracking` says. Every read
+   * runs through it, a one-shot call's, a subscription's, a worker's
+   * and a composed one's: they differ only in where they record.
+   */
+  private runRead(
+    reg: RegisteredQuery,
+    name: string,
+    args: Readonly<Record<string, any>>,
+    user: VexUser | null | undefined,
+    ectx: ExecContext,
+    tracking?: QueryTracking,
+  ): Promise<unknown> {
+    const ctx = this.buildQueryContext(ectx, user, tracking);
+    return this.runMiddleware(
+      ctx,
+      { type: "query", name, args, access: reg.def.access },
+      () => reg.def.handler(ctx, args),
+      ectx,
+    );
   }
 
   private trackQueryBuilder(
@@ -2435,35 +2454,30 @@ export class Vex<A = unknown> {
     reg: RegisteredQuery,
     ectx: ExecContext,
   ): Promise<{ result: unknown; measurement: ReactiveMeasurement }> {
-    const info: MiddlewareInfo<any> = {
-      type: "query",
-      name: group.queryName,
-      args: group.args,
-      access: reg.def.access,
-    };
     let result: unknown;
     do {
       group.stale = false;
-      const began = performance.now();
       result = await this.checkedRun(group.queryName, async () => {
+        // Recorded into the group as the run reads, so a write
+        // meanwhile is judged by what it has read so far.
         group.tables = new Set();
         group.dependencies = [];
         const reads = new Set<string>();
-        const ctx = this.buildQueryContext(ectx, group.user, {
-          tables: group.tables,
-          dependencies: group.dependencies,
-          callerReads: reads,
-        });
-        const answer = await this.runMiddleware(
-          ctx,
-          info,
-          () => reg.def.handler(ctx, group.args),
+        const answer = await this.runRead(
+          reg,
+          group.queryName,
+          group.args,
+          group.user,
           ectx,
+          {
+            tables: group.tables,
+            dependencies: group.dependencies,
+            callerReads: reads,
+          },
         );
         group.reads = reads;
         return answer;
       });
-      this.noteCost(group.queryName, performance.now() - began);
     } while (group.stale);
     const json = checkedAnswer(`query ${group.queryName}`, reg.returns, result);
     return { result, measurement: this.measureReactiveResult(result, json) };
@@ -2511,24 +2525,13 @@ export class Vex<A = unknown> {
     const tables = new Set<string>();
     const dependencies: QueryDependency[] = [];
     const callerReads = new Set<string>();
-    const result = await this.trace("evaluate", request.name, null, (ectx) => {
-      const ctx = this.buildQueryContext(ectx, request.user, {
+    const result = await this.trace("evaluate", request.name, null, (ectx) =>
+      this.runRead(reg, request.name, args, request.user, ectx, {
         tables,
         dependencies,
         callerReads,
-      });
-      return this.runMiddleware(
-        ctx,
-        {
-          type: "query",
-          name: request.name,
-          args,
-          access: reg.def.access,
-        },
-        () => reg.def.handler(ctx, args),
-        ectx,
-      );
-    });
+      }),
+    );
     const json = checkedAnswer(`query ${request.name}`, reg.returns, result);
     return {
       result,
@@ -2541,25 +2544,40 @@ export class Vex<A = unknown> {
   }
 
   /**
-   * The pool that takes `name`'s runs, or null when they run here: a
-   * pool there is, no `purityCheck` repeats runs on this thread, and
-   * the query's runs cost past `offloadAboveMs` (`offloading`).
+   * The pool that takes this run of `name`, or null when it runs here.
+   * A run is measured only in a worker, which runs one at a time: on
+   * this thread runs interleave, so their times say little. So the
+   * pool takes a run of a query not yet measured, of one whose runs
+   * cost past `offloadAboveMs` (`offloading`), and one in every
+   * `REMEASURE_EVERY` of a query kept here, which measures it again.
+   * Under `purityCheck`, which repeats runs on this thread, every run
+   * is here.
    */
   private poolFor(name: string): EvaluationPool | null {
     if (!this.evaluation || this.purity > 0) return null;
-    if (this.offloadAboveMs === 0 || this.offloading.has(name)) {
+    if (
+      this.offloadAboveMs === 0 ||
+      this.offloading.has(name) ||
+      !this.readCost.has(name)
+    ) {
       return this.evaluation;
     }
-    return null;
+    const runs = (this.runsHere.get(name) ?? 0) + 1;
+    if (runs < REMEASURE_EVERY) {
+      this.runsHere.set(name, runs);
+      return null;
+    }
+    this.runsHere.delete(name);
+    return this.evaluation;
   }
 
   /**
-   * A run of `name` took `ms`: its average moves a third of the way
-   * there. Past `offloadAboveMs` the pool takes its runs; under half
-   * of it they return here, so a query near the line does not flap.
+   * A run of `name` in a worker took `ms`: its average moves a third
+   * of the way there. Past `offloadAboveMs` the pool takes its runs;
+   * under half of it they return here, so a query near the line does
+   * not flap.
    */
   private noteCost(name: string, ms: number): void {
-    if (!this.evaluation) return;
     const before = this.readCost.get(name);
     const cost = before === undefined ? ms : before + (ms - before) / 3;
     this.readCost.set(name, cost);
@@ -2994,20 +3012,9 @@ export class Vex<A = unknown> {
       }
       const tables = recording ? new Set<string>() : undefined;
       const dependencies = recording ? ([] as QueryDependency[]) : undefined;
-      const began = performance.now();
-      const result = await this.checkedRun(name, () => {
-        const ctx = this.buildQueryContext(ectx, user, {
-          tables,
-          dependencies,
-        });
-        return this.runMiddleware(
-          ctx,
-          { type: "query", name, args, access: reg.def.access },
-          () => reg.def.handler(ctx, args),
-          ectx,
-        );
-      });
-      this.noteCost(name, performance.now() - began);
+      const result = await this.checkedRun(name, () =>
+        this.runRead(reg, name, args, user, ectx, { tables, dependencies }),
+      );
       const json = checkedAnswer(`query ${name}`, reg.returns, result);
       if (tables && dependencies) {
         recordRead(meta, reg.plugin, {
@@ -3546,6 +3553,10 @@ function parseSchedule(schedule: string): number {
 }
 
 const NONE: string[] = [];
+
+/** One run in this many of a query kept here is measured in a worker. */
+const REMEASURE_EVERY = 32;
+
 // The services of an app that gives none: its types then require none
 // (`HostOptions`).
 const NO_SERVICES = Object.freeze({}) as VexServices;
