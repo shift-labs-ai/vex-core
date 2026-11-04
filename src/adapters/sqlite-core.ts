@@ -1,4 +1,3 @@
-import * as ambient from "../core/ambient.js";
 import { id as generateId } from "../core/id.js";
 import {
   changesRows,
@@ -465,7 +464,7 @@ function sqliteObjectExists(db: SqliteDriver, name: string): boolean {
 }
 
 function rebuildTempTableName(db: SqliteDriver, name: string): string {
-  const base = `__vex_rebuild_${name}_${ambient.now()}`;
+  const base = `__vex_rebuild_${name}_${Date.now()}`;
   let candidate = base;
   let counter = 0;
   while (sqliteObjectExists(db, candidate)) {

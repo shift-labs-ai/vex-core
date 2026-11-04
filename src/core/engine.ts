@@ -5,7 +5,6 @@ import {
   publishedGovernedError,
   UNRESTRICTED,
 } from "./access.js";
-import * as ambient from "./ambient.js";
 import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
 import {
@@ -16,14 +15,11 @@ import {
   workersAvailable,
 } from "./evaluation.js";
 import {
-  assertGuarded,
   type FrameKind,
-  GuardError,
   inFrame,
-  installGuards,
   outsideFrame,
   refuseReentry,
-} from "./guards.js";
+} from "./frames.js";
 import { holdStatement } from "./held-read.js";
 import { id as generateId } from "./id.js";
 import { INTERNAL_TABLES } from "./internal.js";
@@ -474,7 +470,7 @@ interface PendingInvalidation {
 const nextTurn: () => Promise<void> =
   typeof setImmediate === "function"
     ? () => new Promise((resolve) => setImmediate(resolve))
-    : () => new Promise((resolve) => ambient.setTimeout(resolve, 0));
+    : () => new Promise((resolve) => setTimeout(resolve, 0));
 
 interface JobRunResult {
   status: "ok" | "error";
@@ -644,12 +640,6 @@ export class Vex<A = unknown> {
   static async create<A = undefined>(
     options: VexOptions<NoInfer<A>>,
   ): Promise<Vex<NoInfer<A>>> {
-    // Where node's built-in modules are not the app's to import, the
-    // globals are all there is, and guarding them here holds.
-    if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
-      installGuards();
-    }
-    await assertGuarded();
     const vex = new Vex<A>(options.storage);
     if (options.tracer) vex.tracer = options.tracer;
     if (options.appId) vex.appId = options.appId;
@@ -787,7 +777,7 @@ export class Vex<A = unknown> {
           await this.storage.insert("_migrations", {
             _id: generateId(12),
             migrationId: migration.id,
-            appliedAt: ambient.now(),
+            appliedAt: Date.now(),
           });
         }),
       );
@@ -831,12 +821,12 @@ export class Vex<A = unknown> {
   ) {
     if (this.jobScheduler !== "timers" || this.cronTimers.has(cronName)) return;
     const run = () => this.executeJob(cronName, job);
-    const first = ambient.setTimeout(
+    const first = setTimeout(
       () => {
-        this.cronTimers.set(cronName, ambient.setInterval(run, ms));
+        this.cronTimers.set(cronName, setInterval(run, ms));
         run();
       },
-      Math.max(0, firstRun - ambient.now()),
+      Math.max(0, firstRun - Date.now()),
     );
     this.cronTimers.set(cronName, first);
   }
@@ -880,10 +870,7 @@ export class Vex<A = unknown> {
     // A pending run survives a restart: the job runs when it was due, or
     // one interval from now if that is sooner.
     const nextRun = enabled
-      ? Math.min(
-          existing?.nextRun ?? Number.POSITIVE_INFINITY,
-          ambient.now() + ms,
-        )
+      ? Math.min(existing?.nextRun ?? Number.POSITIVE_INFINITY, Date.now() + ms)
       : null;
     const row = {
       plugin,
@@ -932,7 +919,7 @@ export class Vex<A = unknown> {
       if (!row) throw new Error(`Job not found in DB: ${name}`);
 
       if (enabled && ms > 0) {
-        const nextRun = ambient.now() + ms;
+        const nextRun = Date.now() + ms;
         await this.storage.update("_jobs", row._id, { enabled: 1, nextRun });
         if (this.isCurrentJob(name, handler)) {
           this.startJobTimer(name, handler, ms, nextRun);
@@ -973,7 +960,7 @@ export class Vex<A = unknown> {
     cronName: string,
     job: JobDef,
   ): Promise<JobRunResult> {
-    const startTime = ambient.now();
+    const startTime = Date.now();
     const timeoutMs = job.timeoutMs ?? 0;
     const maxRetries = job.retries ?? 0;
     const retryDelay = job.retryDelayMs ?? 1000;
@@ -1018,7 +1005,7 @@ export class Vex<A = unknown> {
         if (timeoutMs > 0) {
           let timer: ReturnType<typeof setTimeout> | undefined;
           const timeout = new Promise<never>((_, reject) => {
-            timer = ambient.setTimeout(
+            timer = setTimeout(
               () =>
                 reject(
                   new Error(`Job ${cronName} timed out after ${timeoutMs}ms`),
@@ -1038,7 +1025,7 @@ export class Vex<A = unknown> {
         const result: JobRunResult = {
           status: "ok",
           error: null,
-          durationMs: ambient.now() - startTime,
+          durationMs: Date.now() - startTime,
         };
         if (row) {
           await this.storage.update("_jobs", row._id, {
@@ -1058,7 +1045,7 @@ export class Vex<A = unknown> {
         lastResult = {
           status: "error",
           error: errMsg,
-          durationMs: ambient.now() - startTime,
+          durationMs: Date.now() - startTime,
         };
         if (row) {
           await this.storage.update("_jobs", row._id, {
@@ -1074,7 +1061,7 @@ export class Vex<A = unknown> {
 
         // A closed engine starts no further attempt.
         if (attempt < maxRetries && !this.closing) {
-          await new Promise((r) => ambient.setTimeout(r, retryDelay));
+          await new Promise((r) => setTimeout(r, retryDelay));
         }
         if (this.closing) break;
       }
@@ -1102,7 +1089,7 @@ export class Vex<A = unknown> {
    * into one.
    */
   async runDueJobs(
-    now = ambient.now(),
+    now = Date.now(),
   ): Promise<Array<JobRunResult & { name: string }>> {
     this.assertOpen();
     const results: Array<JobRunResult & { name: string }> = [];
@@ -1345,7 +1332,7 @@ export class Vex<A = unknown> {
             "ctx.now(resolutionMs): a whole number of milliseconds, at least 1000",
           );
         }
-        const at = Math.floor(ambient.now() / resolutionMs) * resolutionMs;
+        const at = Math.floor(Date.now() / resolutionMs) * resolutionMs;
         dependencies?.push({ table: CLOCK, until: at + resolutionMs });
         return at;
       },
@@ -1509,12 +1496,12 @@ export class Vex<A = unknown> {
     writes?: WriteDependency[],
   ): MutationContext {
     const self = this;
-    const began = ambient.now();
+    const began = Date.now();
     return {
       now: () => began,
       id: () => generateId(),
       random: () => {
-        const bytes = ambient.randomBytes(7);
+        const bytes = crypto.getRandomValues(new Uint8Array(7));
         // 53 random bits over 2^53.
         let n = bytes[0]! & 0x1f;
         for (let i = 1; i < 7; i++) n = n * 256 + bytes[i]!;
@@ -1676,7 +1663,7 @@ export class Vex<A = unknown> {
     return Promise.race([
       promise,
       new Promise<never>((_, reject) =>
-        ambient.setTimeout(
+        setTimeout(
           () =>
             reject(
               new Error(`Handler timed out after ${this.handlerTimeoutMs}ms`),
@@ -2364,14 +2351,14 @@ export class Vex<A = unknown> {
    * context tracks.
    */
   private async checkedRun<T>(name: string, run: () => Promise<T>): Promise<T> {
-    if (this.purity === 0 || ambient.random() >= this.purity) return run();
+    if (this.purity === 0 || Math.random() >= this.purity) return run();
     return this.storage.transaction(async () => {
       const first = await run();
       const second = await run();
       const a = serializeJson(first, `query ${name} answers`).serialized;
       const b = serializeJson(second, `query ${name} answers`).serialized;
       if (a !== b) {
-        throw new GuardError(
+        throw new PurityError(
           `query ${name} answered two ways on the same data: its answer depends on state its context does not track, such as a module's variables`,
         );
       }
@@ -2384,14 +2371,14 @@ export class Vex<A = unknown> {
     affected: ReadonlySet<SubscriptionGroup>,
   ): SubscriptionGroup[] {
     if (this.purity === 0) return [];
-    const at = ambient.now();
+    const at = Date.now();
     return [...this.groups.values()].filter(
       (group) =>
         !affected.has(group) &&
         !group.run &&
         group.last !== null &&
         !(group.clockUntil !== undefined && group.clockUntil <= at) &&
-        ambient.random() < this.purity,
+        Math.random() < this.purity,
     );
   }
 
@@ -2413,7 +2400,7 @@ export class Vex<A = unknown> {
       // A failure is the next write's to report, as any run's is.
       return;
     }
-    const error = new GuardError(
+    const error = new PurityError(
       `query ${group.queryName} answered differently though nothing it read changed: its answer depends on state its context does not track (or a change went unseen)`,
     );
     const members = [...group.members];
@@ -2448,9 +2435,9 @@ export class Vex<A = unknown> {
     this.clockTimer = null;
     this.clockAt = soonest;
     if (this.closing || soonest === Number.POSITIVE_INFINITY) return;
-    this.clockTimer = ambient.setTimeout(
+    this.clockTimer = setTimeout(
       () => void this.clockTick(),
-      Math.max(0, soonest - ambient.now()),
+      Math.max(0, soonest - Date.now()),
     );
   }
 
@@ -2459,7 +2446,7 @@ export class Vex<A = unknown> {
     this.clockTimer = null;
     this.clockAt = Number.POSITIVE_INFINITY;
     if (this.closing) return;
-    const at = ambient.now();
+    const at = Date.now();
     const due = [...this.clockGroups].filter(
       (group) => group.clockUntil !== undefined && group.clockUntil <= at,
     );
@@ -3118,4 +3105,9 @@ function namesIn(sql: string, names: string[]): string[] {
     }
     return false;
   });
+}
+
+/** A query that answered differently from the same data (`purityCheck`). */
+export class PurityError extends Error {
+  override readonly name = "PurityError";
 }

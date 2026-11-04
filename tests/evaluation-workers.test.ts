@@ -93,14 +93,6 @@ describe("evaluation workers", () => {
     for (const answer of seen) expect("missing" in answer).toBe(false);
   });
 
-  test("a run in a worker is guarded as the main thread's is", async () => {
-    const vex = await create();
-    // With workers and no caller to keep it here, a run is a worker's.
-    await expect(vex.subscribe("ev.chance", {}, () => {})).rejects.toThrow(
-      "Math.random is refused in query ev.chance",
-    );
-  });
-
   test("a run in a worker that read the time is re-run by the main thread's clock", async () => {
     const vex = await create();
     const heard: number[] = [];

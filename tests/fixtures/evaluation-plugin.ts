@@ -76,11 +76,6 @@ export function evaluationPlugin(api: VexPluginAPI) {
     reactive: { maxRows: 2, maxBytes: 10_000 },
     handler: (ctx) => ctx.db.table("items").all(),
   });
-  // Chance drawn in a query: refused, in a worker as on the main thread.
-  api.registerQuery("chance", {
-    args: {},
-    handler: () => Math.random(),
-  });
   // The time to the second: re-run by the clock.
   api.registerQuery("second", {
     args: {},

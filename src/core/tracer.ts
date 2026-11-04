@@ -1,4 +1,3 @@
-import * as ambient from "./ambient.js";
 import { id } from "./id.js";
 
 export interface Span {
@@ -82,8 +81,8 @@ function makeSpan(
   name: string,
 ): SpanHandle {
   const spanId = id(8);
-  const start = ambient.monotonic();
-  const startTime = ambient.now();
+  const start = performance.now();
+  const startTime = Date.now();
   let ended = false;
   return {
     spanId,
@@ -98,7 +97,7 @@ function makeSpan(
         type,
         name,
         startTime,
-        duration: Math.round(ambient.monotonic() - start),
+        duration: Math.round(performance.now() - start),
         status,
         error: opts?.error ?? null,
         meta: opts?.meta ? JSON.stringify(opts.meta) : null,

@@ -1,6 +1,5 @@
 import { Database } from "bun:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
-import * as ambient from "../core/ambient.js";
 import {
   leadingSqlKeyword,
   mayChangeSchema,
@@ -382,14 +381,14 @@ export function sqliteAdapter(
   function statisticsAfterSchemaChange(): void {
     if (statisticsDue || closed || readonly) return;
     statisticsDue = transactionContext.exit(() =>
-      ambient.setTimeout(() => {
+      setTimeout(() => {
         statisticsDue = undefined;
         void refreshStatistics();
       }, 0),
     );
   }
   const statisticsTimer = transactionContext.exit(() =>
-    ambient.setInterval(
+    setInterval(
       () => void refreshStatistics(),
       opts?.statisticsIntervalMs ?? SQLITE_STATISTICS_INTERVAL_MS,
     ),

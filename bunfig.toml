@@ -1,8 +1,3 @@
-# The handler guards load before anything else (src/core/guards.ts):
-# an engine refuses to start without them.
-preload = ["./src/guard.ts"]
-
 [test]
-preload = ["./src/guard.ts"]
 # tests/workers/ runs in workerd through vitest (bun run test:workers).
 pathIgnorePatterns = ["tests/workers/**"]

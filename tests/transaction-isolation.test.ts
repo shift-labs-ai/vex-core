@@ -4,7 +4,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
-import { setTimeout as ambientTimeout } from "../src/core/ambient.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 
@@ -20,9 +19,8 @@ afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
-/** The engine's own timer (ambient.ts): a handler's is refused. */
 function sleep(ms: number) {
-  return new Promise<void>((resolve) => ambientTimeout(resolve, ms));
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
 function peerValues(): string[] {

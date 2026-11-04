@@ -18,7 +18,6 @@ import { mkdtempSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
-import * as ambient from "../src/core/ambient.js";
 import type { StorageAdapter } from "../src/core/storage.js";
 
 let tmp = "";
@@ -210,9 +209,8 @@ describe("SQLite planner statistics", () => {
   });
 
   test("closing stops the refresh", async () => {
-    // The adapter schedules through the engine's own timers.
-    const intervals = spyOn(ambient, "setInterval");
-    const timeouts = spyOn(ambient, "setTimeout");
+    const intervals = spyOn(globalThis, "setInterval");
+    const timeouts = spyOn(globalThis, "setTimeout");
     const clearedIntervals = spyOn(globalThis, "clearInterval");
     const clearedTimeouts = spyOn(globalThis, "clearTimeout");
     try {

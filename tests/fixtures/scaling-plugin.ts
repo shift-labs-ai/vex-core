@@ -7,7 +7,6 @@
 
 import type { TableAccessPolicy } from "../../src/core/access.js";
 import { UNRESTRICTED } from "../../src/core/access.js";
-import { setTimeout as ambientTimeout } from "../../src/core/ambient.js";
 import type { VexPluginAPI } from "../../src/core/api.js";
 
 /**
@@ -77,10 +76,8 @@ export function scalingPlugin(api: VexPluginAPI) {
         .where("scope", "=", args.scope)
         .all()) as Array<{ n: number; version: number }>;
       const slowMs = await knob(ctx.db, "slowMs");
-      // A slow run, for a test: the engine's own timer, since a
-      // handler's is refused (guards.ts).
       if (slowMs > 0)
-        await new Promise((resolve) => ambientTimeout(resolve, slowMs));
+        await new Promise((resolve) => setTimeout(resolve, slowMs));
       if (await knob(ctx.db, "fail"))
         throw new Error("sum fails while told to");
       return {

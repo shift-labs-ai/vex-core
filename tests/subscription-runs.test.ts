@@ -11,7 +11,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
-import { outsideFrame } from "../src/core/guards.js";
+import { outsideFrame } from "../src/core/frames.js";
 
 let open: Vex[] = [];
 /** Runs after the list query's read, before it answers. */

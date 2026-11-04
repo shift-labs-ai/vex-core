@@ -253,8 +253,9 @@ export interface QueryContext {
   /**
    * The time, to `resolutionMs` (a whole number, at least 1000): the
    * start of the current interval of that length. The query depends
-   * on it: a subscription re-runs when the next interval begins. The
-   * clock is read only here; `Date.now` and its kin are refused.
+   * on it: a subscription re-runs when the next interval begins. A
+   * query reading the clock any other way (`Date.now`) depends on it
+   * untracked: its subscriptions go stale, and `purityCheck` says so.
    */
   now(resolutionMs: number): number;
   user?: VexUser | null;
