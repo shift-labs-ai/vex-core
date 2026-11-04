@@ -3150,9 +3150,10 @@ export class Vex<A = unknown> {
   /**
    * Closes the engine. From the call on it refuses job changes, job runs
    * and subscriptions, and no timer starts a job or a scheduled
-   * function. The scheduled functions under way finish, job changes in
-   * flight finish without arming a timer, running jobs settle, and then
-   * storage closes. Calling it again returns the same promise.
+   * function. A scheduled function under way finishes and no later
+   * one starts, job changes in flight finish without arming a timer,
+   * running jobs settle, and then storage closes. Calling it again
+   * returns the same promise.
    */
   close(): Promise<void> {
     if (!this.closing) {

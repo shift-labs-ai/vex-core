@@ -687,6 +687,7 @@ const tracer: Tracer = {
 Core metadata describes query and write structure without recording filter values, row values, handler arguments, or results. Core emits spans to the tracer but does not persist them automatically; it reserves the internal `_spans` table for apps that choose SQLite persistence. Retention remains app-specific. For a long-running server that writes `_spans`, register bounded cleanup: a job, which writes through a mutation.
 
 ```ts
+// In a plugin named "app".
 api.registerMutation("dropOldSpans", {
   args: { before: Type.Number() },
   handler: (ctx, args) =>
@@ -713,7 +714,7 @@ Age retention alone is not a hard volume bound. Production sinks should also cap
 | Entry | Contents |
 |-------|----------|
 | `vex-core` | `Vex`, `sqliteAdapter`, `durableObjectAdapter`, `id`, core types, tracer, `RateLimiter`. Under the `workerd` condition, everything but `sqliteAdapter` and `config` |
-| `vex-core/framework` | `table`, `query`, `mutation`, `action`, `webhook`, `job`, `middleware`, `scanDirectory` |
+| `vex-core/framework` | `table`, `query`, `mutation`, `action`, `webhook`, `job`, `middleware`, `scanDirectory`, `Type` |
 | `vex-core/http` | `Router`, `createRouter`, `HttpError`, `compose`, `vexHandler`, static handlers (`serveDir`, `serveFile`), plus middleware (`cors`, `bearerAuth`, `bodyParser`, `accessLog`, `requestId`, `rateLimit`, `errorBoundary`, `sessions`) |
 | `vex-core/client` | `VexProvider`, `useQuery`, `useMutation` |
 | `vex-core/adapters/sqlite` | `sqliteAdapter` |

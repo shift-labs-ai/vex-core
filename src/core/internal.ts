@@ -10,6 +10,7 @@ export const INTERNAL_TABLES: Record<string, StoredTableSchema> = {
     },
     unique: [["migrationId"]],
   },
+  // Each span an app's tracer keeps (README, "Observability").
   _spans: {
     columns: {
       traceId: { type: "string", index: true },

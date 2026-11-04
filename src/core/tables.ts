@@ -67,7 +67,8 @@ export function storedTable(
 const COLUMN_WORDS: ProblemWords = {
   undeclared: (column) => `has no column ${JSON.stringify(column)}`,
   missing: (column) => `needs column ${JSON.stringify(column)}`,
-  refused: (path, message) => `column ${JSON.stringify(path[0])}: ${message}`,
+  refused: (path, message) =>
+    `column ${JSON.stringify(path[0])}${path.length > 1 ? ` at /${path.slice(1).join("/")}` : ""}: ${message}`,
 };
 
 /** The checks writes to a table pass. */
