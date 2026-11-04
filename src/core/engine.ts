@@ -143,6 +143,8 @@ interface SubscriptionGroup {
    * Every member is alike in these (`callerSeen`).
    */
   reads: Set<string> | null;
+  /** Where its family files it (`fileCaller`), while it does. */
+  callerFiling?: { reads: string; seen: string };
   /** When its last run's answer stops holding (`QueryContext.now`). */
   clockUntil?: number;
   /** Filed in the index by its dependencies (`indexGroup`). */
@@ -196,6 +198,25 @@ function callerSeen(
   }
   return canonical(seen);
 }
+
+/** A set of caller fields, spelled one way; `null` (unknown) apart. */
+function readsKey(reads: ReadonlySet<string> | null): string {
+  return reads === null ? "*" : JSON.stringify([...reads].sort());
+}
+
+/**
+ * A query's groups for one set of args: by the caller fields their
+ * runs read, then by what their caller holds in those fields. A
+ * caller finds its group with one lookup per set of fields the
+ * family's runs read, however many callers it holds.
+ */
+type Family = Map<
+  string,
+  {
+    reads: ReadonlySet<string> | null;
+    bySeen: Map<string, Set<SubscriptionGroup>>;
+  }
+>;
 
 /**
  * `user` as a handler sees it, each field it reads recorded in
@@ -597,8 +618,8 @@ export class Vex<A = unknown> {
   private scheduleAt = Number.POSITIVE_INFINITY;
   private scheduledRun: Promise<void> | null = null;
   // Each query with one set of args: its groups, one per set of
-  // callers alike in every field its runs read.
-  private readonly families = new Map<string, Set<SubscriptionGroup>>();
+  // callers alike in every field its runs read (`Family`).
+  private readonly families = new Map<string, Family>();
   private groupSerial = 0;
   // Each plugin table's write checks (tables.ts).
   private readonly rowChecks = new Map<string, RowChecks>();
@@ -2183,10 +2204,57 @@ export class Vex<A = unknown> {
       this.runningGroups.delete(group);
       this.unindexGroup(group);
       this.clockGroups.delete(group);
-      const family = this.families.get(group.family);
-      family?.delete(group);
-      if (family?.size === 0) this.families.delete(group.family);
+      this.unfileCaller(group);
     }
+  }
+
+  /**
+   * Files `group` in its family under what its runs read of its
+   * caller (the whole caller, before a run ends), so a caller alike
+   * in it finds the group by lookup (`joinableGroup`).
+   */
+  private fileCaller(group: SubscriptionGroup): void {
+    this.unfileCaller(group);
+    const at = {
+      reads: readsKey(group.reads),
+      seen: callerSeen(group.user, group.reads),
+    };
+    let family = this.families.get(group.family);
+    if (!family) {
+      family = new Map();
+      this.families.set(group.family, family);
+    }
+    let file = family.get(at.reads);
+    if (!file) {
+      // Its own copy: the set it is keyed by does not move.
+      file = {
+        reads: group.reads && new Set(group.reads),
+        bySeen: new Map(),
+      };
+      family.set(at.reads, file);
+    }
+    let groups = file.bySeen.get(at.seen);
+    if (!groups) {
+      groups = new Set();
+      file.bySeen.set(at.seen, groups);
+    }
+    groups.add(group);
+    group.callerFiling = at;
+  }
+
+  /** Unfiles `group` from where its family filed it. */
+  private unfileCaller(group: SubscriptionGroup): void {
+    const at = group.callerFiling;
+    if (!at) return;
+    group.callerFiling = undefined;
+    const family = this.families.get(group.family);
+    const file = family?.get(at.reads);
+    const groups = file?.bySeen.get(at.seen);
+    if (!family || !file || !groups) return;
+    groups.delete(group);
+    if (groups.size === 0) file.bySeen.delete(at.seen);
+    if (file.bySeen.size === 0) family.delete(at.reads);
+    if (family.size === 0) this.families.delete(group.family);
   }
 
   /**
@@ -2265,6 +2333,8 @@ export class Vex<A = unknown> {
             ? await this.runGroupOffThread(group, this.evaluation)
             : await this.runGroupHere(group, reg, ectx);
         group.last = answer.measurement;
+        // Filed again under what this run read of its caller.
+        if (this.groups.get(group.key) === group) this.fileCaller(group);
         this.rehomeStrangers(group);
         return answer;
       } finally {
@@ -2507,9 +2577,9 @@ export class Vex<A = unknown> {
     family: string,
     user: VexUser | null | undefined,
   ): SubscriptionGroup | undefined {
-    for (const group of this.families.get(family) ?? []) {
-      if (callerSeen(user, group.reads) === callerSeen(group.user, group.reads))
-        return group;
+    for (const file of this.families.get(family)?.values() ?? []) {
+      const groups = file.bySeen.get(callerSeen(user, file.reads));
+      if (groups) for (const group of groups) return group;
     }
     return undefined;
   }
@@ -2538,12 +2608,7 @@ export class Vex<A = unknown> {
       reads: null,
     };
     this.groups.set(group.key, group);
-    let members = this.families.get(family);
-    if (!members) {
-      members = new Set();
-      this.families.set(family, members);
-    }
-    members.add(group);
+    this.fileCaller(group);
     return group;
   }
 
@@ -3250,6 +3315,7 @@ export class Vex<A = unknown> {
     await Promise.allSettled([...this.runningJobs.values()]);
     this.subscriptions.clear();
     this.groups.clear();
+    this.families.clear();
     this.groupIndex.clear();
     this.anyTableGroups.clear();
     this.runningGroups.clear();

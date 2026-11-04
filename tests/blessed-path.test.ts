@@ -194,6 +194,36 @@ describe("callers share a run only when nothing tells them apart", () => {
     expect(vex.describeSubscriptions().unique).toBe(2);
   });
 
+  test("a subscriber finds its group without passing every other caller's", async () => {
+    const vex = await create();
+    await vex.mutate("bp.add", { scope: "a", n: 1 });
+    await vex.mutate("bp.add", { scope: "a", n: 9 });
+    const callers = 8000;
+    const fenced = (i: number) => ({ ...alice, fence: String(i) }) as VexUser;
+    const opened = performance.now();
+    for (let i = 0; i < callers; i++) {
+      await vex.subscribe("bp.visible", { scope: "a" }, () => {}, {
+        user: fenced(i),
+      });
+    }
+    const ms = performance.now() - opened;
+    // One group per fence, every caller its own.
+    expect(vex.describeSubscriptions().unique).toBe(callers);
+    // A caller alike in what the runs read joins its group, hearing
+    // that group's answer without a run.
+    const before = runs.get("visible");
+    const heard: any[] = [];
+    await vex.subscribe("bp.visible", { scope: "a" }, (r) => heard.push(r), {
+      user: { ...fenced(5), id: "bob" } as VexUser,
+    });
+    expect(runs.get("visible")).toBe(before);
+    expect(vex.describeSubscriptions().unique).toBe(callers);
+    expect(heard.at(-1).map((r: any) => r.n)).toEqual([1]);
+    // Scanning every group per subscriber takes seconds here; finding
+    // it by what the runs read, tens of milliseconds.
+    expect(ms).toBeLessThan(1500);
+  });
+
   test("args alike but spelled in another order are one view", async () => {
     const vex = await create();
     await vex.subscribe(
