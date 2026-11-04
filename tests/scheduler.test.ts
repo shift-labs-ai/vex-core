@@ -2,7 +2,8 @@
  * Functions scheduled from mutations and actions (ctx.scheduler): a
  * mutation's schedule is part of its transaction, each runs once, as
  * the caller who scheduled it, and one cut short by a stop is never
- * run again.
+ * run again. Only a mutation or action is scheduled, and a finished
+ * one is kept a week.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";

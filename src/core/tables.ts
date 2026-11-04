@@ -51,13 +51,12 @@ export function storedTable(
       def,
       `table ${name} declares column ${JSON.stringify(column)}`,
     );
-    const d = def as Record<string, any>;
     columns[column] = {
-      type: storageType(d),
-      ...(nullable(d) ? { optional: true } : {}),
-      ...(d.index ? { index: true } : {}),
-      ...(d.default !== undefined ? { default: d.default } : {}),
-      ...(d.renamedFrom ? { renamedFrom: d.renamedFrom } : {}),
+      type: storageType(def),
+      ...(nullable(def) ? { optional: true } : {}),
+      ...(def.index ? { index: true } : {}),
+      ...(def.default !== undefined ? { default: def.default } : {}),
+      ...(def.renamedFrom ? { renamedFrom: def.renamedFrom } : {}),
     };
   }
   const { columns: _columns, ...rest } = schema;

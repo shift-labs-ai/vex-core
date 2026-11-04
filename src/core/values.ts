@@ -49,9 +49,9 @@ export interface ProblemWords {
 }
 
 /**
- * Why `compiled` refuses `value`, one problem per part: an undeclared
- * key is told once (not also as its false schema), and a union's
- * branch errors, which say one thing, as its first.
+ * Why `compiled` refuses `value`, every part it refuses told once: an
+ * undeclared key not also as its false schema, and a union's branch
+ * errors, which say one thing at one path, as its first.
  */
 export function schemaProblems(
   compiled: ReturnType<typeof Compile>,
@@ -73,9 +73,8 @@ export function schemaProblems(
         problems.push(words.missing(key));
       }
     } else {
-      const part = path[0] ?? "";
-      if (told.has(part)) continue;
-      told.add(part);
+      if (told.has(error.instancePath)) continue;
+      told.add(error.instancePath);
       problems.push(words.refused(path, error.message));
     }
   }

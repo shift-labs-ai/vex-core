@@ -162,7 +162,7 @@ api.registerTable("tasks", {
   renamedFrom: ["todos"],
   columns: {
     title: Type.String({ renamedFrom: ["text"] }),
-    done: { type: "boolean" },
+    done: Type.Boolean(),
   },
 });
 
@@ -211,13 +211,13 @@ SQLite reports what a statement reads and writes: its compiled program, as `EXPL
 - **Transactions:** writes inside a transaction are reported when it commits, and a rolled-back one reports nothing.
 - **Other connections:** on a file database, a commit by another connection or process (`PRAGMA data_version`) marks every table changed at the next invalidation.
 - **Skipping re-runs:** a subscription over a changed table re-runs unless its filters prove it could not have seen the change. Every operator counts (`=`, `!=`, `IN`, `<`, `>`, `<=`, `>=`, and OR groups), compared as the column's SQL affinity would: `'5'` in a number column is 5, `undefined` is NULL. The proof is what every touched row holds both before and after the write: an insert's row with its id, a delete's row, and for an update or upsert the columns it leaves as they are, plus what a changed column held and holds now when both are outside the filter. An update that changes nothing, or only columns the subscription neither filters on, orders by nor computes from, is skipped too. Recording what a row held costs a mutation one primary-key read per update, delete or upsert; a filtered delete reads the rows it removes (up to 200, else only its `=` filters count). A table changed by raw SQL, or by a write that ran a trigger or foreign-key action, proves nothing, and every subscription over it re-runs; skipping on other tables is unaffected.
-- **Groups:** subscriptions holding one query with one set of args (key order aside) for one caller form a group: one run answers all of them, a subscriber joining hears the group's current answer without a run, and a write is judged once per group. `describeSubscriptions()` lists groups. Who "one caller" is: every field of the caller by default, so callers that differ in anything (a fence, roles, whom they act for) never share an answer, and one carrying functions shares only with itself; an app that knows which fields decide what a caller sees says so with `callerKey`.
+- **Groups:** subscriptions holding one query with one set of args (key order aside) for one caller form a group: one run answers all of them, a subscriber joining hears the group's current answer without a run, and a write is judged once per group. `describeSubscriptions()` lists groups. A caller is plain data (one holding a function is refused), and callers share a group when they are alike in every field the query's runs read of them: callers differing in a field a run reads (a fence, roles, whom they act for) never share an answer, and a member who turns out to differ moves to the group of callers alike in it.
 - **Failures:** a subscription never fails in silence. `subscribe(name, args, callback, { onError })` hears `onError(error, ended)`: ended when its result outgrows its reactive budget (the WebSocket transport sends its terminal error frame, and the client's `onError` hears it); not ended when a run throws, in which case the last answer stands and the next write that reaches the view runs it again.
 - **Schema and raw access:** the schema changes through `VexOptions.migrations` (applied once each, in order, in transactions, before the engine serves or runs a job). Raw SQL past every policy lives in `vex-core/internal` (`rawSql`, `rawStorage`, `rawBulkInsert`), for tests and tooling; what it writes is announced, so subscriptions over it re-run.
 - **Finding what a write affects:** each group is filed by the tables its last run read and, for a dependency holding columns equal to values (`=`, `IN`), under the combination of those values (a zone and a cell; a list of ids); a dependency holding none so files it wide. A write judges only the groups filed under the values its rows hold (both the value left and taken, for a column it changes), those filed wide, and any with a run open; a write that does not know a column of a shape, or names no rows (a filtered delete past its bound, raw SQL), or an unattributed change, judges every group on the table. The invalidation span records `judged`. The cost of a pass does not grow with the subscriptions the engine holds: 100k players with 500k live views sustain the writes per second of 1k; an MMO-shaped world (`bun run bench:mmo`) with 10k players and 120k views sustains ~9k writes/s and ~700k deliveries/s on one thread, at 2.6 KB of heap per subscription.
 - **Bursts:** writes that commit while another write holds or waits for the storage's write lock invalidate in one pass, begun on the next turn of the event loop, with the union of what they changed: each affected subscription re-runs once for all of them. A lone write invalidates at once. Every mutation still resolves only after its pass delivered.
 - **Writes during a run:** a subscription is registered before its first run, and a run of its query is single-flight. A write that commits while a run is open, and that a read the run has made so far could have seen, marks the subscription stale: the run repeats before its result is delivered, so a subscriber sees every write committed after a read of its query, and results are delivered in the order they were read.
-- **Evaluation workers:** with `evaluation: { workers, module, setup }`, subscriptions re-run off the main thread: each worker runs a read-only engine (`sqliteAdapter(path, { readonly: true })`) built by the `module`'s default export from `setup`, over the same WAL database, and answers with the result, its measurement, and what it read; the main thread keeps judging which writes affect what, single-flight runs, budgets and delivery. A pass's affected groups run together, bounded by the pool. A caller that cannot cross to a worker (one carrying functions) evaluates on the main thread, as does everything where the runtime has no `Worker`.
+- **Evaluation workers:** with `evaluation: { workers, module, setup }`, subscriptions re-run off the main thread: each worker runs a read-only engine (`sqliteAdapter(path, { readonly: true })`) built by the `module`'s default export from `setup`, over the same WAL database, and answers with the result, its measurement, and what it read; the main thread keeps judging which writes affect what, single-flight runs, budgets and delivery. A pass's affected groups run together, bounded by the pool. Where the runtime has no `Worker`, everything evaluates on the main thread.
 - **Raw reads:** `ctx.db.sql(reads, sql, ...params)` names every table the statement reads, and a table read but not named is refused, so what a subscription depends on is written where it is read. A table held to rows (`{ messages: [filters] }`, or `{ messages: { where, reads } }` to hold columns too) is, inside the statement, those rows and nothing else: a non-materialized common table expression of the table's name shadows it, so indexes still serve, and the read is skipped like a builder read's when a write misses them. A table read whole (`{ t: "all" }`) re-runs it on every write to `t`. The hold is enforced, not declared: a statement naming a held table as `main.t`, or reaching it through a view, is refused. A raw read that reads no table re-runs after any write.
 - **Access policies:** raw SQL in a query context (`ctx.db.sql`) is refused when it reads a governed table, in any spelling or through any view. A literal or column that merely shares a governed table's name is not a read. Published SQL has its own rule (below).
 - **Costs:** a statement's first run in a given schema compiles it once more for `EXPLAIN` (a few µs); after that, writes, reads and invalidation cost what they cost without tracking, within measurement noise. The query builder, bulk inserts and mutations run at parity with untracked writes; raw writes and raw reads run faster. On a Durable Object a single-statement write makes no more SQL calls, and bills no more rows, than without tracking; raw SQL of several statements reads `total_changes()` before and after.
@@ -232,7 +232,7 @@ api.registerTable("sessions", { columns: { /* … */ }, published: true });
 api.registerTable("api_keys", { columns: { /* … */ } }); // not published
 
 api.registerQuery("sql", {
-  args: { sql: Type.String(), params: Type.Unknown() },
+  args: { sql: Type.String(), params: Type.Optional(Type.Array(Type.Unknown())) },
   reactive: false,
   handler: (ctx, args) => ctx.db.publishedSql(args.sql, ...(args.params ?? [])),
 });
@@ -307,10 +307,10 @@ const vex = await Vex.create<Access>({
 });
 ```
 
-The engine decides nothing with it. It hands each call's declaration to middleware, where the app's own gate decides, and it describes each operation with its declaration (`describeQuery`, `describeMutation`, `describeAction`, `introspect`), so the app can list what every operation needs:
+The engine decides nothing with it. It hands each call's declaration to middleware, which a plugin declares (`api.use`), where the app's own gate decides, and it describes each operation with its declaration (`describeQuery`, `describeMutation`, `describeAction`, `introspect`), so the app can list what every operation needs. Middleware runs outside the handler, so a gate may ask the engine how to decide:
 
 ```ts
-vex.use((ctx, info, next) => {
+api.use((ctx, info, next) => {
   if (info.type === "webhook") return next();   // a webhook's verify decides
   if (info.access === undefined) throw new Error("Permission denied"); // a cast left it out
   return authorize(ctx.user, info.access, info.args).then(next);
@@ -386,16 +386,16 @@ Flat files, no config. Use `scanDirectory` to turn a folder into plugins.
 
 ```ts
 // schema.ts
-import { table } from "vex-core/framework";
+import { table, Type } from "vex-core/framework";
 export const todos = table({ text: Type.String(), done: Type.Boolean() });
 
 // todos.ts
-import { action, query, mutation } from "vex-core/framework";
+import { action, query, mutation, Type } from "vex-core/framework";
 export const list = query({}, async (ctx) => ctx.db.table("todos").all());
 export const add = mutation({ text: Type.String() }, async (ctx, args) =>
   ctx.db.table("todos").insert({ text: args.text, done: false }),
 );
-export const importAll = action({ texts: Type.Unknown() }, async (ctx, args) => {
+export const importAll = action({ texts: Type.Array(Type.String()) }, async (ctx, args) => {
   for (const text of args.texts) await ctx.mutate("todos.add", { text });
 });
 ```
@@ -684,20 +684,25 @@ const tracer: Tracer = {
 };
 ```
 
-Core metadata describes query and write structure without recording filter values, row values, handler arguments, or results. Core emits spans to the tracer but does not persist them automatically; it reserves the internal `_spans` table for apps that choose SQLite persistence. Retention remains app-specific. For a long-running server that writes `_spans`, register bounded cleanup:
+Core metadata describes query and write structure without recording filter values, row values, handler arguments, or results. Core emits spans to the tracer but does not persist them automatically; it reserves the internal `_spans` table for apps that choose SQLite persistence. Retention remains app-specific. For a long-running server that writes `_spans`, register bounded cleanup: a job, which writes through a mutation.
 
 ```ts
-api.registerJob("spanRetention", {
-  schedule: "every 1h",
-  async handler(ctx) {
-    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 days
-    await ctx.db.sql(
+api.registerMutation("dropOldSpans", {
+  args: { before: Type.Number() },
+  handler: (ctx, args) =>
+    ctx.db.sql(
       `DELETE FROM _spans WHERE _id IN (
          SELECT _id FROM _spans WHERE startTime < ? LIMIT 1000
        )`,
-      cutoff,
-    );
-  },
+      args.before,
+    ),
+});
+api.registerJob("spanRetention", {
+  schedule: "every 1h",
+  handler: (ctx) =>
+    ctx.mutate("app.dropOldSpans", {
+      before: Date.now() - 7 * 24 * 60 * 60 * 1000, // 7 days
+    }),
 });
 ```
 
@@ -713,6 +718,7 @@ Age retention alone is not a hard volume bound. Production sinks should also cap
 | `vex-core/client` | `VexProvider`, `useQuery`, `useMutation` |
 | `vex-core/adapters/sqlite` | `sqliteAdapter` |
 | `vex-core/adapters/durable-object` | `durableObjectAdapter` |
+| `vex-core/internal` | `rawSql`, `rawStorage`, `rawBulkInsert`: storage past every policy, for tests and tooling |
 
 ## License
 

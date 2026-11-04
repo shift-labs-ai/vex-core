@@ -135,8 +135,7 @@ interface SubscriptionGroup {
    */
   run: Promise<{ result: unknown; measurement: ReactiveMeasurement }> | null;
   stale: boolean;
-  /** Its runs go to the evaluation pool: there is one, and its caller
-   *  can cross to a worker. */
+  /** Its runs go to the evaluation pool: the engine has one. */
   offThread: boolean;
   /** Its query and args (`Vex.families`). */
   family: string;
@@ -243,6 +242,13 @@ function checkedAnswer(
   const json = serializeJson(result, `${what} answers`);
   returns?.(result);
   return json;
+}
+
+/** The rows a result holds: an array's, or a `{ rows }` object's. */
+function rowsOf(result: unknown): number | undefined {
+  if (Array.isArray(result)) return result.length;
+  const rows = (result as { rows?: unknown } | null)?.rows;
+  return Array.isArray(rows) ? rows.length : undefined;
 }
 
 /** An answer read back from its JSON: what a joiner hears of a run it did not see. */
@@ -1117,9 +1123,9 @@ export class Vex<A = unknown> {
   }
 
   /**
-   * Runs, one after another, every enabled job due by `now`. Each run
-   * sets the job's next run one interval later; missed runs coalesce
-   * into one.
+   * Runs, one after another, every enabled job due by `now`, then
+   * every scheduled function due by then. Each job run sets the job's
+   * next run one interval later; missed runs coalesce into one.
    */
   async runDueJobs(
     now = Date.now(),
@@ -1945,14 +1951,9 @@ export class Vex<A = unknown> {
   ): ReactiveMeasurement {
     // An undefined result measures as the literal "undefined".
     const measured = serialized ?? "undefined";
-    const resultRows = Array.isArray(result)
-      ? result.length
-      : result && typeof result === "object" && Array.isArray(result.rows)
-        ? result.rows.length
-        : undefined;
     return {
       hash: hashResult(measured),
-      resultRows,
+      resultRows: rowsOf(result),
       resultBytes: utf8ByteLength(measured),
       serialized,
       exact,
@@ -2745,9 +2746,8 @@ export class Vex<A = unknown> {
         meta.plugin = reg.plugin;
         meta.tables = [...tables];
         meta.dependencies = describeQueryDependencies(dependencies);
-        if (Array.isArray(result)) meta.resultRows = result.length;
-        else if (result && typeof result === "object" && "rows" in result)
-          meta.resultRows = (result as any).rows?.length;
+        const rows = rowsOf(result);
+        if (rows !== undefined) meta.resultRows = rows;
         // Same convention as measureReactiveResult: undefined results
         // are counted as the literal "undefined".
         meta.resultBytes = utf8ByteLength(json.serialized ?? "undefined");
@@ -3149,9 +3149,10 @@ export class Vex<A = unknown> {
 
   /**
    * Closes the engine. From the call on it refuses job changes, job runs
-   * and subscriptions, and no timer starts a job. Job changes in flight
-   * finish without arming a timer, running jobs settle, and then storage
-   * closes. Calling it again returns the same promise.
+   * and subscriptions, and no timer starts a job or a scheduled
+   * function. The scheduled functions under way finish, job changes in
+   * flight finish without arming a timer, running jobs settle, and then
+   * storage closes. Calling it again returns the same promise.
    */
   close(): Promise<void> {
     if (!this.closing) {

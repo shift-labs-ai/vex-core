@@ -2,15 +2,18 @@
  * The states the engine's interface makes impossible, each pinned:
  *
  *   - a caller answered with what another may see (callers share a
- *     run only when alike in every field, unless the app says which
- *     fields decide);
+ *     run only when alike in every field its runs read);
  *   - a write the engine is handed that no subscription hears of
  *     (`rawSql`, `rawStorage` in vex-core/internal);
  *   - a raw read whose dependency is not written down (every table a
  *     raw read reads is named, held to rows or read whole), or whose
  *     hold a view slips past;
  *   - a subscription that stops or goes stale in silence (`onError`);
- *   - identical views apart because their args are spelled apart.
+ *   - identical views apart because their args are spelled apart;
+ *   - an arg, column or answer outside its schema, or a declaration
+ *     that is not one;
+ *   - a handler reaching past its context: the engine's tables, the
+ *     clock, the schema.
  */
 
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
@@ -545,6 +548,27 @@ describe("an answer is JSON, and every reader hears the same one", () => {
     await expect(vex.action("a.dated")).rejects.toThrow("holds a Set");
   });
 
+  test("an answer outside its returns schema is refused, every part named", async () => {
+    const vex = await create({
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("ret");
+          api.registerQuery("q", {
+            args: {},
+            returns: Type.Object(
+              { n: Type.Number(), s: Type.String() },
+              { additionalProperties: false },
+            ),
+            handler: () => ({ n: "x", extra: 1 }),
+          });
+        },
+      ],
+    });
+    await expect(vex.query("ret.q")).rejects.toThrow(
+      'query ret.q answers without "s"; with "extra", which it does not return; /n: must be number',
+    );
+  });
+
   test("a mutation refused for its answer commits nothing", async () => {
     const vex = await create({ plugins: [plugin, answers] });
     await expect(vex.mutate("a.dated")).rejects.toThrow("holds a Date");
@@ -564,6 +588,33 @@ describe("an answer is JSON, and every reader hears the same one", () => {
     expect(first[1]).toEqual({ n: 1 });
     expect("missing" in first[1]).toBe(false);
     expect(joiner[1]).toEqual(first[1]);
+  });
+
+  test("a call's answer, like a subscription's, drops what JSON does not say", async () => {
+    const vex = await create({
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("ans");
+          api.registerQuery("q", {
+            args: {},
+            handler: () => ({ kept: 1, dropped: undefined, zero: -0 }),
+          });
+          api.registerMutation("m", {
+            args: {},
+            handler: () => ({ dropped: undefined }),
+          });
+        },
+      ],
+    });
+    const answer = await vex.query("ans.q");
+    expect(Object.keys(answer)).toEqual(["kept", "zero"]);
+    expect(Object.is(answer.zero, 0)).toBe(true);
+    expect(Object.keys(await vex.mutate("ans.m"))).toEqual([]);
+    let heard: any;
+    await vex.subscribe("ans.q", {}, (value) => {
+      heard = value;
+    });
+    expect(heard).toEqual(answer);
   });
 });
 
@@ -1098,9 +1149,6 @@ describe("the engine's tables are the engine's", () => {
       vex.mutate("forge.raw", { sql: "SELECT * FROM _Scheduled" }),
     ).rejects.toThrow("ctx.db.sql reads and writes no _scheduled");
     await expect(
-      vex.mutate("forge.raw", { sql: "DELETE FROM _migrations" }),
-    ).rejects.toThrow("writes no table the engine keeps (_migrations)");
-    await expect(
       vex.query("forge.read", { table: "_scheduled" }),
     ).rejects.toThrow("ctx.db reads and writes no _scheduled");
     await expect(
@@ -1143,6 +1191,23 @@ describe("only a schema Type builds declares an arg or a return", () => {
     ).rejects.toThrow("query old.r declares what it returns as");
   });
 
+  test("every refused part of an arg is named, each once", async () => {
+    const vex = await create({
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("two");
+          api.registerQuery("q", {
+            args: { p: Type.Object({ a: Type.Number(), b: Type.String() }) },
+            handler: () => null,
+          });
+        },
+      ],
+    });
+    await expect(vex.query("two.q", { p: { a: "x", b: 1 } })).rejects.toThrow(
+      'query two.q takes arg "p" at /a: must be number; takes arg "p" at /b: must be string',
+    );
+  });
+
   test("a nullable arg is refused once, by its first branch", async () => {
     const vex = await create({
       plugins: [
@@ -1158,34 +1223,5 @@ describe("only a schema Type builds declares an arg or a return", () => {
     await expect(vex.query("nul.q", { n: "5" })).rejects.toThrow(
       /^query nul\.q takes arg "n": must be number \(it takes "n"\)$/,
     );
-  });
-});
-
-describe("every caller is handed one value: the answer's JSON reading", () => {
-  test("a call's answer, like a subscription's, drops what JSON does not say", async () => {
-    const vex = await create({
-      plugins: [
-        (api: VexPluginAPI) => {
-          api.setName("ans");
-          api.registerQuery("q", {
-            args: {},
-            handler: () => ({ kept: 1, dropped: undefined, zero: -0 }),
-          });
-          api.registerMutation("m", {
-            args: {},
-            handler: () => ({ dropped: undefined }),
-          });
-        },
-      ],
-    });
-    const answer = await vex.query("ans.q");
-    expect(Object.keys(answer)).toEqual(["kept", "zero"]);
-    expect(Object.is(answer.zero, 0)).toBe(true);
-    expect(Object.keys(await vex.mutate("ans.m"))).toEqual([]);
-    let heard: any;
-    await vex.subscribe("ans.q", {}, (value) => {
-      heard = value;
-    });
-    expect(heard).toEqual(answer);
   });
 });

@@ -1,7 +1,6 @@
 import type { StoredTableSchema } from "./types.js";
 
 /** The tables the engine keeps, as storage keeps them. */
-
 export const INTERNAL_TABLES: Record<string, StoredTableSchema> = {
   // Each migration applied, by id (VexOptions.migrations).
   _migrations: {
@@ -40,6 +39,7 @@ export const INTERNAL_TABLES: Record<string, StoredTableSchema> = {
       finishedAt: { type: "number", optional: true },
     },
   },
+  // Each job (`registerJob`): its schedule, and how its last run went.
   _jobs: {
     columns: {
       name: { type: "string", index: true },

@@ -1,7 +1,9 @@
 /**
- * A handler's args are typed from its declaration (TypeBox schemas):
- * declared args have their schema's type, optional ones may be absent,
- * and an undeclared one does not exist.
+ * A handler's args are typed from its declaration (TypeBox schemas),
+ * a plugin's and a file's alike: declared args have their schema's
+ * type, optional ones may be absent, and an undeclared one does not
+ * exist. A declaration that is not a schema `Type` builds does not
+ * compile.
  */
 
 import type { VexPluginAPI } from "../../src/core/api.js";
