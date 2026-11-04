@@ -208,12 +208,15 @@ function plugin(api: VexPluginAPI) {
         .delete();
     },
   });
+  api.registerMutation("retitle", {
+    args: { id: "string", title: "string" },
+    handler: (ctx, args) =>
+      ctx.db.table("sessions").update(args.id, { title: args.title }),
+  });
   api.registerWebhook("ingest", {
     path: "/s/ingest",
     async handler(ctx, req) {
-      await ctx.db
-        .table("sessions")
-        .update(req.body.id, { title: req.body.title });
+      await ctx.mutate("s.retitle", { id: req.body.id, title: req.body.title });
       return { ok: true };
     },
   });

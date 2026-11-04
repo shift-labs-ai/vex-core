@@ -47,7 +47,7 @@ export interface VexWebhook {
   method?: "POST" | "GET" | "PUT" | "DELETE";
   verify?: (req: WebhookRequest) => boolean;
   handler: (
-    ctx: MutationContext,
+    ctx: ActionContext,
     req: WebhookRequest,
   ) => Promise<WebhookResponse | any> | WebhookResponse | any;
 }
@@ -55,7 +55,7 @@ export interface VexWebhook {
 export interface VexJob {
   [KIND]: "job";
   schedule: string;
-  handler: (ctx: MutationContext) => Promise<void> | void;
+  handler: (ctx: ActionContext) => Promise<void> | void;
   description?: string;
   enabled?: boolean;
   timeoutMs?: number;

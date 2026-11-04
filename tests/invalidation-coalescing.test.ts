@@ -46,8 +46,16 @@ function plugin(api: VexPluginAPI) {
   api.registerJob("tick", {
     schedule: "every 1h",
     async handler(ctx) {
-      await ctx.db.table("items").insert({ scope: "a", n: 100 });
+      await ctx.mutate("c.add", { scope: "a", n: 100 });
     },
+  });
+  // A raw write: it names no rows.
+  api.registerMutation("rawAdd", {
+    args: {},
+    handler: (ctx) =>
+      ctx.db.sql(
+        "INSERT INTO items (_id, scope, n) VALUES (lower(hex(randomblob(6))), 'a', 100)",
+      ),
   });
 }
 
@@ -117,8 +125,8 @@ describe("invalidation coalescing", () => {
     const after = runs;
     await Promise.all([
       vex.mutate("c.add", { scope: "a", n: 1 }),
-      // A job records nothing of its rows.
-      vex.triggerJob("c.tick"),
+      // A raw write records nothing of its rows.
+      vex.mutate("c.rawAdd"),
     ]);
     expect(invalidations().at(-1)).toEqual(
       expect.objectContaining({ commits: 2 }),

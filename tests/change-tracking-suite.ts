@@ -403,10 +403,14 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
             await ctx.db.sql("UPDATE items SET n = 7 WHERE scope = 'a'");
           },
         });
+        api.registerMutation("rawWrite", {
+          args: { sql: "string" },
+          handler: (ctx, args) => ctx.db.sql(args.sql),
+        });
         api.registerWebhook("raw", {
           path: "/ct/raw",
           async handler(ctx, req) {
-            await ctx.db.sql(req.body.sql);
+            await ctx.mutate("ct.rawWrite", { sql: req.body.sql });
             return { ok: true };
           },
         });

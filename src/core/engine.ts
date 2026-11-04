@@ -928,9 +928,10 @@ export class Vex<A = unknown> {
           async (ectx, meta) => {
             meta.schedule = job.schedule;
             meta.attempt = attempt;
-            const ctx = this.buildMutationContext();
-            await job.handler(ctx);
-            await this.invalidateAfter(ectx);
+            // A scheduled action, as the system: what it writes goes
+            // through ctx.mutate, each a transaction of its own.
+            const ctx = this.buildActionContext(undefined, ectx, undefined);
+            await inFrame("action", cronName, () => job.handler(ctx));
           },
         );
 
@@ -1617,10 +1618,12 @@ export class Vex<A = unknown> {
   ): Promise<any> {
     // The middleware and the handler run in the handler's frame
     // (`guards.ts`); a webhook writes as a mutation does.
-    const kind: FrameKind = info.type === "webhook" ? "mutation" : info.type;
+    const kind: FrameKind = info.type === "webhook" ? "action" : info.type;
     const run = () => {
       const result = Promise.resolve(inFrame(kind, info.name, handler));
-      return info.type === "action" ? result : this.withTimeout(result);
+      return info.type === "action" || info.type === "webhook"
+        ? result
+        : this.withTimeout(result);
     };
     if (this.middleware.length === 0) {
       return this.trace("handler", info.name, ectx, run);
@@ -2362,10 +2365,6 @@ export class Vex<A = unknown> {
 
   // ─── Public API ───
 
-  use(fn: MiddlewareFn<A>) {
-    this.middleware.push(fn);
-  }
-
   async query<T = any>(
     name: string,
     given: Record<string, any> = {},
@@ -2571,23 +2570,20 @@ export class Vex<A = unknown> {
             body: { error: "Verification failed" },
           } as WebhookResponse;
         }
-        const writes: WriteDependency[] = [];
-        const ctx = this.buildMutationContext(undefined, writes);
+        // An action reached over HTTP: what it writes goes through
+        // ctx.mutate, each a transaction of its own.
+        const ctx = this.buildActionContext(undefined, ectx, undefined);
         const info: MiddlewareInfo<any> = {
           type: "webhook",
           name: `${match.plugin}.${match.name}`,
           args: req.body ?? {},
         };
-        const result = await this.storage.transaction(() =>
-          this.runMiddleware(
-            ctx,
-            info,
-            () => match.def.handler(ctx, req),
-            ectx,
-          ),
+        const result = await this.runMiddleware(
+          ctx,
+          info,
+          () => match.def.handler(ctx, req),
+          ectx,
         );
-        if (isTraceRecording(ectx)) meta.writes = describeWrites(writes);
-        await this.invalidateAfter(ectx, writes);
         if (result && typeof result === "object" && "status" in result) {
           meta.status = (result as any).status;
           return result as WebhookResponse;
@@ -2777,17 +2773,6 @@ export class Vex<A = unknown> {
       actions,
       subscriptions: this.subscriptions.size,
     };
-  }
-
-  async readTable(table: string, opts?: { limit?: number; offset?: number }) {
-    return this.trace("query", `_system.readTable:${table}`, null, async () => {
-      const total = await this.storage.query(table).count();
-      const reader = this.storage.query(table);
-      if (opts?.limit) reader.limit(opts.limit);
-      if (opts?.offset) reader.offset(opts.offset);
-      reader.order("_id", "desc");
-      return { rows: await reader.all(), total };
-    });
   }
 
   /**

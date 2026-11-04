@@ -44,10 +44,14 @@ export class App extends DurableObject {
 function tickerPlugin(api: VexPluginAPI) {
   api.setName("ticker");
   api.registerTable("ticks", { columns: { at: { type: "number" } } });
+  api.registerMutation("record", {
+    args: {},
+    handler: (ctx) => ctx.db.table("ticks").insert({ at: ctx.now() }),
+  });
   api.registerJob("tick", {
     schedule: "every 1s",
     async handler(ctx) {
-      await ctx.db.table("ticks").insert({ at: Date.now() });
+      await ctx.mutate("ticker.record");
     },
   });
   api.registerQuery("count", {

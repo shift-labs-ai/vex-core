@@ -339,9 +339,14 @@ export type ActionDef<A = undefined> = {
   ) => Promise<any> | any;
 } & OperationAccess<A>;
 
+/**
+ * A scheduled action, run as the system: it may wait and reach outside
+ * the engine; what it reads and writes goes through ctx.query and
+ * ctx.mutate.
+ */
 export interface JobDef {
   schedule: string;
-  handler: (ctx: MutationContext) => Promise<void> | void;
+  handler: (ctx: ActionContext) => Promise<void> | void;
   description?: string;
   enabled?: boolean;
   timeoutMs?: number;
@@ -368,8 +373,10 @@ export interface WebhookDef {
   path: string;
   method?: "POST" | "GET" | "PUT" | "DELETE";
   verify?: (req: WebhookRequest) => boolean;
+  /** An action reached over HTTP, as the system: it writes through
+   *  ctx.mutate. */
   handler: (
-    ctx: MutationContext,
+    ctx: ActionContext,
     req: WebhookRequest,
   ) => Promise<WebhookResponse | any> | WebhookResponse | any;
 }

@@ -332,13 +332,17 @@ describe("webhooks", () => {
           api.registerTable("payments", {
             columns: { amount: { type: "number" }, status: { type: "string" } },
           });
+          api.registerMutation("paid", {
+            args: { amount: "number" },
+            handler: (ctx, args) =>
+              ctx.db
+                .table("payments")
+                .insert({ amount: args.amount, status: "paid" }),
+          });
           api.registerWebhook("stripePayment", {
             path: "/stripe",
             async handler(ctx, req) {
-              await ctx.db.table("payments").insert({
-                amount: req.body.amount,
-                status: "paid",
-              });
+              await ctx.mutate("billing.paid", { amount: req.body.amount });
               return { received: true };
             },
           });
@@ -1018,12 +1022,18 @@ describe("jobs", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("shutdown");
+          api.registerTable("marks", { columns: { at: { type: "number" } } });
+          api.registerQuery("count", {
+            args: {},
+            handler: (ctx) => ctx.db.table("marks").count(),
+          });
           api.registerJob("tick", {
             schedule: "every 1h",
             async handler(ctx) {
               active += 1;
               await new Promise((resolve) => setTimeout(resolve, 100));
-              await ctx.db.table("_jobs").count();
+              // Storage is still open for a job close() waits on.
+              await ctx.query("shutdown.count");
               active -= 1;
               completed = true;
             },

@@ -696,3 +696,58 @@ describe("a mutation's raw SQL reads and changes rows, nothing else", () => {
     expect(await vex.query("bp.count", { scope: "a", extra: null })).toBe(0);
   });
 });
+
+describe("jobs and webhooks are actions; middleware is declared", () => {
+  test("a job and a webhook get an action's context, and their writes are mutations that narrow", async () => {
+    const seen: string[] = [];
+    const vex = await create({
+      plugins: [
+        plugin,
+        (api: VexPluginAPI) => {
+          api.setName("jw");
+          api.registerJob("sweep", {
+            schedule: "every 1h",
+            async handler(ctx) {
+              seen.push(`job db:${typeof (ctx as any).db}`);
+              await ctx.mutate("bp.add", { scope: "job", n: 1 });
+            },
+          });
+          api.registerWebhook("in", {
+            path: "/jw",
+            async handler(ctx, req) {
+              seen.push(`hook db:${typeof (ctx as any).db}`);
+              await ctx.mutate("bp.add", { scope: req.body.scope, n: 1 });
+              return { ok: true };
+            },
+          });
+        },
+      ],
+    });
+    const other: number[] = [];
+    await vex.subscribe(
+      "bp.count",
+      { scope: "elsewhere", extra: null },
+      (n: number) => other.push(n),
+    );
+    await vex.triggerJob("jw.sweep");
+    await vex.handleWebhook({
+      path: "/jw",
+      method: "POST",
+      headers: {},
+      body: { scope: "hook" },
+      rawBody: "",
+      query: {},
+    });
+    expect(seen).toEqual(["job db:undefined", "hook db:undefined"]);
+    expect(await vex.query("bp.count", { scope: "job", extra: null })).toBe(1);
+    expect(await vex.query("bp.count", { scope: "hook", extra: null })).toBe(1);
+    // Neither write reached the view of another scope: they narrowed.
+    expect(other).toEqual([0]);
+  });
+
+  test("middleware cannot be added to a running engine, and no table is read past its policy", async () => {
+    const vex = await create();
+    expect((vex as any).use).toBeUndefined();
+    expect((vex as any).readTable).toBeUndefined();
+  });
+});

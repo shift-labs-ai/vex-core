@@ -230,18 +230,21 @@ export function scalingPlugin(api: VexPluginAPI) {
         .upsert({ key: args.key }, { value: args.value });
     },
   });
+  api.registerMutation("ingest", {
+    args: { scope: "string", n: "number" },
+    handler: (ctx, args) =>
+      ctx.db.table("items").insert({ ...args, version: next() }),
+  });
   api.registerJob("tick", {
     schedule: "every 1h",
     async handler(ctx) {
-      await ctx.db
-        .table("items")
-        .insert({ scope: "a", n: 50, version: next() });
+      await ctx.mutate("sc.ingest", { scope: "a", n: 50 });
     },
   });
   api.registerWebhook("in", {
     path: "/sc/in",
     async handler(ctx, req) {
-      await ctx.db.table("items").insert({ ...req.body, version: next() });
+      await ctx.mutate("sc.ingest", { scope: req.body.scope, n: req.body.n });
       return { ok: true };
     },
   });

@@ -262,15 +262,23 @@ function reactivityPlugin(api: VexPluginAPI) {
       await ctx.db.sql("INSERT INTO audit (value) VALUES (?)", args.value);
     },
   });
+  api.registerMutation("ingest", {
+    args: { scope: "string", name: "string" },
+    handler: (ctx, args) =>
+      ctx.db.table("items").insert({
+        scope: args.scope,
+        kind: "hook",
+        name: args.name,
+        score: 0,
+        body: null,
+      }),
+  });
   api.registerWebhook("ingest", {
     path: "/rx/ingest",
     async handler(ctx, req) {
-      await ctx.db.table("items").insert({
+      await ctx.mutate("rx.ingest", {
         scope: req.body.scope,
-        kind: "hook",
         name: req.body.name,
-        score: 0,
-        body: null,
       });
       return { ok: true };
     },

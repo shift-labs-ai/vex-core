@@ -110,10 +110,10 @@ function makeJobPlugin(gate: {
     api.registerJob("sweep", {
       schedule: "every 1h",
       async handler(ctx) {
-        await ctx.db.table("rows").insert({ v: "job-before" });
+        await ctx.mutate("jobtx.write", { v: "job-before" });
         gate.started.resolve();
         await gate.release;
-        await ctx.db.table("rows").insert({ v: "job-after" });
+        await ctx.mutate("jobtx.write", { v: "job-after" });
       },
     });
   };
