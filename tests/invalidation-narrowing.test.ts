@@ -93,7 +93,7 @@ function plugin(api: VexPluginAPI) {
     fn: (ctx: any, args: any) => Promise<unknown>,
   ) => {
     api.registerQuery(name, {
-      args: { arg: "json" },
+      args: { arg: "json?" },
       async handler(ctx, args) {
         runs.set(name, ran(name) + 1);
         return fn(ctx, args.arg);
@@ -156,7 +156,7 @@ function plugin(api: VexPluginAPI) {
   );
 
   api.registerMutation("open", {
-    args: { title: "string", platform: "string", n: "any" },
+    args: { title: "string", platform: "string", n: "json?" },
     async handler(ctx, args) {
       return ctx.db.table("sessions").insert(args);
     },
@@ -652,8 +652,8 @@ describe("invalidation narrowing (SHFT-2537)", () => {
     const vex = await create();
     await watch(vex, "small"); // n < 10
     const small = ran("small");
-    // `n: undefined` is NULL: `n < 10` never matches NULL, skipped.
-    await vex.mutate("s.open", { title: "x", platform: "web", n: undefined });
+    // `n: null` is NULL: `n < 10` never matches NULL, skipped.
+    await vex.mutate("s.open", { title: "x", platform: "web", n: null });
     expect(ran("small")).toBe(small);
     // `"5"` in a REAL column is 5: it matches, re-run.
     await vex.mutate("s.open", { title: "y", platform: "web", n: "5" });

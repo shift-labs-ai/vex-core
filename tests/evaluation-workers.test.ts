@@ -83,6 +83,16 @@ describe("evaluation workers", () => {
     );
   });
 
+  test("a run in a worker is heard as the main thread's would be: as its JSON reading", async () => {
+    const vex = await create();
+    const seen: Array<Record<string, unknown>> = [];
+    await vex.subscribe("ev.sparse", { scope: "a" }, (r: any) => seen.push(r));
+    await vex.mutate("ev.add", { scope: "a", name: "one" });
+    expect(meta("subscribe").at(-1)?.offThread).toBe(true);
+    expect(seen).toEqual([{ n: 0 }, { n: 1 }]);
+    for (const answer of seen) expect("missing" in answer).toBe(false);
+  });
+
   test("the worker's dependencies narrow the next write like the main thread's", async () => {
     const vex = await create();
     let runs = 0;

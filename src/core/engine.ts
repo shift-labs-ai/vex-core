@@ -55,6 +55,12 @@ import type {
   WebhookRequest,
   WebhookResponse,
 } from "./types.js";
+import {
+  type ArgsDecl,
+  assertArgsDecl,
+  checkArgs,
+  serializeJson,
+} from "./values.js";
 
 type SubscriptionCallback = (data: any) => void;
 type SerializedSubscriptionCallback = (data: any, serialized?: string) => void;
@@ -375,7 +381,7 @@ interface RegisteredAction {
  */
 export interface OperationDescription<A> {
   plugin: string;
-  args: Record<string, string>;
+  args: ArgsDecl;
   access: A | undefined;
 }
 
@@ -395,6 +401,8 @@ interface ReactiveMeasurement {
   resultRows: number | undefined;
   resultBytes: number;
   serialized: string | undefined;
+  /** Whether the result is its own JSON reading (`serializeJson`). */
+  exact: boolean;
 }
 
 /**
@@ -628,6 +636,7 @@ export class Vex<A = unknown> {
     for (const [name, def] of Object.entries(plugin.queries)) {
       const key = `${plugin.name}.${name}`;
       if (this.queries.has(key)) throw new Error(`Duplicate query: ${key}`);
+      assertArgsDecl("query", key, def.args);
       this.queries.set(key, { plugin: plugin.name, def });
     }
 
@@ -635,12 +644,14 @@ export class Vex<A = unknown> {
       const key = `${plugin.name}.${name}`;
       if (this.mutations.has(key))
         throw new Error(`Duplicate mutation: ${key}`);
+      assertArgsDecl("mutation", key, def.args);
       this.mutations.set(key, { plugin: plugin.name, def });
     }
 
     for (const [name, def] of Object.entries(plugin.actions ?? {})) {
       const key = `${plugin.name}.${name}`;
       if (this.actions.has(key)) throw new Error(`Duplicate action: ${key}`);
+      assertArgsDecl("action", key, def.args);
       this.actions.set(key, { plugin: plugin.name, def });
     }
 
@@ -1550,8 +1561,14 @@ export class Vex<A = unknown> {
     };
   }
 
-  private measureReactiveResult(result: any): ReactiveMeasurement {
-    const serialized = JSON.stringify(result);
+  private measureReactiveResult(
+    result: any,
+    name: string,
+  ): ReactiveMeasurement {
+    const { serialized, exact } = serializeJson(
+      result,
+      `query ${name} answers`,
+    );
     // An undefined result measures as the literal "undefined".
     const measured = serialized ?? "undefined";
     const resultRows = Array.isArray(result)
@@ -1564,6 +1581,7 @@ export class Vex<A = unknown> {
       resultRows,
       resultBytes: utf8ByteLength(measured),
       serialized,
+      exact,
     };
   }
 
@@ -1832,7 +1850,10 @@ export class Vex<A = unknown> {
         ectx,
       );
     } while (group.stale);
-    return { result, measurement: this.measureReactiveResult(result) };
+    return {
+      result,
+      measurement: this.measureReactiveResult(result, group.queryName),
+    };
   }
 
   /**
@@ -1871,6 +1892,7 @@ export class Vex<A = unknown> {
   async evaluate(request: EvaluationRequest): Promise<Evaluation> {
     const reg = this.queries.get(request.name);
     if (!reg) throw new Error(`Query not found: ${request.name}`);
+    const args = checkArgs("query", request.name, reg.def.args, request.args);
     const tables = new Set<string>();
     const dependencies: QueryDependency[] = [];
     const ctx = this.buildQueryContext(tables, request.user, dependencies);
@@ -1880,16 +1902,16 @@ export class Vex<A = unknown> {
         {
           type: "query",
           name: request.name,
-          args: request.args,
+          args,
           access: reg.def.access,
         },
-        () => reg.def.handler(ctx, request.args),
+        () => reg.def.handler(ctx, args),
         ectx,
       ),
     );
     return {
       result,
-      ...this.measureReactiveResult(result),
+      ...this.measureReactiveResult(result, request.name),
       tables: [...tables],
       dependencies,
     };
@@ -2052,11 +2074,14 @@ export class Vex<A = unknown> {
     result: unknown,
     measurement: ReactiveMeasurement,
   ): void {
+    // Every member hears one value: the result itself when it is its
+    // own JSON reading, else that reading, which a joiner hears too.
+    const answer = measurement.exact ? result : parsed(measurement);
     for (const sub of group.members) {
       if (measurement.hash === sub.lastHash) continue;
       sub.lastHash = measurement.hash;
       try {
-        deliverSubscriptionResult(sub.callback, result, measurement.serialized);
+        deliverSubscriptionResult(sub.callback, answer, measurement.serialized);
       } catch (err) {
         console.error(
           `[vex] subscription ${group.queryName} callback failed:`,
@@ -2091,13 +2116,14 @@ export class Vex<A = unknown> {
 
   async query<T = any>(
     name: string,
-    args: Record<string, any> = {},
+    given: Record<string, any> = {},
     callCtx?: ExecContext | CallContext,
   ): Promise<T> {
     const { parent, user } = normalizeCallContext(callCtx);
     return this.trace("query", name, parent, async (ectx, meta) => {
       const reg = this.queries.get(name);
       if (!reg) throw new Error(`Query not found: ${name}`);
+      const args = checkArgs("query", name, reg.def.args, given);
       const recording = isTraceRecording(ectx);
       const tables = recording ? new Set<string>() : undefined;
       const dependencies = recording ? ([] as QueryDependency[]) : undefined;
@@ -2108,6 +2134,7 @@ export class Vex<A = unknown> {
         () => reg.def.handler(ctx, args),
         ectx,
       );
+      const { serialized } = serializeJson(result, `query ${name} answers`);
       if (tables && dependencies) {
         meta.plugin = reg.plugin;
         meta.tables = [...tables];
@@ -2115,13 +2142,9 @@ export class Vex<A = unknown> {
         if (Array.isArray(result)) meta.resultRows = result.length;
         else if (result && typeof result === "object" && "rows" in result)
           meta.resultRows = (result as any).rows?.length;
-        try {
-          // Same convention as measureReactiveResult: undefined results
-          // are counted as the literal "undefined".
-          meta.resultBytes = utf8ByteLength(
-            JSON.stringify(result) ?? "undefined",
-          );
-        } catch {}
+        // Same convention as measureReactiveResult: undefined results
+        // are counted as the literal "undefined".
+        meta.resultBytes = utf8ByteLength(serialized ?? "undefined");
       }
       return result as T;
     });
@@ -2129,13 +2152,14 @@ export class Vex<A = unknown> {
 
   async mutate<T = any>(
     name: string,
-    args: Record<string, any> = {},
+    given: Record<string, any> = {},
     callCtx?: ExecContext | CallContext,
   ): Promise<T> {
     const { parent, user } = normalizeCallContext(callCtx);
     return this.trace("mutation", name, parent, async (ectx, meta) => {
       const reg = this.mutations.get(name);
       if (!reg) throw new Error(`Mutation not found: ${name}`);
+      const args = checkArgs("mutation", name, reg.def.args, given);
       const writes: WriteDependency[] = [];
       const ctx = this.buildMutationContext(user, writes);
       const result = await this.storage.transaction(() =>
@@ -2144,7 +2168,12 @@ export class Vex<A = unknown> {
           { type: "mutation", name, args, access: reg.def.access },
           () => reg.def.handler(ctx, args),
           ectx,
-        ),
+        ).then((answer) => {
+          // Refused inside the transaction, so a non-JSON answer
+          // commits nothing.
+          serializeJson(answer, `mutation ${name} answers`);
+          return answer;
+        }),
       );
       if (isTraceRecording(ectx)) {
         meta.plugin = reg.plugin;
@@ -2164,28 +2193,31 @@ export class Vex<A = unknown> {
    */
   async action<T = any>(
     name: string,
-    args: Record<string, any> = {},
+    given: Record<string, any> = {},
     callCtx?: ExecContext | CallContext,
   ): Promise<T> {
     const { parent, user, signal } = normalizeCallContext(callCtx);
     return this.trace("action", name, parent, async (ectx, meta) => {
       const reg = this.actions.get(name);
       if (!reg) throw new Error(`Action not found: ${name}`);
+      const args = checkArgs("action", name, reg.def.args, given);
       signal?.throwIfAborted();
       if (isTraceRecording(ectx)) meta.plugin = reg.plugin;
       const ctx = this.buildActionContext(user, ectx, signal);
-      return (await this.runMiddleware(
+      const result = await this.runMiddleware(
         ctx,
         { type: "action", name, args, access: reg.def.access },
         () => reg.def.handler(ctx, args),
         ectx,
-      )) as T;
+      );
+      serializeJson(result, `action ${name} answers`);
+      return result as T;
     });
   }
 
   async subscribe(
     name: string,
-    args: Record<string, any>,
+    given: Record<string, any>,
     callback: SubscriptionCallback,
     callCtx?: SubscribeContext,
   ): Promise<() => void> {
@@ -2195,6 +2227,7 @@ export class Vex<A = unknown> {
     return this.trace("subscribe", name, null, async (_ectx, meta) => {
       const reg = this.queries.get(name);
       if (!reg) throw new Error(`Query not found: ${name}`);
+      const args = checkArgs("query", name, reg.def.args, given);
       const recording = isTraceRecording(_ectx);
       const budget = this.resolveReactive(reg.def);
       if (recording) meta.reactive = budget !== false;
@@ -2204,7 +2237,7 @@ export class Vex<A = unknown> {
       // made and registered before its first run, so a write
       // committing during the run finds it (`runGroup`). A group with
       // an answer already hands it over without a run.
-      const key = `${name}\0${canonical(args) ?? JSON.stringify(args)}\0${this.callerKey(user)}`;
+      const key = `${name}\0${canonical(args)}\0${this.callerKey(user)}`;
       let group = this.groups.get(key);
       if (!group) {
         group = {
@@ -2251,7 +2284,11 @@ export class Vex<A = unknown> {
         // subscription; this one must not outlive it.
         this.assertOpen();
         sub.lastHash = measurement.hash;
-        deliverSubscriptionResult(callback, result, measurement.serialized);
+        deliverSubscriptionResult(
+          callback,
+          measurement.exact ? result : parsed(measurement),
+          measurement.serialized,
+        );
       } catch (err) {
         this.dropSubscription(sub);
         throw err;

@@ -9,7 +9,6 @@ let listRuns = 0;
 let rawRuns = 0;
 let flakyThrows = false;
 let cyclicNow = false;
-let serializationCalls = 0;
 async function create(options: Parameters<typeof Vex.create>[0]) {
   const vex = await Vex.create(options);
   open.push(vex);
@@ -22,7 +21,6 @@ afterEach(async () => {
   rawRuns = 0;
   flakyThrows = false;
   cyclicNow = false;
-  serializationCalls = 0;
 });
 
 function reactivityPlugin(api: VexPluginAPI) {
@@ -202,13 +200,7 @@ function reactivityPlugin(api: VexPluginAPI) {
     args: {},
     async handler(ctx) {
       const rows = await ctx.db.table("items").order("name", "asc").all();
-      return {
-        rows,
-        toJSON() {
-          serializationCalls++;
-          return { rows };
-        },
-      };
+      return { rows };
     },
   });
   api.registerQuery("cyclic", {
@@ -220,7 +212,13 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("add", {
-    args: { scope: "string", kind: "string", name: "string", body: "any" },
+    args: {
+      scope: "string",
+      kind: "string",
+      name: "string",
+      body: "json?",
+      score: "number?",
+    },
     async handler(ctx, args) {
       return ctx.db.table("items").insert({ ...args, score: args.score ?? 0 });
     },
@@ -232,7 +230,7 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("upsert", {
-    args: { scope: "string", kind: "string", name: "string", body: "any" },
+    args: { scope: "string", kind: "string", name: "string", body: "json?" },
     async handler(ctx, args) {
       await ctx.db
         .table("items")
@@ -1091,17 +1089,38 @@ describe("reactive subscription bedrock", () => {
       ordinaryCallbackArgs = args.length;
     });
     frames.length = 0;
-    serializationCalls = 0;
     ordinaryCallbackArgs = 0;
+    // Serializations of the group's answer: what holds the added row.
+    let serializations = 0;
+    const stringify = JSON.stringify;
+    const spy = spyOn(JSON, "stringify").mockImplementation(((
+      value: unknown,
+      ...rest: unknown[]
+    ) => {
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        "rows" in value &&
+        (value as { rows: Array<{ name?: string }> }).rows.some(
+          (row) => row.name === "added",
+        )
+      ) {
+        serializations++;
+      }
+      return (stringify as (...args: unknown[]) => string)(value, ...rest);
+    }) as typeof JSON.stringify);
+    try {
+      await vex.mutate("rx.add", {
+        scope: "a",
+        kind: "one",
+        name: "added",
+        body: null,
+      });
+    } finally {
+      spy.mockRestore();
+    }
 
-    await vex.mutate("rx.add", {
-      scope: "a",
-      kind: "one",
-      name: "added",
-      body: null,
-    });
-
-    expect(serializationCalls).toBe(1);
+    expect(serializations).toBe(1);
     expect(ordinaryCallbackArgs).toBe(1);
     expect(frames).toHaveLength(2);
     expect(frames[0]).toBe(frames[1]);

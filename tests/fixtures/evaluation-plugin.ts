@@ -76,6 +76,14 @@ export function evaluationPlugin(api: VexPluginAPI) {
     reactive: { maxRows: 2, maxBytes: 10_000 },
     handler: (ctx) => ctx.db.table("items").all(),
   });
+  // An answer that is not its own JSON reading: an undefined field.
+  api.registerQuery("sparse", {
+    args: { scope: "string" },
+    handler: async (ctx, args) => ({
+      n: await ctx.db.table("items").where("scope", "=", args.scope).count(),
+      missing: undefined,
+    }),
+  });
   api.registerMutation("add", {
     args: { scope: "string", name: "string" },
     handler: (ctx, args) => ctx.db.table("items").insert(args),

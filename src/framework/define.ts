@@ -9,6 +9,7 @@ import type {
   WebhookRequest,
   WebhookResponse,
 } from "../core/types.js";
+import type { ArgsDecl } from "../core/values.js";
 
 const KIND = Symbol.for("vex.kind");
 
@@ -18,13 +19,13 @@ export interface VexTable extends TableSchema {
 
 export interface VexQuery {
   [KIND]: "query";
-  args: Record<string, string>;
+  args: ArgsDecl;
   handler: (ctx: QueryContext, args: Record<string, any>) => Promise<any> | any;
 }
 
 export interface VexMutation {
   [KIND]: "mutation";
-  args: Record<string, string>;
+  args: ArgsDecl;
   handler: (
     ctx: MutationContext,
     args: Record<string, any>,
@@ -33,7 +34,7 @@ export interface VexMutation {
 
 export interface VexAction {
   [KIND]: "action";
-  args: Record<string, string>;
+  args: ArgsDecl;
   handler: (
     ctx: ActionContext,
     args: Record<string, any>,
@@ -92,22 +93,19 @@ export function untag<T extends { [KIND]: string }>(
   return plain;
 }
 
-export function query(
-  args: Record<string, string>,
-  handler: VexQuery["handler"],
-): VexQuery {
+export function query(args: ArgsDecl, handler: VexQuery["handler"]): VexQuery {
   return { [KIND]: "query", args, handler };
 }
 
 export function mutation(
-  args: Record<string, string>,
+  args: ArgsDecl,
   handler: VexMutation["handler"],
 ): VexMutation {
   return { [KIND]: "mutation", args, handler };
 }
 
 export function action(
-  args: Record<string, string>,
+  args: ArgsDecl,
   handler: VexAction["handler"],
 ): VexAction {
   return { [KIND]: "action", args, handler };

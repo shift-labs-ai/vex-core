@@ -47,6 +47,8 @@ export interface EvaluationRequest {
 export interface Evaluation {
   result: unknown;
   serialized: string | undefined;
+  /** Whether `result` is its own JSON reading, so readers may share it. */
+  exact: boolean;
   hash: number;
   resultRows: number | undefined;
   resultBytes: number;

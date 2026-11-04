@@ -18,6 +18,8 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { VexUser } from "../src/core/types.js";
+import { createRouter } from "../src/http/router.js";
+import { vexHandler } from "../src/http/vex-handler.js";
 
 let open: Vex[] = [];
 const runs = new Map<string, number>();
@@ -49,7 +51,7 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("count", {
-    args: { scope: "string", extra: "json" },
+    args: { scope: "string", extra: "json?" },
     async handler(ctx, args) {
       runs.set("count", (runs.get("count") ?? 0) + 1);
       if (failing) throw new Error("count failed");
@@ -344,5 +346,180 @@ describe("a subscription never fails in silence", () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+});
+
+describe("args are what the operation declares, and nothing else", () => {
+  const typed = (api: VexPluginAPI) => {
+    api.setName("t");
+    api.registerQuery("typed", {
+      args: { s: "string", n: "number", b: "boolean?", j: "json?" },
+      handler: (_ctx, args) => ({ ...args }),
+    });
+    api.registerMutation("mut", {
+      args: { s: "string" },
+      handler: (_ctx, args) => args.s,
+    });
+    api.registerAction("act", {
+      args: { n: "number" },
+      handler: (_ctx, args) => args.n,
+    });
+  };
+  const engine = () => create({ plugins: [plugin, typed] });
+
+  test("a wrong type, a missing arg, an undeclared arg, a non-finite number or a non-JSON value is refused, by every call", async () => {
+    const vex = await engine();
+    const refusals: Array<[Record<string, unknown>, string]> = [
+      [{ s: 1, n: 1 }, 'takes arg "s" as string; got number 1'],
+      [{ n: 1 }, 'needs arg "s" (string)'],
+      [{ s: "a", n: 1, x: 1 }, 'takes no arg "x"'],
+      [{ s: "a", n: Number.NaN }, 'takes arg "n" as number'],
+      [{ s: "a", n: Infinity }, 'takes arg "n" as number'],
+      [{ s: "a", n: 1, b: "yes" }, 'takes arg "b" as boolean'],
+      [{ s: "a", n: 1, j: new Date() }, "holds a Date"],
+      [{ s: "a", n: 1, j: { f: () => 1 } }, "holds a function"],
+    ];
+    for (const [args, message] of refusals) {
+      await expect(vex.query("t.typed", args)).rejects.toThrow(message);
+      await expect(vex.subscribe("t.typed", args, () => {})).rejects.toThrow(
+        message,
+      );
+    }
+    await expect(vex.mutate("t.mut", { s: 2 })).rejects.toThrow(
+      'takes arg "s" as string',
+    );
+    await expect(vex.action("t.act", {})).rejects.toThrow('needs arg "n"');
+    expect(vex.activeSubscriptionCount()).toBe(0);
+  });
+
+  test("an optional arg may be absent or null; absent stays absent, null stays null", async () => {
+    const vex = await engine();
+    expect(await vex.query("t.typed", { s: "a", n: 1 })).toEqual({
+      s: "a",
+      n: 1,
+    });
+    expect(
+      await vex.query("t.typed", { s: "a", n: 1, b: null, j: undefined }),
+    ).toEqual({ s: "a", n: 1, b: null });
+  });
+
+  test("a declaration naming a type the engine cannot check is refused at create", async () => {
+    for (const type of ["any", "String", "int", "string[]", ""]) {
+      await expect(
+        create({
+          plugins: [
+            (api: VexPluginAPI) => {
+              api.setName("bad");
+              api.registerQuery("q", {
+                args: { x: type as any },
+                handler: () => null,
+              });
+            },
+          ],
+        }),
+      ).rejects.toThrow(`declares arg "x" as ${JSON.stringify(type)}`);
+    }
+  });
+
+  test("middleware cannot change the args the handler was checked as", async () => {
+    let seen: unknown;
+    const vex = await create({
+      plugins: [
+        (api: VexPluginAPI) => {
+          api.setName("m");
+          api.use((_ctx, info, next) => {
+            try {
+              (info.args as any).s = "rewritten";
+            } catch {}
+            return next();
+          });
+          api.registerQuery("q", {
+            args: { s: "string" },
+            handler: (_ctx, args) => {
+              seen = args.s;
+              return null;
+            },
+          });
+        },
+      ],
+    });
+    await vex.query("m.q", { s: "given" });
+    expect(seen).toBe("given");
+  });
+
+  test("over HTTP a refused arg answers 400 with the reason", async () => {
+    const vex = await engine();
+    const app = createRouter().mount("/vex", vexHandler(vex));
+    const res = await app.handle(
+      new Request("http://x/vex/query", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "t.typed", args: { s: "a" } }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain(
+      'needs arg "n"',
+    );
+  });
+});
+
+describe("an answer is JSON, and every reader hears the same one", () => {
+  const answers = (api: VexPluginAPI) => {
+    api.setName("a");
+    api.registerQuery("dated", {
+      args: {},
+      handler: () => ({ at: new Date(0) }),
+    });
+    api.registerQuery("sparse", {
+      args: {},
+      handler: async (ctx) => ({
+        n: await ctx.db.table("items").count(),
+        missing: undefined,
+      }),
+    });
+    api.registerMutation("dated", {
+      args: {},
+      handler: async (ctx) => {
+        await ctx.db.table("items").insert({ scope: "x", n: 1 });
+        return new Date(0);
+      },
+    });
+    api.registerAction("dated", {
+      args: {},
+      handler: () => new Set([1]),
+    });
+  };
+
+  test("a query, mutation or action answering something JSON cannot say is refused", async () => {
+    const vex = await create({ plugins: [plugin, answers] });
+    await expect(vex.query("a.dated")).rejects.toThrow(
+      "query a.dated answers holds a Date",
+    );
+    await expect(vex.subscribe("a.dated", {}, () => {})).rejects.toThrow(
+      "holds a Date",
+    );
+    await expect(vex.action("a.dated")).rejects.toThrow("holds a Set");
+  });
+
+  test("a mutation refused for its answer commits nothing", async () => {
+    const vex = await create({ plugins: [plugin, answers] });
+    await expect(vex.mutate("a.dated")).rejects.toThrow("holds a Date");
+    expect(await vex.query("bp.count", { scope: "x", extra: null })).toBe(0);
+  });
+
+  test("the first member, a joiner and a member re-run hear one value, not as given", async () => {
+    const vex = await create({ plugins: [plugin, answers] });
+    const first: any[] = [];
+    const joiner: any[] = [];
+    await vex.subscribe("a.sparse", {}, (r) => first.push(r));
+    await vex.subscribe("a.sparse", {}, (r) => joiner.push(r));
+    expect(first[0]).toEqual({ n: 0 });
+    expect("missing" in first[0]).toBe(false);
+    expect("missing" in joiner[0]).toBe(false);
+    await vex.mutate("bp.add", { scope: "q", n: 1 });
+    expect(first[1]).toEqual({ n: 1 });
+    expect("missing" in first[1]).toBe(false);
+    expect(joiner[1]).toEqual(first[1]);
   });
 });

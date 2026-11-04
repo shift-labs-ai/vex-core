@@ -43,7 +43,7 @@ function kvPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("set", {
-    args: { scope: "string", key: "string", value: "any" },
+    args: { scope: "string", key: "string", value: "json?" },
     async handler(ctx, args) {
       await ctx.db
         .table("kv")
@@ -1163,8 +1163,7 @@ describe("jobs", () => {
 });
 
 describe("trace metadata", () => {
-  test("does not serialize query results when no trace is recording", async () => {
-    let serializations = 0;
+  test("a query's answer is checked as JSON whether or not a trace records", async () => {
     const tracers: Array<Tracer | undefined> = [
       undefined,
       { shouldRecord: () => false, onSpan: () => {} },
@@ -1179,22 +1178,17 @@ describe("trace metadata", () => {
             api.setName("sampled");
             api.registerQuery("result", {
               args: {},
-              handler: () => ({
-                toJSON() {
-                  serializations++;
-                  return { ok: true };
-                },
-              }),
+              handler: () => new Map([["ok", true]]),
             });
           },
         ],
       });
 
-      await tvex.query("sampled.result");
+      await expect(tvex.query("sampled.result")).rejects.toThrow(
+        "query sampled.result answers holds a Map",
+      );
       await tvex.close();
     }
-
-    expect(serializations).toBe(0);
   });
 
   test("emits safe metadata for every query and write shape", async () => {
@@ -1314,7 +1308,7 @@ describe("trace metadata", () => {
     await tvex.close();
   });
 
-  test("traced queries measure undefined and cyclic results safely", async () => {
+  test("traced queries measure undefined results; a cyclic one is refused", async () => {
     const spans: Span[] = [];
     const tvex = await Vex.create({
       storage: sqliteAdapter(":memory:"),
@@ -1341,7 +1335,9 @@ describe("trace metadata", () => {
     });
 
     await tvex.query("edge.nothing");
-    await tvex.query("edge.cyclic");
+    await expect(tvex.query("edge.cyclic")).rejects.toThrow(
+      "query edge.cyclic answers holds a cycle",
+    );
 
     const metaFor = (name: string) => {
       const span = spans.find(
@@ -1355,8 +1351,6 @@ describe("trace metadata", () => {
     expect(metaFor("edge.nothing").resultBytes).toBe(
       Buffer.byteLength("undefined"),
     );
-    // Cyclic results cannot be measured; the span still records cleanly.
-    expect(metaFor("edge.cyclic").resultBytes).toBeUndefined();
 
     await tvex.close();
   });

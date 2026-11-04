@@ -27,8 +27,8 @@
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
-import type { VexPluginAPI } from "../src/core/api.js";
 import { UNRESTRICTED } from "../src/core/access.js";
+import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { filterExcludes } from "../src/core/invalidation.js";
 import type { ColumnType, Filter } from "../src/core/types.js";

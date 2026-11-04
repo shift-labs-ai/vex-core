@@ -1,5 +1,6 @@
 import type { TableAccessPolicy } from "./access.js";
 import type { ExecContext } from "./tracer.js";
+import type { ArgsDecl } from "./values.js";
 
 export type ColumnType = "string" | "number" | "boolean" | "json" | "any";
 
@@ -300,13 +301,13 @@ export type OperationAccess<A> = undefined extends A
   : { access: A };
 
 export type QueryDef<A = undefined> = {
-  args: Record<string, string>;
+  args: ArgsDecl;
   reactive?: false | ReactiveBudget;
   handler: (ctx: QueryContext, args: Record<string, any>) => Promise<any> | any;
 } & OperationAccess<A>;
 
 export type MutationDef<A = undefined> = {
-  args: Record<string, string>;
+  args: ArgsDecl;
   handler: (
     ctx: MutationContext,
     args: Record<string, any>,
@@ -320,7 +321,7 @@ export type MutationDef<A = undefined> = {
  * bounds it; its own work does.
  */
 export type ActionDef<A = undefined> = {
-  args: Record<string, string>;
+  args: ArgsDecl;
   handler: (
     ctx: ActionContext,
     args: Record<string, any>,

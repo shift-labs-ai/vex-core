@@ -81,3 +81,5 @@ export type {
   WebhookRequest,
   WebhookResponse,
 } from "./core/types.js";
+export type { ArgsDecl, ArgType } from "./core/values.js";
+export { ArgsError } from "./core/values.js";

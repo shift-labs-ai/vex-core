@@ -15,6 +15,8 @@ type Access = { permission: string };
 
 const dana: VexUser = { id: "dana", name: "Dana", isAdmin: false };
 
+const watched: Array<AbortSignal | null> = [];
+
 function notesPlugin(api: VexPluginAPI<Access>) {
   api.setName("notes");
   api.registerTable("notes", { columns: { text: { type: "string" } } });
@@ -52,10 +54,15 @@ function notesPlugin(api: VexPluginAPI<Access>) {
       return "waited";
     },
   });
+  // What each run of `watch` saw as its caller's signal; an answer is
+  // JSON, so the signal is kept here rather than answered.
   api.registerAction("watch", {
     args: {},
     access: { permission: "notes.wait" },
-    handler: (ctx) => ctx.signal ?? null,
+    handler: (ctx) => {
+      watched.push(ctx.signal ?? null);
+      return watched.length;
+    },
   });
   api.registerAction("watchThrough", {
     args: {},
@@ -171,11 +178,11 @@ describe("actions", () => {
     const { engine } = await recording();
     const caller = new AbortController();
     const call = { user: dana, signal: caller.signal };
-    expect(await engine.action("notes.watch", {}, call)).toBe(caller.signal);
-    expect(await engine.action("notes.watchThrough", {}, call)).toBe(
-      caller.signal,
-    );
-    expect(await engine.action("notes.watch", {}, { user: dana })).toBeNull();
+    watched.length = 0;
+    await engine.action("notes.watch", {}, call);
+    await engine.action("notes.watchThrough", {}, call);
+    await engine.action("notes.watch", {}, { user: dana });
+    expect(watched).toEqual([caller.signal, caller.signal, null]);
   });
 
   test("a caller that has already stopped waiting starts nothing", async () => {
