@@ -610,8 +610,9 @@ interface EngineOptions<A> {
    * read-only engine over the same database, built from the app's own
    * plugins, env and storage (`EvaluationOptions`): so every plugin is
    * given by module, and the storage has a `reader()`, or the engine
-   * refuses to start. Where the runtime has no workers, every read
-   * runs on the main thread.
+   * refuses to start. The engine starts once every worker has built
+   * its engine, and not when one cannot. Where the runtime has no
+   * workers, every read runs on the main thread.
    */
   evaluation?: EvaluationOptions;
 }
@@ -775,6 +776,20 @@ export class Vex<A = unknown> {
     vex.env = settings(options.env);
     vex.services = options.services ?? NO_SERVICES;
     const given = await loadPlugins(options.plugins);
+    // Refused before anything is built: what a worker needs.
+    const reader =
+      options.evaluation && options.evaluation.workers > 0
+        ? readsElsewhere(given, vex.storage)
+        : null;
+    if (options.evaluation) {
+      const offloadAbove = options.evaluation.offloadAboveMs ?? 2;
+      if (!(offloadAbove >= 0)) {
+        throw new TypeError(
+          "evaluation.offloadAboveMs: a run time in ms, 0 or more",
+        );
+      }
+      vex.offloadAboveMs = offloadAbove;
+    }
     const plugins = given.plugins.map((plugin) =>
       resolvePlugin(plugin, vex.env),
     );
@@ -798,26 +813,27 @@ export class Vex<A = unknown> {
 
     // After every table is ensured: a worker's read-only engine
     // registers the tables it finds, and refuses one it does not.
-    if (options.evaluation && options.evaluation.workers > 0) {
-      const reader = readsElsewhere(given, vex.storage);
-      const offloadAbove = options.evaluation.offloadAboveMs ?? 2;
-      if (!(offloadAbove >= 0)) {
-        throw new TypeError(
-          "evaluation.offloadAboveMs: a run time in ms, 0 or more",
-        );
-      }
-      vex.offloadAboveMs = offloadAbove;
-      if (workersAvailable()) {
-        vex.evaluation = new EvaluationPool(
-          new URL("./evaluation-worker.js", import.meta.url),
-          options.evaluation.workers,
-          {
-            plugins: given.modules,
-            env: vex.env,
-            reader,
-            handlerTimeoutMs: vex.handlerTimeoutMs,
-            reactive: vex.reactiveDefaults,
-          },
+    // The engine starts with its workers built, or not at all.
+    if (options.evaluation && reader && workersAvailable()) {
+      const pool = new EvaluationPool(
+        new URL("./evaluation-worker.js", import.meta.url),
+        options.evaluation.workers,
+        {
+          plugins: given.modules,
+          env: vex.env,
+          reader,
+          handlerTimeoutMs: vex.handlerTimeoutMs,
+          reactive: vex.reactiveDefaults,
+        },
+      );
+      vex.evaluation = pool;
+      try {
+        await pool.ready;
+      } catch (error) {
+        await vex.close();
+        throw new Error(
+          `an evaluation worker could not build its engine: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
         );
       }
     }
@@ -2545,30 +2561,29 @@ export class Vex<A = unknown> {
 
   /**
    * The pool that takes this run of `name`, or null when it runs here.
-   * A run is measured only in a worker, which runs one at a time: on
-   * this thread runs interleave, so their times say little. So the
-   * pool takes a run of a query not yet measured, of one whose runs
-   * cost past `offloadAboveMs` (`offloading`), and one in every
-   * `REMEASURE_EVERY` of a query kept here, which measures it again.
-   * Under `purityCheck`, which repeats runs on this thread, every run
-   * is here.
+   * A run is timed only in a worker, which runs one at a time: on this
+   * thread runs interleave, so their times say little. The pool takes
+   * every run of a query whose runs cost past `offloadAboveMs`
+   * (`offloading`). A run that would time a query, its first and one
+   * in every `REMEASURE_EVERY` kept here, goes to the pool when a
+   * worker is idle: one waiting behind costly runs would only add
+   * their wait, so it runs here and a later run times it. Under
+   * `purityCheck`, which repeats runs on this thread, every run is
+   * here.
    */
   private poolFor(name: string): EvaluationPool | null {
-    if (!this.evaluation || this.purity > 0) return null;
-    if (
-      this.offloadAboveMs === 0 ||
-      this.offloading.has(name) ||
-      !this.readCost.has(name)
-    ) {
-      return this.evaluation;
+    const pool = this.evaluation;
+    if (!pool || this.purity > 0) return null;
+    if (this.offloadAboveMs === 0 || this.offloading.has(name)) return pool;
+    const runs = this.readCost.has(name)
+      ? (this.runsHere.get(name) ?? 0) + 1
+      : REMEASURE_EVERY;
+    if (runs >= REMEASURE_EVERY && pool.idleNow()) {
+      this.runsHere.delete(name);
+      return pool;
     }
-    const runs = (this.runsHere.get(name) ?? 0) + 1;
-    if (runs < REMEASURE_EVERY) {
-      this.runsHere.set(name, runs);
-      return null;
-    }
-    this.runsHere.delete(name);
-    return this.evaluation;
+    this.runsHere.set(name, runs);
+    return null;
   }
 
   /**

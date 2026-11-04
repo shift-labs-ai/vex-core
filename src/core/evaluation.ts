@@ -15,12 +15,12 @@ import type { ReactiveBudget, VexEnv, VexUser } from "./types.js";
  * flight, delivery, writes, actions.
  *
  * A run's answer crosses back as a copy, which costs the main thread;
- * a run cheaper than that is cheaper there. So the pool takes a
- * query's runs, subscriptions' and one-shot calls' alike, once they
- * cost more than `offloadAboveMs`, and hands them back once they cost
- * under half of it. A run is measured in a worker, where it runs
- * alone: the pool takes a query's first run to measure it, and one in
- * every few of a query it handed back, to measure it again.
+ * a run cheaper than its copy is cheaper on the main thread. So the
+ * pool takes a query's runs, subscriptions' and one-shot calls'
+ * alike, once they cost more than `offloadAboveMs`, and hands them
+ * back once they cost under half of it. A run is timed in a worker,
+ * where it runs alone: a query's first run, and one in 32 of a query
+ * kept on the main thread, go to a worker that is idle, to time it.
  */
 export interface EvaluationOptions {
   /** How many workers read; none reads on the main thread. */
@@ -151,16 +151,17 @@ interface Pending {
 interface Member {
   worker: Worker;
   ready: Promise<void>;
+  /** Its engine is built: it takes a run at once. */
+  booted: boolean;
   /** The run it is on, by id; one at a time, its CPU being the point. */
   run: { id: number; pending: Pending } | null;
 }
 
 /**
  * The pool: its workers spawn as it is made, each building its engine
- * at once, so the first run waits for no boot. A request goes to an
- * idle worker, or waits for one; each worker runs one request at a
- * time. A worker that dies fails what it was running and is replaced
- * on the next request.
+ * at once (`ready`). A request goes to an idle worker, or waits for
+ * one; each worker runs one request at a time. A worker that dies
+ * fails what it was running and is replaced on the next request.
  */
 export class EvaluationPool {
   private readonly members: Member[] = [];
@@ -170,6 +171,8 @@ export class EvaluationPool {
   }> = [];
   private nextId = 0;
   private closed = false;
+  /** Every first worker's engine built, or why one could not be. */
+  readonly ready: Promise<void>;
 
   constructor(
     private readonly script: URL,
@@ -177,6 +180,15 @@ export class EvaluationPool {
     private readonly init: EvaluationInit,
   ) {
     for (let i = 0; i < size; i++) this.members.push(this.spawn());
+    this.ready = Promise.all(this.members.map((m) => m.ready)).then(() => {});
+  }
+
+  /** Whether a worker would take a run now, with none waiting. */
+  idleNow(): boolean {
+    return (
+      this.queue.length === 0 &&
+      this.members.some((member) => member.booted && member.run === null)
+    );
   }
 
   run(request: EvaluationRequest): Promise<Evaluation> {
@@ -229,8 +241,13 @@ export class EvaluationPool {
     const member: Member = {
       worker,
       ready: new Promise<void>((resolve, reject) => {
-        booted = (outcome) => (outcome ? reject(outcome) : resolve());
+        booted = (outcome) => {
+          if (outcome) return reject(outcome);
+          member.booted = true;
+          resolve();
+        };
       }),
+      booted: false,
       run: null,
     };
     worker.addEventListener("message", (event: MessageEvent) => {

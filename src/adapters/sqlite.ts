@@ -367,7 +367,6 @@ export function sqliteAdapter(
   // outside any caller's transaction, so its ANALYZE commits alone.
   let statisticsDue: ReturnType<typeof setTimeout> | undefined;
   async function refreshStatistics(): Promise<void> {
-    if (readonly) return;
     try {
       const changed = await withConnectionLock(() => gatherStatistics(db));
       if (changed) {
@@ -390,14 +389,17 @@ export function sqliteAdapter(
       }, 0),
     );
   }
-  const statisticsTimer = transactionContext.exit(() =>
-    setInterval(
-      () => void refreshStatistics(),
-      opts?.statisticsIntervalMs ?? SQLITE_STATISTICS_INTERVAL_MS,
-    ),
-  );
+  // A read-only adapter gathers none, so it keeps no timer for them.
+  const statisticsTimer = readonly
+    ? undefined
+    : transactionContext.exit(() =>
+        setInterval(
+          () => void refreshStatistics(),
+          opts?.statisticsIntervalMs ?? SQLITE_STATISTICS_INTERVAL_MS,
+        ),
+      );
   // A timer of the adapter's own never keeps a process alive.
-  statisticsTimer.unref?.();
+  statisticsTimer?.unref?.();
 
   async function withConnectionLock<T>(fn: () => Promise<T> | T): Promise<T> {
     if (closed) throw closedError();
@@ -423,7 +425,8 @@ export function sqliteAdapter(
 
   // Transaction-owned reads must use the write handle to see uncommitted
   // changes. Connection-local state (TEMP tables, ATTACH, PRAGMAs) also pins
-  // reads to that handle. In-memory databases have no shareable backing file.
+  // reads to that handle. An in-memory database has no shareable backing
+  // file, and a read-only adapter no pool: each reads on its one handle.
   function readsUseWriter(): boolean {
     return (
       transactionContext.getStore()?.active === true ||

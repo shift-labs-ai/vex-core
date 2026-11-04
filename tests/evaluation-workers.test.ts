@@ -60,6 +60,20 @@ const meta = (type: string) =>
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
 
+/**
+ * What `call` fails with, read by a plain await: under Bun 1.4.2's test
+ * runner, `expect(p).rejects` does not settle on a worker's reply once
+ * the test has awaited an earlier one (`Vex.create` awaits its workers),
+ * so a worker's failure is read first and matched after.
+ */
+const failure = (call: Promise<unknown>): Promise<Error> =>
+  call.then(
+    () => {
+      throw new Error("it did not fail");
+    },
+    (error: Error) => error,
+  );
+
 describe("evaluation workers", () => {
   test("a subscription's runs happen in a worker and deliver as on the main thread", async () => {
     const vex = await create();
@@ -168,9 +182,9 @@ describe("evaluation workers", () => {
 
   test("a handler error in the worker fails the subscribe as on the main thread", async () => {
     const vex = await create();
-    await expect(vex.subscribe("ev.failing", {}, () => {})).rejects.toThrow(
-      "handler failed",
-    );
+    expect(
+      (await failure(vex.subscribe("ev.failing", {}, () => {}))).message,
+    ).toBe("handler failed");
     expect(vex.activeSubscriptionCount()).toBe(0);
   });
 
@@ -179,9 +193,9 @@ describe("evaluation workers", () => {
     for (const name of ["a", "b", "c"]) {
       await vex.mutate("ev.add", { scope: "a", name });
     }
-    await expect(vex.subscribe("ev.huge", {}, () => {})).rejects.toThrow(
-      "Reactive query budget exceeded",
-    );
+    expect(
+      (await failure(vex.subscribe("ev.huge", {}, () => {}))).message,
+    ).toContain("Reactive query budget exceeded");
   });
 
   test("many subscriptions re-run across the pool and every one is delivered", async () => {
@@ -243,7 +257,7 @@ describe("evaluation workers", () => {
 
   test("a refusal in a worker answers with its HTTP status and body, as one here would", async () => {
     const vex = await create(1);
-    const error = await vex.query("ev.forbidden").catch((e: unknown) => e);
+    const error = await failure(vex.query("ev.forbidden"));
     expect(isHttpError(error)).toBe(true);
     expect(error).toMatchObject({
       status: 403,
@@ -261,12 +275,11 @@ describe("evaluation workers", () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ code: "NOT_YOURS" });
     // Its body crosses as HTTP would send it, its JSON reading, even
-    // when it holds what a thread boundary cannot copy. Read first,
-    // then matched: Bun 1.4.2's `expect(p).rejects` does not settle on a
-    // worker's reply after an earlier one in the same test.
-    expect(
-      await vex.query("ev.forbiddenOddly").catch((e: unknown) => e),
-    ).toMatchObject({ status: 403, body: { code: "NOT_YOURS" } });
+    // when it holds what a thread boundary cannot copy.
+    expect(await failure(vex.query("ev.forbiddenOddly"))).toMatchObject({
+      status: 403,
+      body: { code: "NOT_YOURS" },
+    });
     // An args refusal stays a 400 wherever the args are checked.
     await expect(vex.query("ev.names", { scope: 1 })).rejects.toMatchObject({
       status: 400,
@@ -274,58 +287,73 @@ describe("evaluation workers", () => {
   });
 
   test("a query's first run is measured in the pool; a cheap one stays here, measured again one run in 32", async () => {
-    const vex = await create(1, { offloadAboveMs: 5 });
-    const ran = () => meta("query").at(-1)?.offThread === true;
+    const vex = await create(1, { offloadAboveMs: 10 });
+    const ranOffThread = () => meta("query").at(-1)?.offThread === true;
     await vex.query("ev.names", { scope: "a" });
-    expect(ran()).toBe(true);
+    expect(ranOffThread()).toBe(true);
     const here: boolean[] = [];
     for (let i = 0; i < 31; i++) {
       await vex.query("ev.names", { scope: "a" });
-      here.push(!ran());
+      here.push(!ranOffThread());
     }
     expect(here.every(Boolean)).toBe(true);
     await vex.query("ev.names", { scope: "a" });
-    expect(ran()).toBe(true);
+    expect(ranOffThread()).toBe(true);
     await vex.query("ev.names", { scope: "a" });
-    expect(ran()).toBe(false);
+    expect(ranOffThread()).toBe(false);
   });
 
   test("a costly query stays in the pool, and comes back once its runs cost under half of offloadAboveMs", async () => {
-    const vex = await create(1, { offloadAboveMs: 5 });
-    const ran = () => meta("query").at(-1)?.offThread === true;
+    const vex = await create(1, { offloadAboveMs: 10 });
+    const ranOffThread = () => meta("query").at(-1)?.offThread === true;
     for (let i = 0; i < 3; i++) {
-      await vex.query("ev.slow", { ms: 20 });
-      expect(ran()).toBe(true);
+      await vex.query("ev.slow", { ms: 40 });
+      expect(ranOffThread()).toBe(true);
     }
-    // Its average falls a third of the way each run, and under 2.5 ms
-    // it returns here.
+    // Its average falls a third of the way each run, and under 5 ms it
+    // returns here.
     let runs = 0;
-    while (ran() && runs < 12) {
+    while (ranOffThread() && runs < 12) {
       await vex.query("ev.slow", { ms: 0 });
       runs++;
     }
-    expect(ran()).toBe(false);
+    expect(ranOffThread()).toBe(false);
     expect(runs).toBeGreaterThan(1);
   });
 
   test("a cheap query kept here moves to the pool once a measuring run finds it costly", async () => {
-    const vex = await create(1, { offloadAboveMs: 5 });
-    const ran = () => meta("query").at(-1)?.offThread === true;
+    const vex = await create(1, { offloadAboveMs: 10 });
+    const ranOffThread = () => meta("query").at(-1)?.offThread === true;
     await vex.query("ev.slow", { ms: 0 });
     for (let i = 0; i < 31; i++) await vex.query("ev.slow", { ms: 0 });
-    expect(ran()).toBe(false);
-    // The 32nd run here is measured in the pool, and it has grown.
-    await vex.query("ev.slow", { ms: 20 });
-    expect(ran()).toBe(true);
-    await vex.query("ev.slow", { ms: 20 });
-    expect(ran()).toBe(true);
+    expect(ranOffThread()).toBe(false);
+    // One run in 32 of a query kept here is timed in the pool: this
+    // one, and the query has grown.
+    await vex.query("ev.slow", { ms: 40 });
+    expect(ranOffThread()).toBe(true);
+    await vex.query("ev.slow", { ms: 40 });
+    expect(ranOffThread()).toBe(true);
+  });
+
+  test("a run that only times a query never waits behind a busy pool: it runs here, and a later run is timed", async () => {
+    const vex = await create(1, { offloadAboveMs: 10 });
+    const ranOffThread = () => meta("query").at(-1)?.offThread === true;
+    await vex.query("ev.slow", { ms: 40 });
+    // The one worker busy with a costly run, a first run of another
+    // query is not sent to wait behind it.
+    const busy = vex.query("ev.slow", { ms: 40 });
+    await vex.query("ev.names", { scope: "a" });
+    expect(ranOffThread()).toBe(false);
+    await busy;
+    await vex.query("ev.names", { scope: "a" });
+    expect(ranOffThread()).toBe(true);
   });
 
   test("a subscription's runs follow the same rule", async () => {
-    const vex = await create(1, { offloadAboveMs: 5 });
+    const vex = await create(1, { offloadAboveMs: 10 });
     await vex.subscribe("ev.names", { scope: "a" }, () => {});
     expect(meta("subscribe").at(-1)?.offThread).toBe(true);
-    await vex.subscribe("ev.slow", { ms: 20 }, () => {});
+    await vex.subscribe("ev.slow", { ms: 40 }, () => {});
     expect(meta("subscribe").at(-1)?.offThread).toBe(true);
     spans.length = 0;
     await vex.mutate("ev.add", { scope: "a", name: "one" });
@@ -387,6 +415,18 @@ describe("what a worker needs, or the engine refuses to start", () => {
   test("offloadAboveMs is a run time, 0 or more", async () => {
     await expect(create(1, { offloadAboveMs: -1 })).rejects.toThrow(
       "evaluation.offloadAboveMs: a run time in ms, 0 or more",
+    );
+  });
+
+  test("a worker that cannot build its engine stops the engine from starting, saying why", async () => {
+    await expect(
+      Vex.create({
+        plugins: [new URL("./fixtures/refs/main-only.ts", import.meta.url)],
+        storage: sqliteAdapter(databasePath()),
+        evaluation: { workers: 1 },
+      }),
+    ).rejects.toThrow(
+      "an evaluation worker could not build its engine: this plugin builds on the main thread",
     );
   });
 
