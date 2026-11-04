@@ -170,6 +170,12 @@ afterEach(async () => {
   dirs = [];
 });
 
+// EQ_PURITY=1: every run repeated on the same data, and every group a
+// write skipped run again and compared: the engine's narrowing and
+// each query's purity checked at once. Runs double, so the waste
+// bound does not apply.
+const PURITY = process.env.EQ_PURITY === "1";
+
 async function create(mode: Mode) {
   const dir = mkdtempSync(join(tmpdir(), "vex-eq-"));
   dirs.push(dir);
@@ -179,6 +185,7 @@ async function create(mode: Mode) {
     plugins: [equivalencePlugin],
     storage: sqliteAdapter(path),
     reactive: { maxRows: 1000, maxBytes: 1024 * 1024 },
+    purityCheck: PURITY ? "always" : "off",
     tracer: {
       onSpan(span: Span) {
         if (span.type === "invalidation" && span.meta) {
@@ -234,6 +241,8 @@ async function run(mode: Mode, seed: number) {
   await vex.mutate("eq.grant", { userId: "alice", itemId: gids[1] });
 
   const watches: Watch[] = [];
+  // Views that ended: under EQ_PURITY, a check that failed.
+  const endings: string[] = [];
   for (let i = 0; i < 12; i++) {
     const s = spec(random, ids);
     const w: Watch = {
@@ -246,7 +255,12 @@ async function run(mode: Mode, seed: number) {
       { spec: s },
       (result: { data: unknown; version: number | null }) =>
         w.deliveries.push({ ...result, count: rowCount(result.data) }),
-      w.user ? { user: w.user } : undefined,
+      {
+        ...(w.user ? { user: w.user } : {}),
+        onError: (error: Error, ended: boolean) => {
+          if (ended) endings.push(error.message);
+        },
+      },
     );
     watches.push(w);
   }
@@ -364,6 +378,7 @@ async function run(mode: Mode, seed: number) {
       }
     }
   }
+  expect(endings).toEqual([]);
   return { changed, spent };
 }
 
@@ -385,7 +400,7 @@ describe("equivalence under every read shape and write kind", () => {
       console.log(
         `${mode}: ${spent} group runs for ${changed} changed results (${wasted} beyond)`,
       );
-      expect(wasted).toBeLessThanOrEqual(changed * 1.5);
+      if (!PURITY) expect(wasted).toBeLessThanOrEqual(changed * 1.5);
     }, 120_000);
   }
 });

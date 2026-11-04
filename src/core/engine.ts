@@ -18,6 +18,7 @@ import {
 import {
   assertGuarded,
   type FrameKind,
+  GuardError,
   inFrame,
   installGuards,
   outsideFrame,
@@ -510,6 +511,17 @@ export interface VexOptions<A = undefined> {
    */
   migrations?: readonly Migration[];
   /**
+   * Whether to check that queries answer from their context alone:
+   * a run is repeated on the same data and the answers compared, and
+   * a subscription a write skipped is run again and compared with its
+   * last answer. A query whose answers differ is refused (a run) or
+   * ended (a subscription), naming it: its answer depends on state no
+   * context tracks, such as a module's variables. "always", a share of
+   * runs (0 to 1), or "off" (the default). It runs each checked query
+   * twice.
+   */
+  purityCheck?: "always" | "off" | number;
+  /**
    * Evaluate subscriptions off the main thread, in workers each running
    * a read-only engine over the same database (`EvaluationOptions`).
    * Where the runtime has no workers, or for a caller that cannot
@@ -568,6 +580,8 @@ export class Vex<A = unknown> {
   // callers alike in every field its runs read.
   private readonly families = new Map<string, Set<SubscriptionGroup>>();
   private groupSerial = 0;
+  // The share of runs `purityCheck` repeats.
+  private purity = 0;
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
   private appId: string = "unknown";
@@ -640,6 +654,17 @@ export class Vex<A = unknown> {
     if (options.tracer) vex.tracer = options.tracer;
     if (options.appId) vex.appId = options.appId;
     if (options.jobScheduler) vex.jobScheduler = options.jobScheduler;
+    const purity = options.purityCheck ?? "off";
+    if (
+      purity !== "off" &&
+      purity !== "always" &&
+      !(purity >= 0 && purity <= 1)
+    ) {
+      throw new TypeError(
+        'purityCheck: "always", "off", or a share of runs from 0 to 1',
+      );
+    }
+    vex.purity = purity === "always" ? 1 : purity === "off" ? 0 : purity;
     if (options.handlerTimeoutMs)
       vex.handlerTimeoutMs = options.handlerTimeoutMs;
     if (options.reactive) {
@@ -1989,22 +2014,25 @@ export class Vex<A = unknown> {
     let result: unknown;
     do {
       group.stale = false;
-      group.tables = new Set();
-      group.dependencies = [];
-      const reads = new Set<string>();
-      const ctx = this.buildQueryContext(
-        group.tables,
-        group.user,
-        group.dependencies,
-        reads,
-      );
-      result = await this.runMiddleware(
-        ctx,
-        info,
-        () => reg.def.handler(ctx, group.args),
-        ectx,
-      );
-      group.reads = reads;
+      result = await this.checkedRun(group.queryName, async () => {
+        group.tables = new Set();
+        group.dependencies = [];
+        const reads = new Set<string>();
+        const ctx = this.buildQueryContext(
+          group.tables,
+          group.user,
+          group.dependencies,
+          reads,
+        );
+        const answer = await this.runMiddleware(
+          ctx,
+          info,
+          () => reg.def.handler(ctx, group.args),
+          ectx,
+        );
+        group.reads = reads;
+        return answer;
+      });
     } while (group.stale);
     return {
       result,
@@ -2183,9 +2211,12 @@ export class Vex<A = unknown> {
         // Groups run together: each is one query for one caller, with
         // nothing shared but the pool that bounds how many evaluate at
         // once off the main thread.
-        await Promise.all(
-          affected.map((group) => this.rerunGroup(group, _invEctx, meta)),
-        );
+        await Promise.all([
+          ...affected.map((group) => this.rerunGroup(group, _invEctx, meta)),
+          ...this.skippedToCheck(new Set(affected)).map((group) =>
+            this.recheckSkipped(group, _invEctx),
+          ),
+        ]);
       },
     );
   }
@@ -2325,6 +2356,69 @@ export class Vex<A = unknown> {
     }
   }
 
+  /**
+   * `run`, or under `purityCheck`, `run` twice on the same data with
+   * the answers compared: a query answering two ways reads state no
+   * context tracks.
+   */
+  private async checkedRun<T>(name: string, run: () => Promise<T>): Promise<T> {
+    if (this.purity === 0 || ambient.random() >= this.purity) return run();
+    return this.storage.transaction(async () => {
+      const first = await run();
+      const second = await run();
+      const a = serializeJson(first, `query ${name} answers`).serialized;
+      const b = serializeJson(second, `query ${name} answers`).serialized;
+      if (a !== b) {
+        throw new GuardError(
+          `query ${name} answered two ways on the same data: its answer depends on state its context does not track, such as a module's variables`,
+        );
+      }
+      return first;
+    });
+  }
+
+  /** Under `purityCheck`, the groups a pass skipped that it checks. */
+  private skippedToCheck(
+    affected: ReadonlySet<SubscriptionGroup>,
+  ): SubscriptionGroup[] {
+    if (this.purity === 0) return [];
+    const at = ambient.now();
+    return [...this.groups.values()].filter(
+      (group) =>
+        !affected.has(group) &&
+        !group.run &&
+        group.last !== null &&
+        !(group.clockUntil !== undefined && group.clockUntil <= at) &&
+        ambient.random() < this.purity,
+    );
+  }
+
+  /**
+   * Runs a group nothing it read changed and compares the answer with
+   * its last: one that differs ends, each member told why.
+   */
+  private async recheckSkipped(
+    group: SubscriptionGroup,
+    ectx: ExecContext,
+  ): Promise<void> {
+    const reg = this.queries.get(group.queryName);
+    const before = group.last;
+    if (!reg || !before) return;
+    try {
+      const { measurement } = await this.runGroup(group, reg, ectx);
+      if (measurement.hash === before.hash) return;
+    } catch {
+      // A failure is the next write's to report, as any run's is.
+      return;
+    }
+    const error = new GuardError(
+      `query ${group.queryName} answered differently though nothing it read changed: its answer depends on state its context does not track (or a change went unseen)`,
+    );
+    const members = [...group.members];
+    this.dropGroup(group);
+    for (const sub of members) this.notify(sub, error, true);
+  }
+
   /** Files `group` under the clock when its answer holds until a time. */
   private timeGroup(group: SubscriptionGroup): void {
     let until: number | undefined;
@@ -2434,13 +2528,15 @@ export class Vex<A = unknown> {
       const recording = isTraceRecording(ectx);
       const tables = recording ? new Set<string>() : undefined;
       const dependencies = recording ? ([] as QueryDependency[]) : undefined;
-      const ctx = this.buildQueryContext(tables, user, dependencies);
-      const result = await this.runMiddleware(
-        ctx,
-        { type: "query", name, args, access: reg.def.access },
-        () => reg.def.handler(ctx, args),
-        ectx,
-      );
+      const result = await this.checkedRun(name, () => {
+        const ctx = this.buildQueryContext(tables, user, dependencies);
+        return this.runMiddleware(
+          ctx,
+          { type: "query", name, args, access: reg.def.access },
+          () => reg.def.handler(ctx, args),
+          ectx,
+        );
+      });
       const { serialized } = serializeJson(result, `query ${name} answers`);
       if (tables && dependencies) {
         meta.plugin = reg.plugin;

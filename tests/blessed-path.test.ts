@@ -831,3 +831,82 @@ describe("the schema changes through migrations; raw access is internal", () => 
     }
   });
 });
+
+describe("under purityCheck, a query answers from its context alone", () => {
+  let counter = 0;
+  let mode = "a";
+  const impure = (api: VexPluginAPI) => {
+    api.setName("pu");
+    api.registerQuery("counted", {
+      args: {},
+      // Module state in the answer: a different answer every run.
+      handler: () => ++counter,
+    });
+    api.registerQuery("moded", {
+      args: {},
+      handler: async (ctx) => ({
+        n: await ctx.db.table("items").where("scope", "=", "m").count(),
+        mode,
+      }),
+    });
+  };
+
+  test("a run answering two ways on the same data is refused, naming why", async () => {
+    const vex = await create({
+      plugins: [plugin, impure],
+      purityCheck: "always",
+    });
+    await expect(vex.query("pu.counted")).rejects.toThrow(
+      "query pu.counted answered two ways on the same data",
+    );
+    await expect(vex.subscribe("pu.counted", {}, () => {})).rejects.toThrow(
+      "answered two ways on the same data",
+    );
+  });
+
+  test("a subscription that answers differently though nothing it read changed is ended and told", async () => {
+    const vex = await create({
+      plugins: [plugin, impure],
+      purityCheck: "always",
+    });
+    mode = "a";
+    const told: Array<[string, boolean]> = [];
+    const heard: unknown[] = [];
+    await vex.subscribe("pu.moded", {}, (r) => heard.push(r), {
+      onError: (error, ended) => told.push([error.message, ended]),
+    });
+    mode = "b";
+    // A write it did not read: skipped, then checked.
+    await vex.mutate("bp.add", { scope: "elsewhere", n: 1 });
+    expect(told).toEqual([
+      [
+        expect.stringContaining(
+          "answered differently though nothing it read changed",
+        ),
+        true,
+      ],
+    ]);
+    expect(heard).toEqual([{ n: 0, mode: "a" }]);
+    expect(vex.activeSubscriptionCount()).toBe(0);
+  });
+
+  test("pure queries answer and deliver as ever under the check", async () => {
+    const vex = await create({ purityCheck: "always" });
+    const seen: number[] = [];
+    await vex.subscribe("bp.count", { scope: "a", extra: null }, (n: number) =>
+      seen.push(n),
+    );
+    await vex.mutate("bp.add", { scope: "a", n: 1 });
+    await vex.mutate("bp.add", { scope: "other", n: 1 });
+    expect(seen).toEqual([0, 1]);
+    expect(await vex.query("bp.count", { scope: "a", extra: null })).toBe(1);
+  });
+
+  test("the check takes always, off, or a share of runs", async () => {
+    for (const purityCheck of [1.5, -1, "sometimes"]) {
+      await expect(create({ purityCheck: purityCheck as any })).rejects.toThrow(
+        'purityCheck: "always", "off", or a share of runs from 0 to 1',
+      );
+    }
+  });
+});
