@@ -915,3 +915,35 @@ describe("under purityCheck, a query answers from its context alone", () => {
     }
   });
 });
+
+test("an action's call may name its caller, as the app decides", async () => {
+  const seen: Array<string | null> = [];
+  const vex = await create({
+    plugins: [
+      (api: VexPluginAPI) => {
+        api.setName("as");
+        api.registerQuery("who", {
+          args: {},
+          handler: (ctx) => {
+            seen.push(ctx.user?.id ?? null);
+            return null;
+          },
+        });
+        api.registerAction("run", {
+          args: {},
+          async handler(ctx) {
+            await ctx.query("as.who");
+            await ctx.query(
+              "as.who",
+              {},
+              { user: { id: "system", name: "S", isAdmin: true } },
+            );
+            return null;
+          },
+        });
+      },
+    ],
+  });
+  await vex.action("as.run", {}, { user: alice });
+  expect(seen).toEqual(["alice", "system"]);
+});

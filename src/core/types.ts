@@ -281,10 +281,25 @@ export interface MutationContext {
  * transaction. Nothing it does is held open while it waits.
  */
 export interface ActionContext {
-  query<T = any>(name: string, args?: Record<string, any>): Promise<T>;
-  mutate<T = any>(name: string, args?: Record<string, any>): Promise<T>;
-  /** Another action, as the same caller, stopped when this one is. */
-  action<T = any>(name: string, args?: Record<string, any>): Promise<T>;
+  /** As the action's caller, unless `as` names another (the app's to
+   *  decide, by its middleware). */
+  query<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    as?: { user: VexUser | null },
+  ): Promise<T>;
+  mutate<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    as?: { user: VexUser | null },
+  ): Promise<T>;
+  /** Another action, as the same caller (or `as`), stopped when this
+   *  one is. */
+  action<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    as?: { user: VexUser | null },
+  ): Promise<T>;
   runtime: VexRuntime;
   user?: VexUser | null;
   /** Aborted when the caller stops waiting (`/action`'s request

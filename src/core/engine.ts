@@ -1146,12 +1146,14 @@ export class Vex<A = unknown> {
     const as = (): CallContext => ({ parent, user: ctx.user });
     const ctx: ActionContext = {
       // Each call is the action's own, through its context.
-      query: (name, args = {}) =>
-        outsideFrame(() => this.query(name, args, as())),
-      mutate: (name, args = {}) =>
-        outsideFrame(() => this.mutate(name, args, as())),
-      action: (name, args = {}) =>
-        outsideFrame(() => this.action(name, args, { ...as(), signal })),
+      query: (name, args = {}, caller) =>
+        outsideFrame(() => this.query(name, args, { ...as(), ...caller })),
+      mutate: (name, args = {}, caller) =>
+        outsideFrame(() => this.mutate(name, args, { ...as(), ...caller })),
+      action: (name, args = {}, caller) =>
+        outsideFrame(() =>
+          this.action(name, args, { ...as(), ...caller, signal }),
+        ),
       runtime: this.runtime(),
       user: user ?? undefined,
       signal,
