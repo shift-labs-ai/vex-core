@@ -166,7 +166,6 @@ async function create(mode: Mode): Promise<Harness> {
 }
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
-const withFn = { ...alice, decide: () => true } as unknown as VexUser;
 
 /** A burst: `n` writes issued together. */
 const burst = (
@@ -330,12 +329,6 @@ const scenarios: Record<string, (h: Harness) => Promise<void>> = {
       h.write("renameGoverned", { id: mine, title: "mine'" }),
       h.write("addGoverned", { title: "third" }),
     ]);
-  },
-  "a caller that cannot cross to a worker, beside one that can": async (h) => {
-    await h.watch("whoami", {}, alice);
-    await h.watch("whoami", {}, withFn);
-    await h.watch("sum", { scope: "a" }, withFn);
-    await burst(h, 6, (i) => ["add", { scope: "a", n: i }]);
   },
   "three identical subscribers": async (h) => {
     for (let i = 0; i < 3; i++) await h.watch("sum", { scope: "a" });

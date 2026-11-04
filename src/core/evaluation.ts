@@ -49,6 +49,8 @@ export interface Evaluation {
   serialized: string | undefined;
   /** Whether `result` is its own JSON reading, so readers may share it. */
   exact: boolean;
+  /** The caller's fields the run read. */
+  callerReads: string[];
   hash: number;
   resultRows: number | undefined;
   resultBytes: number;
@@ -73,16 +75,6 @@ export type WorkerOutbound =
   | { type: "failed"; error: string }
   | { type: "done"; id: number; evaluation: Evaluation }
   | { type: "error"; id: number; error: string };
-
-/** Whether `value` can cross to a worker as it is. */
-export function transferable(value: unknown): boolean {
-  try {
-    structuredClone(value);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /** Whether this runtime can host evaluation workers. */
 export function workersAvailable(): boolean {

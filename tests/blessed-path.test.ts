@@ -116,7 +116,7 @@ describe("callers share a run only when nothing tells them apart", () => {
     expect(fenced.at(-1).map((r: any) => r.n)).toEqual([1, 3]);
   });
 
-  test("callers alike in every field share one run; a caller carrying functions shares only with itself", async () => {
+  test("callers alike in every field share one run; a caller holding a function is refused", async () => {
     const vex = await create();
     await vex.subscribe("bp.visible", { scope: "a" }, () => {}, {
       user: { ...alice },
@@ -126,27 +126,67 @@ describe("callers share a run only when nothing tells them apart", () => {
     });
     expect(vex.describeSubscriptions().unique).toBe(1);
     const withReach = { ...alice, reach: () => true } as unknown as VexUser;
-    await vex.subscribe("bp.visible", { scope: "a" }, () => {}, {
-      user: withReach,
-    });
-    await vex.subscribe("bp.visible", { scope: "a" }, () => {}, {
-      user: withReach,
-    });
-    await vex.subscribe("bp.visible", { scope: "a" }, () => {}, {
-      user: { ...alice, reach: () => true } as unknown as VexUser,
-    });
-    expect(vex.describeSubscriptions().unique).toBe(3);
+    await expect(
+      vex.subscribe("bp.visible", { scope: "a" }, () => {}, {
+        user: withReach,
+      }),
+    ).rejects.toThrow("a caller is plain data");
+    await expect(
+      vex.query("bp.visible", { scope: "a" }, { user: withReach }),
+    ).rejects.toThrow("a caller is plain data");
   });
 
-  test("an app saying which fields decide shares across the rest", async () => {
-    const vex = await create({ callerKey: (user) => user?.id ?? "none" });
+  test("callers differing only in fields the query never reads share one run", async () => {
+    const vex = await create();
+    // bp.visible reads only `fence`.
     await vex.subscribe("bp.visible", { scope: "a" }, () => {}, {
       user: { ...alice, seenAt: 1 } as VexUser,
     });
     await vex.subscribe("bp.visible", { scope: "a" }, () => {}, {
-      user: { ...alice, seenAt: 2 } as VexUser,
+      user: { ...alice, id: "bob", seenAt: 2 } as VexUser,
     });
     expect(vex.describeSubscriptions().unique).toBe(1);
+    // A different fence is a different answer: its own run.
+    await vex.subscribe("bp.visible", { scope: "a" }, () => {}, {
+      user: { ...alice, fence: "5" } as VexUser,
+    });
+    expect(vex.describeSubscriptions().unique).toBe(2);
+  });
+
+  test("a run that comes to read a field its members differ in splits them, each hearing its own answer", async () => {
+    let readsTier = false;
+    const vex = await create({
+      plugins: [
+        plugin,
+        (api: VexPluginAPI) => {
+          api.setName("sp");
+          api.registerQuery("tiered", {
+            args: {},
+            handler: async (ctx) => {
+              const n = await ctx.db.table("items").count();
+              if (!readsTier) return { n };
+              const tier = (ctx.user as { tier?: string } | undefined)?.tier;
+              return { n, tier };
+            },
+          });
+        },
+      ],
+    });
+    const gold: any[] = [];
+    const free: any[] = [];
+    await vex.subscribe("sp.tiered", {}, (r) => gold.push(r), {
+      user: { ...alice, tier: "gold" } as VexUser,
+    });
+    await vex.subscribe("sp.tiered", {}, (r) => free.push(r), {
+      user: { ...alice, tier: "free" } as VexUser,
+    });
+    expect(vex.describeSubscriptions().unique).toBe(1);
+    readsTier = true;
+    await vex.mutate("bp.add", { scope: "a", n: 1 });
+    await Bun.sleep(10);
+    expect(gold.at(-1)).toEqual({ n: 1, tier: "gold" });
+    expect(free.at(-1)).toEqual({ n: 1, tier: "free" });
+    expect(vex.describeSubscriptions().unique).toBe(2);
   });
 
   test("args alike but spelled in another order are one view", async () => {

@@ -163,17 +163,6 @@ describe("evaluation workers", () => {
     expect(names.indexOf("three")).toBe(names.length - 1);
   });
 
-  test("a caller that cannot cross to a worker evaluates on the main thread", async () => {
-    const vex = await create();
-    const seen: unknown[] = [];
-    const user = { ...alice, decide: () => true } as unknown as VexUser;
-    await vex.subscribe("ev.whoami", {}, (r: unknown) => seen.push(r), {
-      user,
-    });
-    expect(meta("subscribe").at(-1)?.offThread).toBe(false);
-    expect(seen).toEqual(["alice"]);
-  });
-
   test("a handler error in the worker fails the subscribe as on the main thread", async () => {
     const vex = await create();
     await expect(vex.subscribe("ev.failing", {}, () => {})).rejects.toThrow(

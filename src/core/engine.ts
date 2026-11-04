@@ -13,7 +13,6 @@ import {
   type EvaluationOptions,
   EvaluationPool,
   type EvaluationRequest,
-  transferable,
   workersAvailable,
 } from "./evaluation.js";
 import {
@@ -135,6 +134,13 @@ interface SubscriptionGroup {
   /** Its runs go to the evaluation pool: there is one, and its caller
    *  can cross to a worker. */
   offThread: boolean;
+  /** Its query and args (`Vex.families`). */
+  family: string;
+  /**
+   * The caller's fields its last run read; null before a run ends.
+   * Every member is alike in these (`callerSeen`).
+   */
+  reads: Set<string> | null;
   /** When its last run's answer stops holding (`QueryContext.now`). */
   clockUntil?: number;
   /** Filed in the index by its dependencies (`indexGroup`). */
@@ -147,6 +153,8 @@ interface Subscription {
   callback: SubscriptionCallback;
   lastHash: number;
   onError?: SubscribeContext["onError"];
+  /** The caller it was made for. */
+  user: VexUser | null | undefined;
 }
 
 /**
@@ -156,7 +164,12 @@ interface Subscription {
  */
 function canonical(value: unknown, seen = new Set<object>()): string | null {
   if (value === null || typeof value !== "object") {
-    if (typeof value === "function" || typeof value === "symbol") return null;
+    if (
+      typeof value === "function" ||
+      typeof value === "symbol" ||
+      typeof value === "bigint"
+    )
+      return null;
     return value === undefined ? "null" : JSON.stringify(value);
   }
   if (seen.has(value)) return null;
@@ -183,26 +196,47 @@ function canonical(value: unknown, seen = new Set<object>()): string | null {
   }
 }
 
-const callerIdentities = new WeakMap<object, number>();
-let lastCallerIdentity = 0;
+/**
+ * The fields of `user` that `reads` names, spelled canonically: what a
+ * group's runs saw of their caller. Unknown reads (no run yet) are the
+ * whole caller.
+ */
+function callerSeen(
+  user: VexUser | null | undefined,
+  reads: ReadonlySet<string> | null,
+): string {
+  if (user == null) return "none";
+  if (reads === null) return canonical(user) ?? "";
+  const seen: Record<string, unknown> = {};
+  for (const key of reads) {
+    if (Object.hasOwn(user, key)) seen[key] = (user as any)[key];
+  }
+  return canonical(seen) ?? "";
+}
 
 /**
- * Who a caller is, for sharing a group: every field of it. Callers
- * that are plain data and alike in every field share; one carrying
- * functions (closures over what it may see) is itself alone, since
- * nothing says two such are alike. An app that knows which fields
- * decide what a caller sees says so (`VexOptions.callerKey`).
+ * `user` as a handler sees it, each field it reads recorded in
+ * `reads`: a spread or a listing of its keys reads every field.
  */
-export function defaultCallerKey(user: VexUser | null | undefined): string {
-  if (user == null) return "none";
-  const data = canonical(user);
-  if (data !== null) return `data:${data}`;
-  let identity = callerIdentities.get(user);
-  if (identity === undefined) {
-    identity = ++lastCallerIdentity;
-    callerIdentities.set(user, identity);
-  }
-  return `caller:${identity}`;
+function trackedCaller(user: VexUser, reads: Set<string>): VexUser {
+  return new Proxy(user, {
+    get(target, prop, receiver) {
+      if (typeof prop === "string") reads.add(prop);
+      return Reflect.get(target, prop, receiver);
+    },
+    has(target, prop) {
+      if (typeof prop === "string") reads.add(prop);
+      return Reflect.has(target, prop);
+    },
+    ownKeys(target) {
+      for (const key of Object.keys(target)) reads.add(key);
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, prop) {
+      if (typeof prop === "string") reads.add(prop);
+      return Reflect.getOwnPropertyDescriptor(target, prop);
+    },
+  });
 }
 
 /** A measured result as a joiner hears it: its serialized form, read. */
@@ -466,15 +500,6 @@ export interface VexOptions<A = undefined> {
    */
   jobScheduler?: "timers" | "external" | "none";
   /**
-   * Who a caller is when subscriptions decide whether to share a run:
-   * two callers with one key are answered alike by every query, so
-   * one run serves both. The key must therefore say everything that
-   * decides what a caller may see (an id, its roles, a fence, whom it
-   * acts for). Unset, it is every field of the caller
-   * (`defaultCallerKey`), which never shares wrongly.
-   */
-  callerKey?: (user: VexUser | null | undefined) => string;
-  /**
    * Evaluate subscriptions off the main thread, in workers each running
    * a read-only engine over the same database (`EvaluationOptions`).
    * Where the runtime has no workers, or for a caller that cannot
@@ -529,8 +554,10 @@ export class Vex<A = unknown> {
   private readonly clockGroups = new Set<SubscriptionGroup>();
   private clockTimer: ReturnType<typeof setTimeout> | null = null;
   private clockAt = Number.POSITIVE_INFINITY;
-  private callerKey: (user: VexUser | null | undefined) => string =
-    defaultCallerKey;
+  // Each query with one set of args: its groups, one per set of
+  // callers alike in every field its runs read.
+  private readonly families = new Map<string, Set<SubscriptionGroup>>();
+  private groupSerial = 0;
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
   private appId: string = "unknown";
@@ -603,7 +630,6 @@ export class Vex<A = unknown> {
     if (options.tracer) vex.tracer = options.tracer;
     if (options.appId) vex.appId = options.appId;
     if (options.jobScheduler) vex.jobScheduler = options.jobScheduler;
-    if (options.callerKey) vex.callerKey = options.callerKey;
     if (options.handlerTimeoutMs)
       vex.handlerTimeoutMs = options.handlerTimeoutMs;
     if (options.reactive) {
@@ -1056,8 +1082,10 @@ export class Vex<A = unknown> {
     touchedTables?: Set<string>,
     user?: VexUser | null,
     dependencies?: QueryDependency[],
+    callerReads?: Set<string>,
   ): QueryContext {
     const self = this;
+    if (user && callerReads) user = trackedCaller(user, callerReads);
     // One prepared access context per governed table per operation:
     // a handler reading `sessions` through three chains resolves the
     // caller's standing once. Subscription re-runs rebuild the whole
@@ -1792,6 +1820,9 @@ export class Vex<A = unknown> {
       this.runningGroups.delete(group);
       this.unindexGroup(group);
       this.clockGroups.delete(group);
+      const family = this.families.get(group.family);
+      family?.delete(group);
+      if (family?.size === 0) this.families.delete(group.family);
     }
   }
 
@@ -1871,6 +1902,7 @@ export class Vex<A = unknown> {
             ? await this.runGroupOffThread(group, this.evaluation)
             : await this.runGroupHere(group, reg, ectx);
         group.last = answer.measurement;
+        this.rehomeStrangers(group);
         return answer;
       } finally {
         group.run = null;
@@ -1901,10 +1933,12 @@ export class Vex<A = unknown> {
       group.stale = false;
       group.tables = new Set();
       group.dependencies = [];
+      const reads = new Set<string>();
       const ctx = this.buildQueryContext(
         group.tables,
         group.user,
         group.dependencies,
+        reads,
       );
       result = await this.runMiddleware(
         ctx,
@@ -1912,6 +1946,7 @@ export class Vex<A = unknown> {
         () => reg.def.handler(ctx, group.args),
         ectx,
       );
+      group.reads = reads;
     } while (group.stale);
     return {
       result,
@@ -1943,6 +1978,7 @@ export class Vex<A = unknown> {
       evaluation = await pool.run(request);
       group.tables = new Set(evaluation.tables);
       group.dependencies = evaluation.dependencies;
+      group.reads = new Set(evaluation.callerReads);
     } while (group.stale);
     return { result: evaluation.result, measurement: evaluation };
   }
@@ -1958,7 +1994,13 @@ export class Vex<A = unknown> {
     const args = checkArgs("query", request.name, reg.def.args, request.args);
     const tables = new Set<string>();
     const dependencies: QueryDependency[] = [];
-    const ctx = this.buildQueryContext(tables, request.user, dependencies);
+    const callerReads = new Set<string>();
+    const ctx = this.buildQueryContext(
+      tables,
+      request.user,
+      dependencies,
+      callerReads,
+    );
     const result = await this.trace("evaluate", request.name, null, (ectx) =>
       this.runMiddleware(
         ctx,
@@ -1977,6 +2019,7 @@ export class Vex<A = unknown> {
       ...this.measureReactiveResult(result, request.name),
       tables: [...tables],
       dependencies,
+      callerReads: [...callerReads],
     };
   }
 
@@ -2087,6 +2130,95 @@ export class Vex<A = unknown> {
         );
       },
     );
+  }
+
+  /**
+   * The group of `family` whose members `user` is alike in every field
+   * its runs read (the whole caller, before a run ends): one run serves
+   * them all.
+   */
+  private joinableGroup(
+    family: string,
+    user: VexUser | null | undefined,
+  ): SubscriptionGroup | undefined {
+    for (const group of this.families.get(family) ?? []) {
+      if (callerSeen(user, group.reads) === callerSeen(group.user, group.reads))
+        return group;
+    }
+    return undefined;
+  }
+
+  private newGroup(
+    family: string,
+    queryName: string,
+    args: Record<string, any>,
+    user: VexUser | null | undefined,
+  ): SubscriptionGroup {
+    const group: SubscriptionGroup = {
+      key: `${family}\0${++this.groupSerial}`,
+      queryName,
+      args,
+      user,
+      members: new Set(),
+      tables: new Set(),
+      dependencies: [],
+      last: null,
+      run: null,
+      stale: false,
+      // A caller is plain data, so every one crosses to a worker.
+      offThread: this.evaluation !== null,
+      filed: false,
+      family,
+      reads: null,
+    };
+    this.groups.set(group.key, group);
+    let members = this.families.get(family);
+    if (!members) {
+      members = new Set();
+      this.families.set(family, members);
+    }
+    members.add(group);
+    return group;
+  }
+
+  /**
+   * After a run that read a field its members are not alike in, each
+   * member who differs leaves for the group of callers alike in what
+   * the runs read, and hears that group's answer: no one is answered
+   * from what another caller is.
+   */
+  private rehomeStrangers(group: SubscriptionGroup): void {
+    const own = callerSeen(group.user, group.reads);
+    const strangers = [...group.members].filter(
+      (sub) => callerSeen(sub.user, group.reads) !== own,
+    );
+    for (const sub of strangers) {
+      group.members.delete(sub);
+      const home =
+        this.joinableGroup(group.family, sub.user) ??
+        this.newGroup(group.family, group.queryName, group.args, sub.user);
+      sub.group = home;
+      home.members.add(sub);
+      if (home.last && home.last.hash !== sub.lastHash) {
+        sub.lastHash = home.last.hash;
+        try {
+          deliverSubscriptionResult(
+            sub.callback,
+            parsed(home.last),
+            home.last.serialized,
+          );
+        } catch (err) {
+          console.error(
+            `[vex] subscription ${group.queryName} callback failed:`,
+            err,
+          );
+        }
+      } else if (!home.last && !home.run) {
+        void this.trace("invalidation", "rehome", null, (ectx, meta) =>
+          this.rerunGroup(home, ectx, meta),
+        );
+      }
+    }
   }
 
   /**
@@ -2361,31 +2493,17 @@ export class Vex<A = unknown> {
       // made and registered before its first run, so a write
       // committing during the run finds it (`runGroup`). A group with
       // an answer already hands it over without a run.
-      const key = `${name}\0${canonical(args)}\0${this.callerKey(user)}`;
-      let group = this.groups.get(key);
-      if (!group) {
-        group = {
-          key,
-          queryName: name,
-          args,
-          user,
-          members: new Set(),
-          tables: new Set(),
-          dependencies: [],
-          last: null,
-          run: null,
-          stale: false,
-          offThread: this.evaluation !== null && transferable(user),
-          filed: false,
-        };
-        this.groups.set(key, group);
-      }
+      const family = `${name}\0${canonical(args)}`;
+      const group =
+        this.joinableGroup(family, user) ??
+        this.newGroup(family, name, args, user);
       const sub: Subscription = {
         id: subId,
         group,
         callback,
         lastHash: 0,
         onError: callCtx?.onError,
+        user,
       };
       group.members.add(sub);
       this.subscriptions.set(subId, sub);
@@ -2775,6 +2893,11 @@ function normalizeCallContext(callCtx?: ExecContext | CallContext): {
     return { parent: callCtx as ExecContext };
   }
   const cc = callCtx as CallContext;
+  if (cc.user != null && canonical(cc.user) === null) {
+    throw new TypeError(
+      "a caller is plain data: a function, symbol or cycle in it is state no query could track",
+    );
+  }
   return { parent: cc.parent, user: cc.user, signal: cc.signal };
 }
 
