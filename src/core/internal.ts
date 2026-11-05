@@ -1,11 +1,16 @@
-import type { TableSchema } from "./types.js";
+import type { StoredTableSchema } from "./types.js";
 
-/**
- * Built-in tables and queries managed by the engine itself.
- * These are not plugins — they're infrastructure the engine needs to operate.
- */
-
-export const INTERNAL_TABLES: Record<string, TableSchema> = {
+/** The tables the engine keeps, as storage keeps them. */
+export const INTERNAL_TABLES: Record<string, StoredTableSchema> = {
+  // Each migration applied, by id (VexOptions.migrations).
+  _migrations: {
+    columns: {
+      migrationId: { type: "string", index: true },
+      appliedAt: { type: "number" },
+    },
+    unique: [["migrationId"]],
+  },
+  // Each span an app's tracer keeps (README, "Observability").
   _spans: {
     columns: {
       traceId: { type: "string", index: true },
@@ -21,6 +26,21 @@ export const INTERNAL_TABLES: Record<string, TableSchema> = {
       meta: { type: "string", optional: true },
     },
   },
+  // Each scheduled function (ctx.scheduler): what runs, when, as whom.
+  _scheduled: {
+    columns: {
+      name: { type: "string" },
+      kind: { type: "string" },
+      args: { type: "json" },
+      caller: { type: "json", optional: true },
+      runAt: { type: "number", index: true },
+      status: { type: "string", index: true },
+      error: { type: "string", optional: true },
+      createdAt: { type: "number" },
+      finishedAt: { type: "number", optional: true },
+    },
+  },
+  // Each job (`registerJob`): its schedule, and how its last run went.
   _jobs: {
     columns: {
       name: { type: "string", index: true },

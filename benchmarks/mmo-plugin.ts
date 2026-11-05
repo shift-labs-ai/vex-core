@@ -1,0 +1,207 @@
+/**
+ * A world, as an MMO server keeps it: players in zones, parties and
+ * guilds, with inventories and zone chat. Every view a client holds
+ * open is a live query here; every tick of play is a write.
+ *
+ * Passed by module, so each evaluation worker imports it too.
+ */
+
+import type { VexPluginAPI } from "../src/core/api.js";
+import { Type } from "../src/portable.js";
+
+export const ZONE_SIZE = 100;
+export const PARTY_SIZE = 5;
+export const GUILD_SIZE = 50;
+export const ITEMS_PER_PLAYER = 20;
+
+export const zoneOf = (player: number) => `z${Math.floor(player / ZONE_SIZE)}`;
+export const partyOf = (player: number) =>
+  `p${Math.floor(player / PARTY_SIZE)}`;
+export const guildOf = (player: number) =>
+  `g${Math.floor(player / GUILD_SIZE)}`;
+export const playerId = (player: number) => `pl${player}`;
+/** Interest management: the world in cells, each a view its players share. */
+export const CELL = 100;
+export const cellOf = (x: number, y: number) =>
+  `${Math.floor(x / CELL)}:${Math.floor(y / CELL)}`;
+
+export default function mmoPlugin(api: VexPluginAPI) {
+  api.setName("mmo");
+  api.registerTable("players", {
+    columns: {
+      name: Type.String(),
+      zone: Type.String({ index: true }),
+      partyId: Type.String({ index: true }),
+      guildId: Type.String({ index: true }),
+      level: Type.Number({ index: true }),
+      x: Type.Number(),
+      y: Type.Number(),
+      cell: Type.String(),
+      hp: Type.Number(),
+    },
+    indexes: [["idx_players_zone_cell", ["zone", "cell"]]],
+  });
+  api.registerTable("items", {
+    columns: {
+      playerId: Type.String({ index: true }),
+      kind: Type.String(),
+      qty: Type.Number(),
+    },
+  });
+  api.registerTable("messages", {
+    columns: {
+      channel: Type.String({ index: true }),
+      playerId: Type.String(),
+      text: Type.String(),
+      at: Type.Number(),
+    },
+    indexes: [["idx_messages_channel_at", ["channel", "at"]]],
+  });
+
+  // ─── A player's own views ───
+  api.registerQuery("self", {
+    args: { id: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db.table("players").where("_id", "=", args.id).first(),
+  });
+  api.registerQuery("inventory", {
+    args: { id: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db
+        .table("items")
+        .where("playerId", "=", args.id)
+        .order("kind", "asc")
+        .all(),
+  });
+  api.registerQuery("inventoryCount", {
+    args: { id: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db.table("items").where("playerId", "=", args.id).count(),
+  });
+  api.registerQuery("weapons", {
+    args: { id: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db
+        .table("items")
+        .select("kind", "qty")
+        .where("playerId", "=", args.id)
+        .where("kind", "=", "weapon")
+        .all(),
+  });
+
+  // ─── Views many players share ───
+  api.registerQuery("zoneRoster", {
+    args: { zone: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db
+        .table("players")
+        .select("_id", "name", "x", "y", "hp")
+        .where("zone", "=", args.zone)
+        .limit(ZONE_SIZE * 2)
+        .all(),
+  });
+  api.registerQuery("nearby", {
+    args: { zone: Type.String(), cell: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db
+        .table("players")
+        .select("_id", "x", "y")
+        .where("zone", "=", args.zone)
+        .where("cell", "=", args.cell)
+        .all(),
+  });
+  api.registerQuery("zoneChat", {
+    args: { zone: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db
+        .table("messages")
+        .select("playerId", "text", "at")
+        .where("channel", "=", args.zone)
+        .order("at", "desc")
+        .limit(50)
+        .all(),
+  });
+  api.registerQuery("party", {
+    args: { partyId: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db
+        .table("players")
+        .select("_id", "name", "zone", "hp", "level")
+        .where("partyId", "=", args.partyId)
+        .all(),
+  });
+  api.registerQuery("partyHp", {
+    args: { partyId: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db
+        .table("players")
+        .select("_id", "hp")
+        .where("partyId", "=", args.partyId)
+        .all(),
+  });
+  api.registerQuery("guildRoster", {
+    args: { guildId: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db
+        .table("players")
+        .select("_id", "name", "level")
+        .where("guildId", "=", args.guildId)
+        .order("level", "desc")
+        .all(),
+  });
+  api.registerQuery("guildChat", {
+    args: { guildId: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db
+        .table("messages")
+        .select("playerId", "text", "at")
+        .where("channel", "=", args.guildId)
+        .order("at", "desc")
+        .limit(50)
+        .all(),
+  });
+  api.registerQuery("leaderboard", {
+    args: {},
+    handler: (ctx) =>
+      ctx.db
+        .table("players")
+        .select("name", "level")
+        .order("level", "desc")
+        .limit(10)
+        .all(),
+  });
+
+  // ─── Ticks of play ───
+  api.registerMutation("move", {
+    args: { id: Type.String(), x: Type.Number(), y: Type.Number() },
+    handler: (ctx, args) =>
+      ctx.db.table("players").update(args.id, {
+        x: args.x,
+        y: args.y,
+        cell: cellOf(args.x, args.y),
+      }),
+  });
+  api.registerMutation("damage", {
+    args: { id: Type.String(), hp: Type.Number() },
+    handler: (ctx, args) =>
+      ctx.db.table("players").update(args.id, { hp: args.hp }),
+  });
+  api.registerMutation("levelUp", {
+    args: { id: Type.String(), level: Type.Number() },
+    handler: (ctx, args) =>
+      ctx.db.table("players").update(args.id, { level: args.level }),
+  });
+  api.registerMutation("say", {
+    args: {
+      channel: Type.String(),
+      playerId: Type.String(),
+      text: Type.String(),
+      at: Type.Number(),
+    },
+    handler: (ctx, args) => ctx.db.table("messages").insert(args),
+  });
+  api.registerMutation("loot", {
+    args: { playerId: Type.String(), kind: Type.String(), qty: Type.Number() },
+    handler: (ctx, args) => ctx.db.table("items").insert(args),
+  });
+}

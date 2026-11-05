@@ -12,10 +12,12 @@ npm install vex-core
 
 Peer: `react` ^19 (only if you use `vex-core/client`).
 
+Upgrading: [`docs/upgrading/`](docs/upgrading/), one file per version (from 0.22: [0.23](docs/upgrading/0.23.md)).
+
 ## Quick start
 
 ```ts
-import { Vex, sqliteAdapter } from "vex-core";
+import { Type, Vex, sqliteAdapter } from "vex-core";
 
 const vex = await Vex.create({
   storage: sqliteAdapter(".vex/data.db"),
@@ -23,10 +25,10 @@ const vex = await Vex.create({
     (api) => {
       api.setName("counter");
       api.registerTable("counters", {
-        columns: { key: { type: "string" }, value: { type: "number" } },
+        columns: { key: Type.String(), value: Type.Number() },
       });
       api.registerMutation("set", {
-        args: { key: "string", value: "number" },
+        args: { key: Type.String(), value: Type.Number() },
         async handler(ctx, args) {
           return ctx.db.table("counters").insert(args);
         },
@@ -48,6 +50,88 @@ const unsub = await vex.subscribe("counter.list", {}, (rows) => {
   console.log("changed:", rows);
 });
 ```
+
+## Tables
+
+A table declares each column as a TypeBox schema: what the column holds (`Type.Optional` lets it hold nothing, `default` fills an insert that omits it), and what the table does with it (`index`, `renamedFrom`). Every write passes the columns: an insert gives each required column, an update any of them, each of its type, no undeclared one, and JSON columns hold plain data. Storage keeps each column as its SQLite type (strings as TEXT, numbers as REAL, booleans as 0 or 1, anything else as JSON text).
+
+```ts
+api.registerTable("cards", {
+  columns: {
+    title: Type.String({ index: true }),
+    votes: Type.Number({ default: 0 }),
+    note: Type.Optional(Type.String()),
+    meta: Type.Optional(Type.Object({ tags: Type.Array(Type.String()) })),
+  },
+});
+```
+
+## Args and returns
+
+An operation declares what it takes (`args`, one schema per arg) and, optionally, what it answers (`returns`). The schemas are [TypeBox](https://github.com/sinclairzx81/typebox) types, re-exported as `Type`: JSON Schema that infers as TypeScript, so the handler's `args` are typed from the declaration, and the engine checks every call against it with a validator compiled once per operation.
+
+```ts
+api.registerMutation("rename", {
+  args: { id: Type.String(), title: Type.String(), note: Type.Optional(Type.String()) },
+  returns: Type.Null(),
+  async handler(ctx, args) {
+    // args: { id: string; title: string; note?: string }
+    await ctx.db.table("docs").update(args.id, { title: args.title });
+    return null;
+  },
+});
+```
+
+- A call with an undeclared arg, a missing one, or one of the wrong type is refused with an `ArgsError`, every problem named (HTTP answers 400). `Type.Optional` means the arg may be absent; `null` is a value its schema must allow (`Type.Union([Type.String(), Type.Null()])`).
+- Args and answers are JSON values: plain objects, arrays, strings, finite numbers, booleans, null. A `Date`, `Map`, class instance or function is refused, since a client could not receive it. An answer against a declared `returns` is refused too; a refused mutation commits nothing. Every caller, in process or over the wire, a call or a subscription, is handed the answer as JSON reads it back (an `undefined` property gone, `-0` as `0`).
+- A declaration is a schema `Type` builds: a plain object such as `{ type: "string" }` is refused as the engine starts, and does not compile.
+
+## Handlers
+
+A handler reaches the engine only through its context: a query reads through `ctx.db` and composes queries with `ctx.query`, a mutation reads and writes through `ctx.db` and schedules with `ctx.scheduler`, and an action calls through `ctx.query`, `ctx.mutate` and `ctx.action`. A handler calling a captured `Vex` directly is refused with a `ReentryError` naming the context call to use, so every read is tracked, every call is decided by middleware, and no mutation waits on another's transaction. Middleware is not a handler: it runs outside the frame and may call the engine.
+
+A query answers from what its context reads. One that reads anything else (a module's variable, `Date.now()`) goes stale, since no write announces a change to it. `purityCheck` finds such a query: with `"always"` (in tests) or a share of runs (`0.01`), a run is repeated on the same data, and a subscription a write skipped is run again, and a query whose answers differ is refused or ended with a `PurityError` naming it. Read the clock through `ctx.now(resolutionMs)`, which a subscription re-runs on.
+
+## Plugins, settings and services
+
+A plugin is given by value (a function or a definition) or by module: a `URL`, an absolute path or a package name, whose default export is a plugin, a definition, or an array of them. The engine imports a module itself, so another thread can import the same plugin from the same reference ([Reads off the main thread](#reads-off-the-main-thread)).
+
+```ts
+const vex = await Vex.create({
+  storage: sqliteAdapter(".vex/data.db"),
+  plugins: [
+    new URL("./plugins/notes.ts", import.meta.url),
+    new URL("./plugins/mail.ts", import.meta.url),
+  ],
+  env: { dataDir: "/data", publicUrl: "https://notes.example" },
+  services: { mailer },
+});
+```
+
+What a plugin is configured with arrives two ways, and neither is a closure over its factory:
+
+- **`env`: the app's settings.** One object of plain data (strings, numbers, booleans, arrays, plain objects), checked and frozen as the engine starts, the same on every thread. Every context reads it as `ctx.env`, middleware included, and every plugin's registration as `api.env`. A value that changes while the server runs is not a setting: it belongs in a table, where reads of it are tracked.
+- **`services`: the host's live capabilities.** A process fleet, a dispatcher, a network client: objects, used as given, on the thread that owns them. Actions, jobs and webhooks hold them as `ctx.services`. No query or mutation does: a query that needs the outside world is an action, and a mutation's effect on it is scheduled (`ctx.scheduler`), so it happens only if the mutation commits.
+
+An app types both once, by augmenting the interfaces; the engine then requires what it declares:
+
+```ts
+declare module "vex-core" {
+  interface VexEnv { dataDir: string; publicUrl: string | null }
+  interface VexServices { mailer: Mailer }
+}
+
+// plugins/mail.ts
+export default (api: VexPluginAPI) => {
+  api.setName("mail");
+  api.registerAction("invite", {
+    args: { to: Type.String() },
+    handler: (ctx, args) => ctx.services.mailer.send(args.to, `${ctx.env.publicUrl}/join`),
+  });
+};
+```
+
+A plugin module's top-level code runs once per thread that imports it, so a module-level `Map` or client is one per thread, each its own. Keep state in tables and capabilities in `services`.
 
 ## Cloudflare Durable Objects
 
@@ -126,12 +210,12 @@ A run with nothing to do reads only row counts, and SQLite limits how many rows 
 api.registerTable("tasks", {
   renamedFrom: ["todos"],
   columns: {
-    title: { type: "string", renamedFrom: ["text"] },
-    done: { type: "boolean" },
+    title: Type.String({ renamedFrom: ["text"] }),
+    done: Type.Boolean(),
   },
 });
 
-// File-based: table({ title: "string" }, { renamedFrom: ["chat_todos"] })
+// File-based: table({ title: Type.String() }, { renamedFrom: ["chat_todos"] })
 ```
 
 - A previous name that exists, where the current one does not, is renamed in place with its data and indexes.
@@ -176,8 +260,14 @@ SQLite reports what a statement reads and writes: its compiled program, as `EXPL
 - **Transactions:** writes inside a transaction are reported when it commits, and a rolled-back one reports nothing.
 - **Other connections:** on a file database, a commit by another connection or process (`PRAGMA data_version`) marks every table changed at the next invalidation.
 - **Skipping re-runs:** a subscription over a changed table re-runs unless its filters prove it could not have seen the change. Every operator counts (`=`, `!=`, `IN`, `<`, `>`, `<=`, `>=`, and OR groups), compared as the column's SQL affinity would: `'5'` in a number column is 5, `undefined` is NULL. The proof is what every touched row holds both before and after the write: an insert's row with its id, a delete's row, and for an update or upsert the columns it leaves as they are, plus what a changed column held and holds now when both are outside the filter. An update that changes nothing, or only columns the subscription neither filters on, orders by nor computes from, is skipped too. Recording what a row held costs a mutation one primary-key read per update, delete or upsert; a filtered delete reads the rows it removes (up to 200, else only its `=` filters count). A table changed by raw SQL, or by a write that ran a trigger or foreign-key action, proves nothing, and every subscription over it re-runs; skipping on other tables is unaffected.
+- **Groups:** subscriptions holding one query with one set of args (key order aside) for one caller form a group: one run answers all of them, a subscriber joining hears the group's current answer without a run, and a write is judged once per group. `describeSubscriptions()` lists groups. A caller is plain data (one holding a function is refused), and callers share a group when they are alike in every field the query's runs read of them: callers differing in a field a run reads (a fence, roles, whom they act for) never share an answer, and a member who turns out to differ moves to the group of callers alike in it.
+- **Failures:** a subscription never fails in silence. `subscribe(name, args, callback, { onError })` hears `onError(error, ended)`: ended when its result outgrows its reactive budget (the WebSocket transport sends its terminal error frame, and the client's `onError` hears it); not ended when a run throws, in which case the last answer stands and the next write that reaches the view runs it again.
+- **Schema and raw access:** the schema changes through `VexOptions.migrations` (applied once each, in order, in transactions, before the engine serves or runs a job). Raw SQL past every policy lives in `vex-core/internal` (`rawSql`, `rawStorage`, `rawBulkInsert`), for tests and tooling; what it writes is announced, so subscriptions over it re-run.
+- **Finding what a write affects:** each group is filed by the tables its last run read and, for a dependency holding columns equal to values (`=`, `IN`), under the combination of those values (a zone and a cell; a list of ids); a dependency holding none so files it wide. A write judges only the groups filed under the values its rows hold (both the value left and taken, for a column it changes), those filed wide, and any with a run open; a write that does not know a column of a shape, or names no rows (a filtered delete past its bound, raw SQL), or an unattributed change, judges every group on the table. The invalidation span records `judged`. The cost of a pass does not grow with the subscriptions the engine holds: 100k players with 500k live views sustain the writes per second of 1k; an MMO-shaped world (`bun run bench:mmo`) with 10k players and 120k views sustains ~9k writes/s and ~700k deliveries/s on one thread, at 2.6 KB of heap per subscription.
+- **Bursts:** writes that commit while another write holds or waits for the storage's write lock invalidate in one pass, begun on the next turn of the event loop, with the union of what they changed: each affected subscription re-runs once for all of them. A lone write invalidates at once. Every mutation still resolves only after its pass delivered.
 - **Writes during a run:** a subscription is registered before its first run, and a run of its query is single-flight. A write that commits while a run is open, and that a read the run has made so far could have seen, marks the subscription stale: the run repeats before its result is delivered, so a subscriber sees every write committed after a read of its query, and results are delivered in the order they were read.
-- **Raw reads:** a raw read depends on exactly the tables its program reads, through views, subqueries and covering indexes. A raw read that reads no table re-runs after any write.
+- **Off the main thread:** with `evaluation`, expensive reads run in workers ([Reads off the main thread](#reads-off-the-main-thread)); the main thread keeps judging which writes affect what, single-flight runs, budgets and delivery. A pass's affected groups run together, bounded by the pool.
+- **Raw reads:** `ctx.db.sql(reads, sql, ...params)` names every table the statement reads, and a table read but not named is refused, so what a subscription depends on is written where it is read. A table held to rows (`{ messages: [filters] }`, or `{ messages: { where, reads } }` to hold columns too) is, inside the statement, those rows and nothing else: a non-materialized common table expression of the table's name shadows it, so indexes still serve, and the read is skipped like a builder read's when a write misses them. A table read whole (`{ t: "all" }`) re-runs it on every write to `t`. The hold is enforced, not declared: a statement naming a held table as `main.t`, or reaching it through a view, is refused. A raw read that reads no table re-runs after any write.
 - **Access policies:** raw SQL in a query context (`ctx.db.sql`) is refused when it reads a governed table, in any spelling or through any view. A literal or column that merely shares a governed table's name is not a read. Published SQL has its own rule (below).
 - **Costs:** a statement's first run in a given schema compiles it once more for `EXPLAIN` (a few µs); after that, writes, reads and invalidation cost what they cost without tracking, within measurement noise. The query builder, bulk inserts and mutations run at parity with untracked writes; raw writes and raw reads run faster. On a Durable Object a single-statement write makes no more SQL calls, and bills no more rows, than without tracking; raw SQL of several statements reads `total_changes()` before and after.
 - **Adapters:** a custom `StorageAdapter` reports changes through `takeChanges`; one that cannot tell which rows a write changed lists every changed table as unattributed, and `ANY_TABLE` when it cannot tell which tables. `tablesRead` is optional: without it, or when it cannot say (a virtual table, TEMP, an attached database), a raw read depends on every registered table it names, through named views. `readOnlyTables` is optional too: without it, `publishedSql` refuses everything.
@@ -191,7 +281,7 @@ api.registerTable("sessions", { columns: { /* … */ }, published: true });
 api.registerTable("api_keys", { columns: { /* … */ } }); // not published
 
 api.registerQuery("sql", {
-  args: { sql: "string", params: "json" },
+  args: { sql: Type.String(), params: Type.Optional(Type.Array(Type.Unknown())) },
   reactive: false,
   handler: (ctx, args) => ctx.db.publishedSql(args.sql, ...(args.params ?? [])),
 });
@@ -205,13 +295,50 @@ api.registerQuery("sql", {
 
 A published table with an access policy is read only for callers its policy leaves `UNRESTRICTED`, since raw SQL cannot apply the row filter; everyone else is refused. Storage that cannot show a statement's program (`StorageAdapter.readOnlyTables`) refuses every call. Results are reactive like any raw read: a subscription depends on exactly the tables the statement read. `ctx.db.publishedTables()` lists the dataset: each published table with every column a statement can read, `_id` included.
 
+## Composing queries
+
+A query may call another by name: `ctx.query(name, args?, { user }?)`. The call is a call of its own, with its args checked, middleware deciding it as the calling query's caller (or the `user` given), and its answer checked. What it reads is the calling query's: a subscription re-runs when a write reaches what either read, and skips a write both rule out.
+
+```ts
+api.registerQuery("prompt", {
+  args: { workspaceId: Type.String() },
+  async handler(ctx, args) {
+    const skills = await ctx.query("skills.list", args).catch(() => []); // the plugin may be absent
+    return render(skills);
+  },
+});
+```
+
+It is for composing queries another plugin owns, which may not be installed (a missing one rejects with `Query not found: name`). Within a plugin, a plain function over `ctx` composes as well and costs less.
+
+## Reads off the main thread
+
+One thread runs the engine's JavaScript: its HTTP and WebSocket traffic, writes, invalidation and every query's handler. A view whose run costs milliseconds holds all of them. `evaluation` moves such reads to a pool of workers:
+
+```ts
+const vex = await Vex.create({
+  storage: sqliteAdapter(".vex/data.db"),
+  plugins: [new URL("./plugins/notes.ts", import.meta.url)],
+  env,
+  evaluation: { workers: 2 },
+});
+```
+
+- **Each worker builds its own read-only engine from the app's own**: the same plugin modules, the same `env`, the same database, opened by the storage's `reader()` (`sqliteAdapter` on a file has one). Nothing else is written for it. `Vex.create` resolves once every worker has built its engine, and refuses to start when one cannot, when a plugin is given by value (a worker could not import it), or when the storage has no reader (a database in memory).
+- **The pool takes expensive reads, not every read.** A run's answer crosses back as a copy, which costs the main thread, so a cheap run is cheaper where it is. Runs are timed in a worker, which runs one query at a time; on the main thread runs interleave, so their times say little. The pool takes a query's first run to time it, when a worker is idle (a run that only times a query never waits behind others). Its runs, a subscription's re-runs and one-shot `vex.query` calls alike, stay in the pool while their average is past `offloadAboveMs` (2 ms unless set) and come back under half of it; one run in 32 of a query kept on the main thread is timed again. `offloadAboveMs: 0` sends every run.
+- **A worker costs memory**: about 18 MB of resident memory each, idle, over a small app's plugins; its storage reads on one connection.
+- **What a reader sees does not change**: the same answer as its JSON reading, the same dependencies narrowing the next write, the same access policies and middleware, as the caller (plain data, as every caller is). A refusal in a worker answers with its `HttpError` status, body and headers.
+- **What stays on the main thread**: writes, actions, jobs, webhooks and every `services` call; reads repeated by `purityCheck`; everything, where the runtime has no `Worker`.
+
+A file-based app is given by module too: a module whose default export is `(await scanDirectory(dir)).plugins`.
+
 ## Actions
 
 A mutation runs inside one transaction, so it must not wait: on a person, on another process, on the network. Work that does is an action, the third kind of operation beside queries and mutations:
 
 ```ts
 api.registerAction("import", {
-  args: { url: "string" },
+  args: { url: Type.String() },
   async handler(ctx, args) {
     const rows = await fetchRows(args.url);          // may take minutes
     for (const row of rows) await ctx.mutate("notes.add", row);
@@ -223,6 +350,25 @@ await vex.action("notes.import", { url });
 ```
 
 An action has no database. It reads and writes through the queries and mutations it calls (`ctx.query`, `ctx.mutate`, `ctx.action`), each made as the action's caller, decided by middleware, traced, and in its own transaction: what one mutation wrote stays even if the action fails later. Middleware decides the action itself first (`info.type === "action"`). No handler timeout bounds an action, since it holds no read and no transaction; its own work bounds it, and `ctx.signal` aborts when its caller stops waiting (`vex.action(name, args, { user, signal })`; an `/action` request closing), so long work can stop with it. An action it calls inherits the signal. Actions are called over HTTP (`POST /action`), over the WebSocket (`{ type: "action", id, name, args? }`, stopped when the connection closes), and with `VexClient.action()`, and never subscribed to. A caller that has already stopped waiting starts nothing. Middleware that tells the action more about its caller (`ctx.user`) tells every call it makes.
+
+## Scheduling
+
+A mutation does no I/O: it holds the write lock, and it may roll back after an effect is sent. What it wants done outside the database it schedules, and the schedule is part of its transaction (a transactional outbox): it runs only if the mutation commits.
+
+```ts
+api.registerMutation("invite", {
+  args: { email: Type.String() },
+  async handler(ctx, args) {
+    const id = await ctx.db.table("invites").insert({ email: args.email });
+    await ctx.scheduler.runAfter(0, "mail.sendInvite", { id });
+    return id;
+  },
+});
+```
+
+`runAfter(ms, name, args)` and `runAt(time, name, args)` schedule a mutation or action by name, its args checked when scheduled; `cancel(id)` removes one not yet started. Each runs once, as the caller who scheduled it (middleware decides the run as it decides any call), and is recorded `done` or `failed` in `_scheduled`, kept a week. One that was running when the engine stopped is failed at the next start, never run again. An action schedules too, outside any transaction. With `jobScheduler: "external"`, `nextJobRun()` and `runDueJobs()` include them.
+
+The engine's tables (`_jobs`, `_migrations`, `_scheduled`) are its own to write: `ctx.db` refuses a write to one, through the builder or SQL. `_scheduled` is not read through `ctx.db` either, since each row names the caller it runs as.
 
 ## Operation access
 
@@ -247,10 +393,10 @@ const vex = await Vex.create<Access>({
 });
 ```
 
-The engine decides nothing with it. It hands each call's declaration to middleware, where the app's own gate decides, and it describes each operation with its declaration (`describeQuery`, `describeMutation`, `describeAction`, `introspect`), so the app can list what every operation needs:
+The engine decides nothing with it. It hands each call's declaration to middleware, which a plugin declares (`api.use`), where the app's own gate decides, and it describes each operation with its declaration (`describeQuery`, `describeMutation`, `describeAction`, `introspect`), so the app can list what every operation needs. Middleware runs outside the handler, so a gate may ask the engine how to decide:
 
 ```ts
-vex.use((ctx, info, next) => {
+api.use((ctx, info, next) => {
   if (info.type === "webhook") return next();   // a webhook's verify decides
   if (info.access === undefined) throw new Error("Permission denied"); // a cast left it out
   return authorize(ctx.user, info.access, info.args).then(next);
@@ -296,7 +442,7 @@ A table can declare who sees its rows. Every query-context read of it (queries, 
 
 ```ts
 api.registerTable("docs", {
-  columns: { ownerId: { type: "string", index: true }, title: { type: "string" } },
+  columns: { ownerId: Type.String({ index: true }), title: Type.String() },
   access: {
     // Once per operation: UNRESTRICTED, or what `row` decides by.
     async prepare(user, db) {
@@ -326,16 +472,16 @@ Flat files, no config. Use `scanDirectory` to turn a folder into plugins.
 
 ```ts
 // schema.ts
-import { table } from "vex-core/framework";
-export const todos = table({ text: "string", done: "boolean" });
+import { table, Type } from "vex-core/framework";
+export const todos = table({ text: Type.String(), done: Type.Boolean() });
 
 // todos.ts
-import { action, query, mutation } from "vex-core/framework";
+import { action, query, mutation, Type } from "vex-core/framework";
 export const list = query({}, async (ctx) => ctx.db.table("todos").all());
-export const add = mutation({ text: "string" }, async (ctx, args) =>
+export const add = mutation({ text: Type.String() }, async (ctx, args) =>
   ctx.db.table("todos").insert({ text: args.text, done: false }),
 );
-export const importAll = action({ texts: "json" }, async (ctx, args) => {
+export const importAll = action({ texts: Type.Array(Type.String()) }, async (ctx, args) => {
   for (const text of args.texts) await ctx.mutate("todos.add", { text });
 });
 ```
@@ -624,20 +770,26 @@ const tracer: Tracer = {
 };
 ```
 
-Core metadata describes query and write structure without recording filter values, row values, handler arguments, or results. Core emits spans to the tracer but does not persist them automatically; it reserves the internal `_spans` table for apps that choose SQLite persistence. Retention remains app-specific. For a long-running server that writes `_spans`, register bounded cleanup:
+Core metadata describes query and write structure without recording filter values, row values, handler arguments, or results. Core emits spans to the tracer but does not persist them automatically; it reserves the internal `_spans` table for apps that choose SQLite persistence. Retention remains app-specific. For a long-running server that writes `_spans`, register bounded cleanup: a job, which writes through a mutation.
 
 ```ts
-api.registerJob("spanRetention", {
-  schedule: "every 1h",
-  async handler(ctx) {
-    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 days
-    await ctx.db.sql(
+// In a plugin named "app".
+api.registerMutation("dropOldSpans", {
+  args: { before: Type.Number() },
+  handler: (ctx, args) =>
+    ctx.db.sql(
       `DELETE FROM _spans WHERE _id IN (
          SELECT _id FROM _spans WHERE startTime < ? LIMIT 1000
        )`,
-      cutoff,
-    );
-  },
+      args.before,
+    ),
+});
+api.registerJob("spanRetention", {
+  schedule: "every 1h",
+  handler: (ctx) =>
+    ctx.mutate("app.dropOldSpans", {
+      before: Date.now() - 7 * 24 * 60 * 60 * 1000, // 7 days
+    }),
 });
 ```
 
@@ -647,12 +799,13 @@ Age retention alone is not a hard volume bound. Production sinks should also cap
 
 | Entry | Contents |
 |-------|----------|
-| `vex-core` | `Vex`, `sqliteAdapter`, `durableObjectAdapter`, `id`, core types, tracer, `RateLimiter`. Under the `workerd` condition, everything but `sqliteAdapter` and `config` |
-| `vex-core/framework` | `table`, `query`, `mutation`, `action`, `webhook`, `job`, `middleware`, `scanDirectory` |
+| `vex-core` | `Vex`, `Type` and `Static` (TypeBox), `sqliteAdapter`, `durableObjectAdapter`, `id`, the errors a caller handles (`ArgsError`, `ReentryError`, `PurityError`, `RateLimitExceededError`), core types (`VexEnv` and `VexServices` to augment, `PluginModule`), tracer, `RateLimiter`. Under the `workerd` condition, everything but `sqliteAdapter` and `config` |
+| `vex-core/framework` | `table`, `query`, `mutation`, `action`, `webhook`, `job`, `middleware`, `scanDirectory`, `Type` |
 | `vex-core/http` | `Router`, `createRouter`, `HttpError`, `compose`, `vexHandler`, static handlers (`serveDir`, `serveFile`), plus middleware (`cors`, `bearerAuth`, `bodyParser`, `accessLog`, `requestId`, `rateLimit`, `errorBoundary`, `sessions`) |
 | `vex-core/client` | `VexProvider`, `useQuery`, `useMutation` |
 | `vex-core/adapters/sqlite` | `sqliteAdapter` |
 | `vex-core/adapters/durable-object` | `durableObjectAdapter` |
+| `vex-core/internal` | `rawSql`, `rawStorage`, `rawBulkInsert`: storage past every policy, for tests and tooling |
 
 ## License
 

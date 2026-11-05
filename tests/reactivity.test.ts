@@ -2,6 +2,8 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex, withSerializedSubscriptionResult } from "../src/core/engine.js";
+import { rawBulkInsert } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 const user = { id: "u1", name: "User", isAdmin: false };
 let open: Vex[] = [];
@@ -9,7 +11,6 @@ let listRuns = 0;
 let rawRuns = 0;
 let flakyThrows = false;
 let cyclicNow = false;
-let serializationCalls = 0;
 async function create(options: Parameters<typeof Vex.create>[0]) {
   const vex = await Vex.create(options);
   open.push(vex);
@@ -22,23 +23,22 @@ afterEach(async () => {
   rawRuns = 0;
   flakyThrows = false;
   cyclicNow = false;
-  serializationCalls = 0;
 });
 
 function reactivityPlugin(api: VexPluginAPI) {
   api.setName("rx");
   api.registerTable("items", {
     columns: {
-      scope: { type: "string", index: true },
-      kind: { type: "string", index: true },
-      name: { type: "string" },
-      score: { type: "number", optional: true },
-      body: { type: "json", optional: true },
+      scope: Type.String({ index: true }),
+      kind: Type.String({ index: true }),
+      name: Type.String(),
+      score: Type.Optional(Type.Number()),
+      body: Type.Optional(Type.Unknown()),
     },
   });
-  api.registerTable("audit", { columns: { value: { type: "string" } } });
+  api.registerTable("audit", { columns: { value: Type.String() } });
   api.registerQuery("list", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       listRuns++;
       return ctx.db
@@ -73,7 +73,7 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("names", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       return ctx.db
         .table("items")
@@ -86,7 +86,7 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("summary", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       const scoped = ctx.db.table("items").where("scope", "=", args.scope);
       return {
@@ -157,7 +157,7 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("branched", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       // The underlying query builder is mutable-shared: this order() call
       // changes the SQL that base.all() executes. The recorded descriptor
@@ -171,14 +171,17 @@ function reactivityPlugin(api: VexPluginAPI) {
     args: {},
     async handler(ctx) {
       rawRuns++;
-      return ctx.db.sql("SELECT * FROM items ORDER BY name ASC");
+      return ctx.db.sql(
+        { items: "all" },
+        "SELECT * FROM items ORDER BY name ASC",
+      );
     },
   });
   api.registerQuery("rawUnknown", {
     args: {},
     async handler(ctx) {
       rawRuns++;
-      return ctx.db.sql("SELECT 1 as value");
+      return ctx.db.sql({}, "SELECT 1 as value");
     },
   });
   api.registerQuery("flaky", {
@@ -199,13 +202,7 @@ function reactivityPlugin(api: VexPluginAPI) {
     args: {},
     async handler(ctx) {
       const rows = await ctx.db.table("items").order("name", "asc").all();
-      return {
-        rows,
-        toJSON() {
-          serializationCalls++;
-          return { rows };
-        },
-      };
+      return { rows };
     },
   });
   api.registerQuery("cyclic", {
@@ -217,19 +214,30 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("add", {
-    args: { scope: "string", kind: "string", name: "string", body: "any" },
+    args: {
+      scope: Type.String(),
+      kind: Type.String(),
+      name: Type.String(),
+      body: Type.Optional(Type.Unknown()),
+      score: Type.Optional(Type.Number()),
+    },
     async handler(ctx, args) {
       return ctx.db.table("items").insert({ ...args, score: args.score ?? 0 });
     },
   });
   api.registerMutation("touchAudit", {
-    args: { value: "string" },
+    args: { value: Type.String() },
     async handler(ctx, args) {
       await ctx.db.table("audit").insert(args);
     },
   });
   api.registerMutation("upsert", {
-    args: { scope: "string", kind: "string", name: "string", body: "any" },
+    args: {
+      scope: Type.String(),
+      kind: Type.String(),
+      name: Type.String(),
+      body: Type.Optional(Type.Unknown()),
+    },
     async handler(ctx, args) {
       await ctx.db
         .table("items")
@@ -240,7 +248,7 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("renameFirst", {
-    args: { scope: "string", name: "string" },
+    args: { scope: Type.String(), name: Type.String() },
     async handler(ctx, args) {
       const row = await ctx.db
         .table("items")
@@ -250,26 +258,34 @@ function reactivityPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("deleteByScope", {
-    args: { scope: "string" },
+    args: { scope: Type.String() },
     async handler(ctx, args) {
       return ctx.db.table("items").where("scope", "=", args.scope).delete();
     },
   });
   api.registerMutation("rawTouchAudit", {
-    args: { value: "string" },
+    args: { value: Type.String() },
     async handler(ctx, args) {
       await ctx.db.sql("INSERT INTO audit (value) VALUES (?)", args.value);
     },
   });
+  api.registerMutation("ingest", {
+    args: { scope: Type.String(), name: Type.String() },
+    handler: (ctx, args) =>
+      ctx.db.table("items").insert({
+        scope: args.scope,
+        kind: "hook",
+        name: args.name,
+        score: 0,
+        body: null,
+      }),
+  });
   api.registerWebhook("ingest", {
     path: "/rx/ingest",
     async handler(ctx, req) {
-      await ctx.db.table("items").insert({
+      await ctx.mutate("rx.ingest", {
         scope: req.body.scope,
-        kind: "hook",
         name: req.body.name,
-        score: 0,
-        body: null,
       });
       return { ok: true };
     },
@@ -564,7 +580,7 @@ describe("reactive subscription bedrock", () => {
     }
   });
 
-  test("unsafeBulkInsert invalidation is value-precise for filtered subscriptions", async () => {
+  test("rawBulkInsert invalidation is value-precise for filtered subscriptions", async () => {
     const vex = await create({
       plugins: [reactivityPlugin],
       storage: sqliteAdapter(":memory:"),
@@ -577,7 +593,7 @@ describe("reactive subscription bedrock", () => {
 
     // Bulk rows for a different scope: recorded write values miss the
     // eq-filter, so the group must not even re-run.
-    await vex.unsafeBulkInsert("items", [
+    await rawBulkInsert(vex, "items", [
       { scope: "other", kind: "one", name: "x", score: 0, body: null },
       { scope: "other", kind: "two", name: "y", score: 0, body: null },
     ]);
@@ -585,7 +601,7 @@ describe("reactive subscription bedrock", () => {
     expect(calls).toEqual([[]]);
 
     // Matching rows re-run and deliver.
-    await vex.unsafeBulkInsert("items", [
+    await rawBulkInsert(vex, "items", [
       { scope: "a", kind: "one", name: "m", score: 0, body: null },
     ]);
     expect(listRuns).toBe(runsAfterSubscribe + 1);
@@ -871,8 +887,9 @@ describe("reactive subscription bedrock", () => {
       { userId: "u1", rows: 0 },
       { userId: "u1", rows: 1 },
     ]);
+    // The second subscriber joins the first's group and hears its
+    // answer: one run serves both, before and after the write.
     expect(seen).toEqual([
-      "query:rx.viewer:u1",
       "query:rx.viewer:u1",
       "mutation:rx.add:none",
       "query:rx.viewer:u1",
@@ -1087,17 +1104,38 @@ describe("reactive subscription bedrock", () => {
       ordinaryCallbackArgs = args.length;
     });
     frames.length = 0;
-    serializationCalls = 0;
     ordinaryCallbackArgs = 0;
+    // Serializations of the group's answer: what holds the added row.
+    let serializations = 0;
+    const stringify = JSON.stringify;
+    const spy = spyOn(JSON, "stringify").mockImplementation(((
+      value: unknown,
+      ...rest: unknown[]
+    ) => {
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        "rows" in value &&
+        (value as { rows: Array<{ name?: string }> }).rows.some(
+          (row) => row.name === "added",
+        )
+      ) {
+        serializations++;
+      }
+      return (stringify as (...args: unknown[]) => string)(value, ...rest);
+    }) as typeof JSON.stringify);
+    try {
+      await vex.mutate("rx.add", {
+        scope: "a",
+        kind: "one",
+        name: "added",
+        body: null,
+      });
+    } finally {
+      spy.mockRestore();
+    }
 
-    await vex.mutate("rx.add", {
-      scope: "a",
-      kind: "one",
-      name: "added",
-      body: null,
-    });
-
-    expect(serializationCalls).toBe(1);
+    expect(serializations).toBe(1);
     expect(ordinaryCallbackArgs).toBe(1);
     expect(frames).toHaveLength(2);
     expect(frames[0]).toBe(frames[1]);

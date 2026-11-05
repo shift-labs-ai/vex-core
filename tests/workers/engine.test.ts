@@ -5,18 +5,19 @@ import { env } from "cloudflare:workers";
 import * as root from "vex-core";
 import { durableObjectAdapter, Vex, type VexPluginAPI } from "vex-core";
 import * as vitest from "vitest";
+import { Type } from "../../src/portable.js";
 import { describe, expect, objectStorage, test } from "./bun-test.js";
 
 function ledgerPlugin(api: VexPluginAPI) {
   api.setName("ledger");
   api.registerTable("entries", {
     columns: {
-      account: { type: "string", index: true },
-      amount: { type: "number" },
+      account: Type.String({ index: true }),
+      amount: Type.Number(),
     },
   });
   api.registerQuery("balance", {
-    args: { account: "string" },
+    args: { account: Type.String() },
     async handler(ctx, args) {
       return ctx.db
         .table("entries")
@@ -27,7 +28,7 @@ function ledgerPlugin(api: VexPluginAPI) {
   // Moves money between accounts; fails after the first write when the
   // source would go negative, so the transfer must roll back whole.
   api.registerMutation("transfer", {
-    args: { from: "string", to: "string", amount: "number" },
+    args: { from: Type.String(), to: Type.String(), amount: Type.Number() },
     async handler(ctx, args) {
       await ctx.db
         .table("entries")
@@ -49,7 +50,7 @@ function ledgerPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("deposit", {
-    args: { account: "string", amount: "number" },
+    args: { account: Type.String(), amount: Type.Number() },
     async handler(ctx, args) {
       await ctx.db
         .table("entries")

@@ -75,11 +75,27 @@ export function writeMayAffect(
 }
 
 /**
- * A value as the database holds it, before any column affinity: what
- * an update compares to tell a column it changes from one it leaves.
+ * Whether a column of `type` holds the same under `a` as under `b`:
+ * what an update compares to tell a column it changes from one it
+ * leaves. Certain equality only: a doubt counts as a change.
  */
-export function sqlBound(v: unknown): string | number | null {
-  return bound(v, "unknown");
+export function sameValue(a: unknown, b: unknown, type?: ColumnType): boolean {
+  const affinity = affinityOf(type);
+  return certainlyEqual(bound(a, affinity), bound(b, affinity), affinity);
+}
+
+/**
+ * The key two values share when SQL `=` may hold between them under
+ * any affinity: numbers and numeric text under the number they name,
+ * other text under itself, NULL under its own. Over-inclusive where
+ * the column's affinity would keep `'5.0'` and `5` apart, never
+ * exclusive where it would not.
+ */
+export function equalityKey(v: unknown): string {
+  const value = bound(v, "unknown");
+  if (value === null) return "null";
+  if (typeof value === "number") return `n:${value}`;
+  return numeric(value) ? `n:${Number(value)}` : `s:${value}`;
 }
 
 /**
@@ -153,7 +169,6 @@ function affinityOf(type: ColumnType | undefined): Affinity {
       return "numeric";
     case "string":
     case "json":
-    case "any":
       return "text";
     default:
       return "unknown";

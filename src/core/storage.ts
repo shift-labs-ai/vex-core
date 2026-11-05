@@ -1,4 +1,4 @@
-import type { QueryBuilder, TableSchema } from "./types.js";
+import type { QueryBuilder, StoredTableSchema } from "./types.js";
 
 /**
  * A table name that stands for any table: a raw read that reads no table
@@ -6,6 +6,12 @@ import type { QueryBuilder, TableSchema } from "./types.js";
  * tables, or one by another connection) affects every subscription.
  */
 export const ANY_TABLE = "*";
+
+/**
+ * The clock, as a query depends on it (`QueryContext.now`): no write
+ * changes it; the boundary a dependency names passing re-runs it.
+ */
+export const CLOCK = "\0clock";
 
 /** What changed since the engine last asked. */
 export interface Changes {
@@ -27,7 +33,7 @@ export type ReadOnlyRead =
 
 export interface StorageAdapter {
   readonly name: string;
-  ensureTable(name: string, schema: TableSchema): Promise<void> | void;
+  ensureTable(name: string, schema: StoredTableSchema): Promise<void> | void;
   insert(table: string, row: Record<string, any>): Promise<string>;
   /**
    * Updates the row matching `keys` with `data`, or inserts both; a
@@ -52,6 +58,12 @@ export interface StorageAdapter {
   /** What changed since the last call; committed writes only. */
   takeChanges(): Changes;
   /**
+   * Whether another write holds or waits for the storage's write lock:
+   * a commit's invalidation then waits a turn for those to join it.
+   * Absent where writes never queue in the adapter.
+   */
+  writesPending?(): boolean;
+  /**
    * The tables a raw statement reads, exactly, from how the database
    * would run it; undefined when the adapter cannot tell. Without it the
    * engine falls back to every registered table the statement names.
@@ -66,6 +78,25 @@ export interface StorageAdapter {
    * refuses `publishedSql` outright.
    */
   readOnlyTables?(sql: string): ReadOnlyRead | Promise<ReadOnlyRead>;
-  getSchema(table: string): TableSchema | null;
+  /**
+   * The name of every view, listed once per schema. Without it the
+   * engine lists them for each raw read that holds a table.
+   */
+  viewNames?(): string[] | Promise<string[]>;
+  /**
+   * How another thread opens this storage to read it (an evaluation
+   * worker), as plain data; null or absent when no other thread can
+   * (a database in memory, a Durable Object's).
+   */
+  reader?(): StorageReader | null;
+  getSchema(table: string): StoredTableSchema | null;
   close(): Promise<void> | void;
+}
+
+/** How a thread opens a storage another adapter writes (`reader`). */
+export interface StorageReader {
+  adapter: "sqlite";
+  path: string;
+  busyTimeout?: number;
+  cacheSize?: number;
 }

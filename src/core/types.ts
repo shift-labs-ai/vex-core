@@ -1,13 +1,19 @@
 import type { TableAccessPolicy } from "./access.js";
 import type { ExecContext } from "./tracer.js";
+import type { ArgsOf, ArgsShape, Schema } from "./values.js";
 
-export type ColumnType = "string" | "number" | "boolean" | "json" | "any";
+/** How storage keeps a column: its storage type. */
+export type ColumnType = "string" | "number" | "boolean" | "json";
 
-export interface ColumnDef {
-  type: ColumnType;
+/**
+ * A column as an app declares it: a TypeBox schema (what values it
+ * holds; `Type.Optional` lets it hold none), with what the table does
+ * with it. `default` is the schema's: the value an insert that omits
+ * the column gives it.
+ */
+export type ColumnDef = Schema & {
+  default?: unknown;
   index?: boolean;
-  optional?: boolean;
-  default?: any;
   /**
    * Every name this column has had before. When the table has a column
    * by one of them and none by this name, that column is renamed in
@@ -16,7 +22,22 @@ export interface ColumnDef {
    * name that matches nothing is a mistake.
    */
   renamedFrom?: string[];
+};
+
+/** A column as storage keeps it (`tables.ts` derives it). */
+export interface StoredColumn {
+  type: ColumnType;
+  index?: boolean;
+  optional?: boolean;
+  default?: any;
+  /** As {@link ColumnDef.renamedFrom}. */
+  renamedFrom?: string[];
 }
+
+/** A table as storage keeps it: each column's storage type. */
+export type StoredTableSchema = Omit<TableSchema, "columns"> & {
+  columns: Record<string, StoredColumn>;
+};
 
 export interface TableSchema {
   columns: Record<string, ColumnDef>;
@@ -143,12 +164,44 @@ export interface VexUser {
   isAdmin: boolean;
 }
 
+/**
+ * The app's settings (`VexOptions.env`): plain data every context and
+ * every plugin's registration reads, the same on every thread. An app
+ * declares its fields by augmenting this interface:
+ *
+ *   declare module "vex-core" {
+ *     interface VexEnv { sessionRoot: string; publicUrl: string | null }
+ *   }
+ */
+// biome-ignore lint/suspicious/noEmptyInterface: an app augments it.
+export interface VexEnv {}
+
+/**
+ * The host's live capabilities (`VexOptions.services`): a process
+ * fleet, a dispatcher, a network client. Actions alone hold them
+ * (`ActionContext.services`), on the thread that owns them. An app
+ * declares them by augmenting this interface, as it does `VexEnv`.
+ */
+// biome-ignore lint/suspicious/noEmptyInterface: an app augments it.
+export interface VexServices {}
+
 export interface CallContext {
   parent?: ExecContext;
   user?: VexUser | null;
   /** An action's caller stopping: the action sees it as
    *  `ActionContext.signal`. Queries and mutations ignore it. */
   signal?: AbortSignal;
+}
+
+/** How a subscription is made: as whom, and whom to tell of failures. */
+export interface SubscribeContext extends CallContext {
+  /**
+   * The subscription's view could not be produced. `ended`: it is
+   * over (its result outgrew its reactive budget) and hears nothing
+   * more. Otherwise a run failed: the subscriber keeps the last
+   * answer, and the next write that reaches the view runs it again.
+   */
+  onError?: (error: Error, ended: boolean) => void;
 }
 
 export interface SubscriptionSummary {
@@ -187,10 +240,41 @@ export interface PublishedTable {
   columns: Record<string, DescribedColumn>;
 }
 
+/**
+ * How a raw read is held to a table it reads (`QueryContext.db.sql`):
+ * to the rows its filters match, and, when `reads` is given, to those
+ * columns of them alone.
+ */
+export type Hold = Filter[] | { where: Filter[]; reads: string[] };
+
+/**
+ * What a raw read reads (`QueryContext.db.sql`): each table it reads,
+ * held to rows (`Hold`), or read whole (`"all"`), every write to which
+ * re-runs its subscriptions.
+ */
+export type Reads = Record<string, Hold | "all">;
+
 export interface QueryContext {
   db: {
     table(name: string): QueryBuilder;
-    sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
+    /**
+     * A raw read, of the tables `reads` names and no other: a table
+     * read but not named is refused, so what a subscription depends on
+     * is written down where it is read. A table held to rows (`Hold`)
+     * is, inside the statement, those rows and nothing else, and only
+     * the columns its `reads` name when given: a write to other rows,
+     * or to other columns of them, does not re-run a subscription that
+     * made it. A table read whole (`"all"`) re-runs it on every write.
+     * The hold is the engine's, not the handler's word: a statement
+     * cannot read past it, and one naming a held table under its
+     * schema (`main.t`) is refused. A governed table is refused too,
+     * as raw SQL cannot apply its policy.
+     */
+    sql<T = Record<string, any>>(
+      reads: Reads,
+      sql: string,
+      ...params: any[]
+    ): Promise<T[]>;
     /**
      * Runs SQL someone other than the app wrote: one statement that
      * SQLite's compiled program shows writes nothing and opens only
@@ -207,16 +291,78 @@ export interface QueryContext {
     /** The published dataset: every table `publishedSql` may read. */
     publishedTables(): PublishedTable[];
   };
-  runtime: VexRuntime;
+  /**
+   * Query `name`, called by name: a call of its own (its args
+   * checked, decided by middleware, its answer checked) as this
+   * query's caller, unless `as` names another. What it reads counts as
+   * read by this query, so a subscription re-runs when it changes. A
+   * query not registered rejects with `Query not found: name`. Within a
+   * plugin a plain function over `ctx` composes as well, and costs
+   * less; this composes queries other plugins own.
+   */
+  query<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    as?: { user: VexUser | null },
+  ): Promise<T>;
+  /** The app's settings (`VexEnv`). */
+  env: Readonly<VexEnv>;
+  /**
+   * The time, to `resolutionMs` (a whole number, at least 1000): the
+   * start of the current interval of that length. The query depends
+   * on it: a subscription re-runs when the next interval begins. A
+   * query reading the clock any other way (`Date.now`) depends on it
+   * untracked: its subscriptions go stale, and `purityCheck` says so.
+   */
+  now(resolutionMs: number): number;
   user?: VexUser | null;
+}
+
+/**
+ * Functions to run later, as the caller who scheduled them: a mutation
+ * or action by name, with its args, checked when scheduled. In a
+ * mutation a schedule is part of its transaction (it happens only if
+ * the mutation commits); in an action it happens when called. Each
+ * runs once; a finished one is kept a week.
+ */
+export interface Scheduler {
+  /** Runs `name` after `ms` milliseconds; its scheduled id. */
+  runAfter(
+    ms: number,
+    name: string,
+    args?: Record<string, any>,
+  ): Promise<string>;
+  /** Runs `name` at `time` (ms since the epoch); its scheduled id. */
+  runAt(
+    time: number,
+    name: string,
+    args?: Record<string, any>,
+  ): Promise<string>;
+  /** Cancels a scheduled function not yet started. */
+  cancel(id: string): Promise<void>;
 }
 
 export interface MutationContext {
   db: {
     table(name: string): MutationTable;
+    /**
+     * Raw SQL in the mutation's transaction: statements that read or
+     * change rows. A schema change, a PRAGMA, an attached database or
+     * a transaction statement is refused (schema changes are
+     * migrations), and so is a write to a table the engine keeps.
+     */
     sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
   };
-  runtime: VexRuntime;
+  /** The time this call began: one value for every write it makes. */
+  now(): number;
+  /** A new id, as rows are given. */
+  id(): string;
+  /** A uniform float in [0, 1). */
+  random(): number;
+  /** Functions to run after this mutation commits (`Scheduler`). */
+  scheduler: Scheduler;
+  /** The app's settings (`VexEnv`). */
+  env: Readonly<VexEnv>;
   user?: VexUser | null;
 }
 
@@ -227,15 +373,65 @@ export interface MutationContext {
  * transaction. Nothing it does is held open while it waits.
  */
 export interface ActionContext {
-  query<T = any>(name: string, args?: Record<string, any>): Promise<T>;
-  mutate<T = any>(name: string, args?: Record<string, any>): Promise<T>;
-  /** Another action, as the same caller, stopped when this one is. */
-  action<T = any>(name: string, args?: Record<string, any>): Promise<T>;
+  /** As the action's caller, unless `as` names another (the app's to
+   *  decide, by its middleware). */
+  query<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    as?: { user: VexUser | null },
+  ): Promise<T>;
+  mutate<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    as?: { user: VexUser | null },
+  ): Promise<T>;
+  /** Another action, as the same caller (or `as`), stopped when this
+   *  one is. */
+  action<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    as?: { user: VexUser | null },
+  ): Promise<T>;
   runtime: VexRuntime;
+  /** Functions to run later (`Scheduler`). */
+  scheduler: Scheduler;
+  /** The app's settings (`VexEnv`). */
+  env: Readonly<VexEnv>;
+  /** The host's live capabilities (`VexServices`), as the app gave them. */
+  services: VexServices;
   user?: VexUser | null;
   /** Aborted when the caller stops waiting (`/action`'s request
    *  closing): work that outlives its answer stops with it. */
   signal?: AbortSignal;
+}
+
+/**
+ * What a migration runs with: SQL of any kind, the schema included,
+ * and the engine's operations as the system. It runs in a transaction
+ * of its own, before the engine serves anything.
+ */
+export interface MigrationContext {
+  sql<T = Record<string, any>>(sql: string, ...params: any[]): Promise<T[]>;
+  /** The app's settings (`VexEnv`). */
+  env: Readonly<VexEnv>;
+  /** As the caller `call` names: the system when it names none. */
+  query<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    call?: CallContext,
+  ): Promise<T>;
+  /** As the caller `call` names: the system when it names none. */
+  mutate<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    call?: CallContext,
+  ): Promise<T>;
+}
+
+/** A change to the stored data or schema, applied once, by `id`. */
+export interface Migration {
+  id: string;
+  up(m: MigrationContext): Promise<void> | void;
 }
 
 export interface ReactiveBudget {
@@ -257,18 +453,22 @@ export type OperationAccess<A> = undefined extends A
   ? { access?: A }
   : { access: A };
 
-export type QueryDef<A = undefined> = {
-  args: Record<string, string>;
+/**
+ * A query: what it takes (`args`, a schema per arg, from which its
+ * handler's args are typed), what it answers when it says (`returns`),
+ * and its handler.
+ */
+export type QueryDef<A = undefined, S extends ArgsShape = any> = {
+  args: S;
+  returns?: Schema;
   reactive?: false | ReactiveBudget;
-  handler: (ctx: QueryContext, args: Record<string, any>) => Promise<any> | any;
+  handler: (ctx: QueryContext, args: ArgsOf<S>) => Promise<any> | any;
 } & OperationAccess<A>;
 
-export type MutationDef<A = undefined> = {
-  args: Record<string, string>;
-  handler: (
-    ctx: MutationContext,
-    args: Record<string, any>,
-  ) => Promise<any> | any;
+export type MutationDef<A = undefined, S extends ArgsShape = any> = {
+  args: S;
+  returns?: Schema;
+  handler: (ctx: MutationContext, args: ArgsOf<S>) => Promise<any> | any;
 } & OperationAccess<A>;
 
 /**
@@ -277,17 +477,20 @@ export type MutationDef<A = undefined> = {
  * no read and no transaction while it runs, so no handler timeout
  * bounds it; its own work does.
  */
-export type ActionDef<A = undefined> = {
-  args: Record<string, string>;
-  handler: (
-    ctx: ActionContext,
-    args: Record<string, any>,
-  ) => Promise<any> | any;
+export type ActionDef<A = undefined, S extends ArgsShape = any> = {
+  args: S;
+  returns?: Schema;
+  handler: (ctx: ActionContext, args: ArgsOf<S>) => Promise<any> | any;
 } & OperationAccess<A>;
 
+/**
+ * A scheduled action, run as the system: it may wait and reach outside
+ * the engine; what it reads and writes goes through ctx.query and
+ * ctx.mutate.
+ */
 export interface JobDef {
   schedule: string;
-  handler: (ctx: MutationContext) => Promise<void> | void;
+  handler: (ctx: ActionContext) => Promise<void> | void;
   description?: string;
   enabled?: boolean;
   timeoutMs?: number;
@@ -314,8 +517,10 @@ export interface WebhookDef {
   path: string;
   method?: "POST" | "GET" | "PUT" | "DELETE";
   verify?: (req: WebhookRequest) => boolean;
+  /** An action reached over HTTP, as the system: it writes through
+   *  ctx.mutate. */
   handler: (
-    ctx: MutationContext,
+    ctx: ActionContext,
     req: WebhookRequest,
   ) => Promise<WebhookResponse | any> | WebhookResponse | any;
 }

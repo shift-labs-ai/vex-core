@@ -6,7 +6,7 @@ import {
 } from "../core/sql-text.js";
 import { serializeValue } from "../core/sql-value.js";
 import { ANY_TABLE, type Changes, type ReadOnlyRead } from "../core/storage.js";
-import type { TableSchema } from "../core/types.js";
+import type { StoredTableSchema } from "../core/types.js";
 import {
   buildInsertSql,
   buildUpdateSql,
@@ -71,7 +71,7 @@ const SQLITE_INDEX_METADATA_TABLE = "__vex_sqlite_indexes";
  */
 export const GATHER_STATISTICS = "PRAGMA optimize=0x10002";
 
-function toSqlType(type: TableSchema["columns"][string]["type"]): string {
+function toSqlType(type: StoredTableSchema["columns"][string]["type"]): string {
   switch (type) {
     case "number":
       return "REAL";
@@ -105,18 +105,20 @@ function sqlLiteral(value: any): string {
   return `'${String(serialized).replaceAll("'", "''")}'`;
 }
 
-function defaultLiteral(colDef: TableSchema["columns"][string]): string | null {
+function defaultLiteral(
+  colDef: StoredTableSchema["columns"][string],
+): string | null {
   return colDef.default !== undefined ? sqlLiteral(colDef.default) : null;
 }
 
-function defaultSql(colDef: TableSchema["columns"][string]): string {
+function defaultSql(colDef: StoredTableSchema["columns"][string]): string {
   const literal = defaultLiteral(colDef);
   return literal !== null ? ` DEFAULT ${literal}` : "";
 }
 
 function columnNeedsRebuild(
   col: ExistingColumn,
-  colDef: TableSchema["columns"][string],
+  colDef: StoredTableSchema["columns"][string],
 ): boolean {
   const expectedType = toSqlType(colDef.type).toUpperCase();
   const actualType = (col.type || "TEXT").toUpperCase();
@@ -131,7 +133,7 @@ function columnNeedsRebuild(
 
 function columnSql(
   colName: string,
-  colDef: TableSchema["columns"][string],
+  colDef: StoredTableSchema["columns"][string],
 ): string {
   const sqlType = toSqlType(colDef.type);
   const nullable = colDef.optional ? "" : " NOT NULL";
@@ -140,7 +142,7 @@ function columnSql(
 
 function migratedColumnSql(
   colName: string,
-  colDef: TableSchema["columns"][string],
+  colDef: StoredTableSchema["columns"][string],
   enforceRequired: boolean,
 ): string {
   const sqlType = toSqlType(colDef.type);
@@ -169,7 +171,10 @@ function validateTableName(name: string): void {
 
 // SQLite matches table names case-insensitively; this returns the stored
 // spelling of the table a name refers to.
-function existingTableName(db: SqliteDriver, name: string): string | undefined {
+export function existingTableName(
+  db: SqliteDriver,
+  name: string,
+): string | undefined {
   const row = db
     .prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(?) LIMIT 1",
@@ -187,7 +192,7 @@ function validateTableNameAvailability(db: SqliteDriver, name: string): void {
   }
 }
 
-function validateTableRenames(name: string, schema: TableSchema): void {
+function validateTableRenames(name: string, schema: StoredTableSchema): void {
   for (const previous of schema.renamedFrom ?? []) {
     validateTableName(previous);
     if (previous.toLowerCase() === name.toLowerCase()) {
@@ -231,7 +236,7 @@ function renameSource(
 function renameTableIfNeeded(
   db: SqliteDriver,
   name: string,
-  schema: TableSchema,
+  schema: StoredTableSchema,
 ): string | undefined {
   const source = renameSource("table", name, schema.renamedFrom ?? [], (n) =>
     existingTableName(db, n),
@@ -251,7 +256,7 @@ function renameTableIfNeeded(
 function renameColumnsIfNeeded(
   db: SqliteDriver,
   name: string,
-  schema: TableSchema,
+  schema: StoredTableSchema,
   existing: ExistingColumn[],
 ): void {
   const column = (colName: string) =>
@@ -282,7 +287,7 @@ function renameColumnsIfNeeded(
   }
 }
 
-function validateColumns(name: string, schema: TableSchema): void {
+function validateColumns(name: string, schema: StoredTableSchema): void {
   const columnNames = new Set<string>();
   for (const colName of Object.keys(schema.columns)) {
     const normalizedColName = colName.toLowerCase();
@@ -319,7 +324,7 @@ function validateColumns(name: string, schema: TableSchema): void {
   }
 }
 
-function validateIndexColumns(name: string, schema: TableSchema): void {
+function validateIndexColumns(name: string, schema: StoredTableSchema): void {
   const columnNames = new Set(["_id", ...Object.keys(schema.columns)]);
   const generatedColumnIndexNames = new Map<string, string>();
   for (const [colName, colDef] of Object.entries(schema.columns)) {
@@ -394,7 +399,7 @@ function validateIndexColumns(name: string, schema: TableSchema): void {
 
 function expectedIndexDefinitions(
   name: string,
-  schema: TableSchema,
+  schema: StoredTableSchema,
 ): Map<string, ExpectedIndex> {
   const expectedIndexes = new Map<string, ExpectedIndex>();
   for (const [colName, colDef] of Object.entries(schema.columns)) {
@@ -438,7 +443,7 @@ function validateIndexNameAvailability(
 
 function createTableSql(
   name: string,
-  schema: TableSchema,
+  schema: StoredTableSchema,
   extraColumns: ExistingColumn[] = [],
 ): string {
   const colDefs = ["_id TEXT PRIMARY KEY"];
@@ -474,7 +479,7 @@ function rebuildTempTableName(db: SqliteDriver, name: string): string {
 function rebuildTable(
   db: SqliteDriver,
   name: string,
-  schema: TableSchema,
+  schema: StoredTableSchema,
   existingColumns: ExistingColumn[],
   copyData: boolean,
 ): void {
@@ -512,7 +517,7 @@ function rebuildTable(
 export function ensureSqliteTable(
   db: SqliteDriver,
   name: string,
-  schema: TableSchema,
+  schema: StoredTableSchema,
 ): string | undefined {
   validateTableName(name);
   validateTableNameAvailability(db, name);
@@ -673,6 +678,8 @@ export interface SqliteIntrospection {
   explain(statement: string): ExplainRow[];
   /** The root page of every table and index in the main database. */
   rootPages(): { rootpage: number; tbl_name: string }[];
+  /** The name of every view in the main database. */
+  views(): { name: string }[];
 }
 
 // The cursors a program opens on stored tables. `Clear` is DELETE
@@ -735,7 +742,7 @@ class BoundedMap<K, V> extends Map<K, V> {
  * set at commit, so nothing reports a write that may yet roll back.
  */
 export class SqliteAdapterState {
-  readonly schemas = new Map<string, TableSchema>();
+  readonly schemas = new Map<string, StoredTableSchema>();
   // Table → attributed, for the changes since the engine last asked.
   private readonly changed = new Map<string, boolean>();
   // The open transaction's writes; one Map, reused.
@@ -743,7 +750,7 @@ export class SqliteAdapterState {
   private pending: Map<string, boolean> | null = null;
   // While a transaction is open, each schema it replaces, to put back on
   // rollback.
-  private readonly schemaUndo: [string, TableSchema | undefined][] = [];
+  private readonly schemaUndo: [string, StoredTableSchema | undefined][] = [];
   private readonly writes = new BoundedMap<string, WriteAnalysis>(
     ANALYSIS_CACHE_SIZE,
   );
@@ -754,6 +761,7 @@ export class SqliteAdapterState {
     ANALYSIS_CACHE_SIZE,
   );
   private roots: Map<number, string> | null = null;
+  private viewList: string[] | null = null;
   private dataVersion: number | undefined;
   private schemaEpoch = 0;
 
@@ -765,7 +773,7 @@ export class SqliteAdapterState {
 
   registerSchema(
     name: string,
-    schema: TableSchema,
+    schema: StoredTableSchema,
     renamedFrom: string | undefined,
   ): void {
     if (this.pending !== null) {
@@ -786,6 +794,18 @@ export class SqliteAdapterState {
     this.reads.clear();
     this.plainReads.clear();
     this.roots = null;
+    this.viewList = null;
+  }
+
+  /** The views as last listed for this schema; null when not listed yet. */
+  cachedViewNames(): string[] | null {
+    return this.viewList;
+  }
+
+  /** The views in the main database, listed once per schema. */
+  viewNames(introspection: SqliteIntrospection): string[] {
+    this.viewList ??= introspection.views().map(({ name }) => name);
+    return this.viewList;
   }
 
   /**

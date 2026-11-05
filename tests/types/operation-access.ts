@@ -7,10 +7,10 @@
 
 import type { PluginFunction, VexPluginAPI } from "../../src/core/api.js";
 import { Vex } from "../../src/core/engine.js";
-import { vexHandler } from "../../src/http/vex-handler.js";
-import { vexWebSocket } from "../../src/http/vex-websocket.js";
 import type { StorageAdapter } from "../../src/core/storage.js";
 import type { MiddlewareFn } from "../../src/core/types.js";
+import { vexHandler } from "../../src/http/vex-handler.js";
+import { vexWebSocket } from "../../src/http/vex-websocket.js";
 
 declare const storage: StorageAdapter;
 

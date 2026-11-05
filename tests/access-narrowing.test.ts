@@ -29,6 +29,8 @@ import {
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { VexUser } from "../src/core/types.js";
+import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
 const admin: VexUser = { id: "root", name: "Root", isAdmin: true };
@@ -98,12 +100,12 @@ const nothing: TableAccessPolicy<Prepared> = {
 };
 
 const DOC_COLUMNS = {
-  ownerId: { type: "string" as const, index: true },
-  title: { type: "string" as const },
-  kind: { type: "string" as const },
-  score: { type: "number" as const, optional: true },
+  ownerId: Type.String({ index: true }),
+  title: Type.String(),
+  kind: Type.String(),
+  score: Type.Optional(Type.Number()),
   /** The heavy column no window asks for. */
-  body: { type: "string" as const, optional: true },
+  body: Type.Optional(Type.String()),
 };
 
 const GOVERNED = { docs: exact, loose, unsaid, hidden: nothing } as const;
@@ -113,8 +115,8 @@ function plugin(api: VexPluginAPI) {
   api.setName("nx");
   api.registerTable("grants", {
     columns: {
-      userId: { type: "string", index: true },
-      docId: { type: "string", index: true },
+      userId: Type.String({ index: true }),
+      docId: Type.String({ index: true }),
     },
   });
   for (const [name, access] of Object.entries(GOVERNED)) {
@@ -125,7 +127,7 @@ function plugin(api: VexPluginAPI) {
   }
 
   api.registerQuery("run", {
-    args: { op: "json" },
+    args: { op: Type.Unknown() },
     async handler(ctx, args) {
       const spec = args.op as {
         table: string;
@@ -180,7 +182,7 @@ function plugin(api: VexPluginAPI) {
   });
 
   api.registerQuery("grouped", {
-    args: { table: "string", spec: "json" },
+    args: { table: Type.String(), spec: Type.Unknown() },
     async handler(ctx, args) {
       const spec = (args.spec ?? {}) as {
         columns?: string | string[];
@@ -230,7 +232,7 @@ function plugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("grant", {
-    args: { userId: "string", docId: "string" },
+    args: { userId: Type.String(), docId: Type.String() },
     async handler(ctx, args) {
       await ctx.db.table("grants").insert(args);
     },
@@ -284,7 +286,8 @@ async function seed(vex: Vex, total = 30): Promise<Doc[]> {
   }
   const insert = async (table: string, docs: Doc[]) => {
     for (const r of docs) {
-      await vex.unsafeSql(
+      await rawSql(
+        vex,
         `INSERT INTO ${table} (_id, ownerId, title, kind, score, body) VALUES (?, ?, ?, ?, ?, ?)`,
         r._id,
         r.ownerId,

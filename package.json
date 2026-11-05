@@ -12,6 +12,11 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./internal": {
+      "types": "./dist/internal.d.ts",
+      "import": "./dist/internal.js",
+      "default": "./dist/internal.js"
+    },
     "./client": {
       "types": "./dist/client/index.d.ts",
       "import": "./dist/client/index.js",
@@ -40,6 +45,7 @@
   },
   "files": [
     "dist",
+    "docs",
     "README.md",
     "LICENSE"
   ],
@@ -48,10 +54,14 @@
     "test": "bun test",
     "test:workers": "tsc && tsc -p tests/workers && vitest run --config tests/workers/vitest.config.ts",
     "bench:sqlite-read": "bun benchmarks/sqlite-read-contention.ts",
+    "bench:invalidation": "bun benchmarks/invalidation.ts",
+    "bench:compare": "bun benchmarks/compare.ts",
+    "bench:scale": "bun benchmarks/scale.ts",
+    "bench:mmo": "bun benchmarks/mmo.ts",
     "format": "bunx biome format --write src/",
     "lint": "bunx biome lint src/",
     "check": "bunx biome check src/",
-    "typecheck": "tsc --noEmit && tsc -p tests/types",
+    "typecheck": "tsc --noEmit && tsc -p tests/types && tsc -p tests/types-env",
     "prepublishOnly": "bun run typecheck && bun run build"
   },
   "keywords": [
@@ -89,7 +99,7 @@
     "vitest": "^4.1.0"
   },
   "dependencies": {
-    "nanoid": "^5.1.7"
+    "typebox": "^1.4.3"
   },
   "peerDependencies": {
     "react": "^19.2.4"

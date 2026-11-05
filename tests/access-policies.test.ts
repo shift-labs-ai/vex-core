@@ -36,6 +36,8 @@ import { UNRESTRICTED } from "../src/core/access.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { VexUser } from "../src/core/types.js";
+import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
 const bob: VexUser = { id: "bob", name: "Bob", isAdmin: false };
@@ -62,16 +64,16 @@ function docsPlugin(api: VexPluginAPI) {
   api.setName("dx");
   api.registerTable("grants", {
     columns: {
-      userId: { type: "string", index: true },
-      docId: { type: "string", index: true },
+      userId: Type.String({ index: true }),
+      docId: Type.String({ index: true }),
     },
   });
   api.registerTable("docs", {
     columns: {
-      ownerId: { type: "string", index: true },
-      title: { type: "string" },
-      kind: { type: "string" },
-      score: { type: "number", optional: true },
+      ownerId: Type.String({ index: true }),
+      title: Type.String(),
+      kind: Type.String(),
+      score: Type.Optional(Type.Number()),
     },
     access: {
       async prepare(user, db) {
@@ -101,17 +103,20 @@ function docsPlugin(api: VexPluginAPI) {
   for (const oracle of ["mirror", "mirrorAll"]) {
     api.registerTable(oracle, {
       columns: {
-        ownerId: { type: "string", index: true },
-        title: { type: "string" },
-        kind: { type: "string" },
-        score: { type: "number", optional: true },
+        ownerId: Type.String({ index: true }),
+        title: Type.String(),
+        kind: Type.String(),
+        score: Type.Optional(Type.Number()),
       },
     });
   }
   // A second governed table with its own policy: a handler reading
   // both must resolve two independent prepared contexts.
   api.registerTable("pets", {
-    columns: { ownerId: { type: "string", index: true }, name: { type: "string" } },
+    columns: {
+      ownerId: Type.String({ index: true }),
+      name: Type.String(),
+    },
     access: {
       prepare(user) {
         if (!user || user.isAdmin) return UNRESTRICTED;
@@ -125,7 +130,7 @@ function docsPlugin(api: VexPluginAPI) {
   // A governed table whose policy fails — failures must reject the
   // operation, never fail open.
   api.registerTable("vault", {
-    columns: { name: { type: "string" } },
+    columns: { name: Type.String() },
     access: {
       prepare(user) {
         if (!user) return UNRESTRICTED;
@@ -140,7 +145,7 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerQuery("run", {
-    args: { op: "json" },
+    args: { op: Type.Unknown() },
     // The test drives arbitrary builder chains through one query so
     // every read path is exercised inside a real query context.
     async handler(ctx, args) {
@@ -196,7 +201,7 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerQuery("grouped", {
-    args: { table: "string", spec: "json" },
+    args: { table: Type.String(), spec: Type.Unknown() },
     async handler(ctx, args) {
       const spec = (args.spec ?? {}) as {
         columns?: string | string[];
@@ -239,7 +244,10 @@ function docsPlugin(api: VexPluginAPI) {
   api.registerQuery("rawRead", {
     args: {},
     async handler(ctx) {
-      return ctx.db.sql("SELECT * FROM docs ORDER BY title ASC");
+      return ctx.db.sql(
+        { docs: "all" },
+        "SELECT * FROM docs ORDER BY title ASC",
+      );
     },
   });
 
@@ -247,6 +255,7 @@ function docsPlugin(api: VexPluginAPI) {
     args: {},
     async handler(ctx) {
       return ctx.db.sql(
+        { grants: "all", docs: "all" },
         "SELECT g.userId FROM grants g JOIN docs d ON d._id = g.docId",
       );
     },
@@ -255,7 +264,7 @@ function docsPlugin(api: VexPluginAPI) {
   api.registerQuery("rawUngoverned", {
     args: {},
     async handler(ctx) {
-      return ctx.db.sql("SELECT COUNT(*) AS n FROM grants");
+      return ctx.db.sql({ grants: "all" }, "SELECT COUNT(*) AS n FROM grants");
     },
   });
 
@@ -271,7 +280,12 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("addDoc", {
-    args: { id: "string", ownerId: "string", title: "string", kind: "string" },
+    args: {
+      id: Type.String(),
+      ownerId: Type.String(),
+      title: Type.String(),
+      kind: Type.String(),
+    },
     async handler(ctx, args) {
       await ctx.db.table("docs").insert({
         _id: args.id,
@@ -284,7 +298,7 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("grant", {
-    args: { userId: "string", docId: "string" },
+    args: { userId: Type.String(), docId: Type.String() },
     async handler(ctx, args) {
       await ctx.db.table("grants").insert(args);
     },
@@ -332,13 +346,20 @@ async function seed(vex: Vex, total = 20): Promise<DocRow[]> {
       kind: row.kind,
     });
     if (row.score !== null) {
-      await vex.unsafeSql("UPDATE docs SET score = ? WHERE _id = ?", row.score, row._id);
+      await rawSql(
+        vex,
+        "UPDATE docs SET score = ? WHERE _id = ?",
+        row.score,
+        row._id,
+      );
     }
-    if (granted) await vex.mutate("dx.grant", { userId: "alice", docId: row._id });
+    if (granted)
+      await vex.mutate("dx.grant", { userId: "alice", docId: row._id });
     if (mine || granted) accessible.push(row);
   }
   for (const row of accessible) {
-    await vex.unsafeSql(
+    await rawSql(
+      vex,
       "INSERT INTO mirror (_id, ownerId, title, kind, score) VALUES (?, ?, ?, ?, ?)",
       `m-${row._id}`,
       row.ownerId,
@@ -347,7 +368,8 @@ async function seed(vex: Vex, total = 20): Promise<DocRow[]> {
       row.score,
     );
   }
-  await vex.unsafeSql(
+  await rawSql(
+    vex,
     "INSERT INTO mirrorAll (_id, ownerId, title, kind, score) SELECT 'a-' || _id, ownerId, title, kind, score FROM docs",
   );
   return accessible;
@@ -360,8 +382,14 @@ describe("table access policies", () => {
   test("unrestricted callers (internal, admin) see every row", async () => {
     const vex = await create();
     await seed(vex);
-    const internal = (await run(vex, null, { table: "docs", terminal: "all" })) as DocRow[];
-    const asAdmin = (await run(vex, admin, { table: "docs", terminal: "all" })) as DocRow[];
+    const internal = (await run(vex, null, {
+      table: "docs",
+      terminal: "all",
+    })) as DocRow[];
+    const asAdmin = (await run(vex, admin, {
+      table: "docs",
+      terminal: "all",
+    })) as DocRow[];
     expect(internal.length).toBe(20);
     expect(asAdmin.length).toBe(20);
   });
@@ -376,7 +404,9 @@ describe("table access policies", () => {
     })) as DocRow[];
     expect(rows.map((r) => r._id)).toEqual(accessible.map((r) => r._id));
     // Nothing of Bob's leaks.
-    expect(rows.every((r) => r.ownerId === "alice" || r.ownerId === "bob")).toBe(true);
+    expect(
+      rows.every((r) => r.ownerId === "alice" || r.ownerId === "bob"),
+    ).toBe(true);
     const bobRows = (await run(vex, bob, {
       table: "docs",
       order: ["title", "asc"],
@@ -394,7 +424,9 @@ describe("table access policies", () => {
       limit: 5,
       terminal: "all",
     })) as DocRow[];
-    expect(rows.map((r) => r._id)).toEqual(accessible.slice(0, 5).map((r) => r._id));
+    expect(rows.map((r) => r._id)).toEqual(
+      accessible.slice(0, 5).map((r) => r._id),
+    );
   });
 
   test("offset pages the accessible stream, not the raw table", async () => {
@@ -479,7 +511,11 @@ describe("table access policies", () => {
     expect(projected).toEqual({ title: accessible[0].title });
     const none = await run(vex, alice, {
       table: "docs",
-      where: [["ownerId", "=", "bob"], ["kind", "=", "memo"], ["score", "=", -1]],
+      where: [
+        ["ownerId", "=", "bob"],
+        ["kind", "=", "memo"],
+        ["score", "=", -1],
+      ],
       terminal: "first",
     });
     expect(none).toBeNull();
@@ -522,7 +558,10 @@ describe("table access policies", () => {
         order: ["title", "asc"],
         terminal,
       });
-      expect({ terminal, value: governed }).toEqual({ terminal, value: mirror });
+      expect({ terminal, value: governed }).toEqual({
+        terminal,
+        value: mirror,
+      });
     }
   });
 
@@ -551,7 +590,9 @@ describe("table access policies", () => {
       /access-governed/,
     );
     // Raw SQL over ungoverned tables is untouched.
-    const counts = (await vex.query("dx.rawUngoverned", {})) as Array<{ n: number }>;
+    const counts = (await vex.query("dx.rawUngoverned", {})) as Array<{
+      n: number;
+    }>;
     expect(counts[0].n).toBeGreaterThan(0);
   });
 
@@ -568,7 +609,9 @@ describe("table access policies", () => {
   test("mutation contexts stay ungoverned — the trusted tier", async () => {
     const vex = await create();
     await seed(vex);
-    expect(await vex.mutate("dx.mutationReadsAll", {}, { user: alice })).toBe(20);
+    expect(await vex.mutate("dx.mutationReadsAll", {}, { user: alice })).toBe(
+      20,
+    );
   });
 
   test("prepare runs once per operation, not once per chain", async () => {
@@ -593,14 +636,48 @@ describe("table access policies", () => {
     await seed(vex);
     const specs: Array<Record<string, unknown>> = [
       { order: ["title", "asc"], limit: 3, offset: 2, terminal: "all" },
-      { select: ["title", "kind"], order: ["title", "desc"], limit: 4, terminal: "all" },
-      { where: [["kind", "=", "memo"]], order: ["title", "asc"], offset: 1, terminal: "all" },
-      { where: [["kind", "IN", ["memo", "report"]]], order: ["title", "asc"], terminal: "all" },
-      { where: [["score", "=", null]], order: ["title", "asc"], terminal: "all" },
-      { where: [["score", ">", 5]], order: ["score", "desc"], limit: 2, terminal: "all" },
-      { select: ["title"], order: ["title", "asc"], offset: 2, terminal: "first" },
+      {
+        select: ["title", "kind"],
+        order: ["title", "desc"],
+        limit: 4,
+        terminal: "all",
+      },
+      {
+        where: [["kind", "=", "memo"]],
+        order: ["title", "asc"],
+        offset: 1,
+        terminal: "all",
+      },
+      {
+        where: [["kind", "IN", ["memo", "report"]]],
+        order: ["title", "asc"],
+        terminal: "all",
+      },
+      {
+        where: [["score", "=", null]],
+        order: ["title", "asc"],
+        terminal: "all",
+      },
+      {
+        where: [["score", ">", 5]],
+        order: ["score", "desc"],
+        limit: 2,
+        terminal: "all",
+      },
+      {
+        select: ["title"],
+        order: ["title", "asc"],
+        offset: 2,
+        terminal: "first",
+      },
       { limit: 3, terminal: "count" },
-      { order: ["title", "asc"], limit: 2, offset: 1, terminal: "distinct", column: "kind" },
+      {
+        order: ["title", "asc"],
+        limit: 2,
+        offset: 1,
+        terminal: "distinct",
+        column: "kind",
+      },
       { terminal: "countDistinct", column: "ownerId" },
       { where: [["kind", "=", "memo"]], terminal: "sum", column: "score" },
       { where: [["kind", "=", "report"]], terminal: "avg", column: "score" },
@@ -618,12 +695,24 @@ describe("table access policies", () => {
           ? { ...(value as object), _id: "~" }
           : value;
     for (const spec of specs) {
-      const restricted = strip(await run(vex, alice, { ...spec, table: "docs" }));
-      const restrictedOracle = strip(await run(vex, null, { ...spec, table: "mirror" }));
-      expect({ spec, value: restricted }).toEqual({ spec, value: restrictedOracle });
+      const restricted = strip(
+        await run(vex, alice, { ...spec, table: "docs" }),
+      );
+      const restrictedOracle = strip(
+        await run(vex, null, { ...spec, table: "mirror" }),
+      );
+      expect({ spec, value: restricted }).toEqual({
+        spec,
+        value: restrictedOracle,
+      });
       const released = strip(await run(vex, admin, { ...spec, table: "docs" }));
-      const releasedOracle = strip(await run(vex, null, { ...spec, table: "mirrorAll" }));
-      expect({ spec, value: released }).toEqual({ spec, value: releasedOracle });
+      const releasedOracle = strip(
+        await run(vex, null, { ...spec, table: "mirrorAll" }),
+      );
+      expect({ spec, value: released }).toEqual({
+        spec,
+        value: releasedOracle,
+      });
     }
   });
 
@@ -634,24 +723,45 @@ describe("table access policies", () => {
       { order: ["kind", "asc"] },
       { columns: ["kind", "ownerId"], order: ["kind", "asc"] },
       { having: [["count", ">", 2]], order: ["count", "desc"] },
-      { having: [["top", "<", 100], ["owners", "IN", [1, 2]]], order: ["kind", "desc"], limit: 1 },
+      {
+        having: [
+          ["top", "<", 100],
+          ["owners", "IN", [1, 2]],
+        ],
+        order: ["kind", "desc"],
+        limit: 1,
+      },
     ];
     const sorted = (rows: unknown) =>
       JSON.parse(JSON.stringify(rows)) as Array<Record<string, unknown>>;
     for (const spec of specs) {
       expect({
         spec,
-        value: sorted(await vex.query("dx.grouped", { table: "docs", spec }, { user: alice })),
+        value: sorted(
+          await vex.query(
+            "dx.grouped",
+            { table: "docs", spec },
+            { user: alice },
+          ),
+        ),
       }).toEqual({
         spec,
         value: sorted(await vex.query("dx.grouped", { table: "mirror", spec })),
       });
       expect({
         spec,
-        value: sorted(await vex.query("dx.grouped", { table: "docs", spec }, { user: admin })),
+        value: sorted(
+          await vex.query(
+            "dx.grouped",
+            { table: "docs", spec },
+            { user: admin },
+          ),
+        ),
       }).toEqual({
         spec,
-        value: sorted(await vex.query("dx.grouped", { table: "mirrorAll", spec })),
+        value: sorted(
+          await vex.query("dx.grouped", { table: "mirrorAll", spec }),
+        ),
       });
     }
   });
@@ -683,11 +793,16 @@ describe("table access policies", () => {
   test("two governed tables resolve independent prepared contexts", async () => {
     const vex = await create();
     await seed(vex, 4);
-    await vex.unsafeSql(
+    await rawSql(
+      vex,
       "INSERT INTO pets (_id, ownerId, name) VALUES ('p1','alice','rex'), ('p2','bob','tux')",
     );
     prepareCalls = 0;
-    const result = (await vex.query("dx.bothGoverned", {}, { user: alice })) as {
+    const result = (await vex.query(
+      "dx.bothGoverned",
+      {},
+      { user: alice },
+    )) as {
       docs: number;
       pets: number;
     };
@@ -700,11 +815,11 @@ describe("table access policies", () => {
 
   test("policy failures reject the operation — never fail open", async () => {
     const vex = await create();
-    await vex.unsafeSql("INSERT INTO vault (_id, name) VALUES ('v1','mine')");
+    await rawSql(vex, "INSERT INTO vault (_id, name) VALUES ('v1','mine')");
     // prepare throwing rejects the query…
-    await expect(vex.query("dx.vaultRead", {}, { user: alice })).rejects.toThrow(
-      "prepare exploded",
-    );
+    await expect(
+      vex.query("dx.vaultRead", {}, { user: alice }),
+    ).rejects.toThrow("prepare exploded");
     // …a row verdict throwing rejects the query…
     await expect(vex.query("dx.vaultRead", {}, { user: bob })).rejects.toThrow(
       "row verdict exploded",
@@ -770,7 +885,10 @@ describe("the caller a policy prepares for", () => {
     });
     open.push(vex);
     await seed(vex, 6);
-    const rows = (await run(vex, alice, { table: "docs", terminal: "all" })) as DocRow[];
+    const rows = (await run(vex, alice, {
+      table: "docs",
+      terminal: "all",
+    })) as DocRow[];
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.every((row) => row.ownerId === "bob")).toBe(true);
   });

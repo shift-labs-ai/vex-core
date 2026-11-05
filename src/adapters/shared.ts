@@ -1,34 +1,33 @@
 import { serializeValue } from "../core/sql-value.js";
+import { buildWhereClause, quoteIdent } from "../core/sql-where.js";
 import type {
   AggDef,
   Condition,
   Filter,
   GroupByBuilder,
   QueryBuilder,
-  TableSchema,
+  StoredTableSchema,
 } from "../core/types.js";
 
-export function quoteIdent(name: string): string {
-  return `"${name.replaceAll('"', '""')}"`;
-}
+export { buildWhereClause, quoteIdent } from "../core/sql-where.js";
 
 interface RowTransform {
   column: string;
   kind: "json" | "boolean";
 }
 
-// Deserialization plans are cached per schema object: only json/any and
+// Deserialization plans are cached per schema object: only json and
 // boolean columns need per-row work, and most tables have none. ensureTable
 // registers a fresh schema object on every (re)registration, so migrations
 // invalidate naturally and the WeakMap cannot outlive the schemas it keys.
-const rowTransformPlans = new WeakMap<TableSchema, RowTransform[]>();
+const rowTransformPlans = new WeakMap<StoredTableSchema, RowTransform[]>();
 
-function rowTransforms(schema: TableSchema): RowTransform[] {
+function rowTransforms(schema: StoredTableSchema): RowTransform[] {
   let plan = rowTransformPlans.get(schema);
   if (!plan) {
     plan = [];
     for (const [column, def] of Object.entries(schema.columns)) {
-      if (def.type === "json" || def.type === "any") {
+      if (def.type === "json") {
         plan.push({ column, kind: "json" });
       } else if (def.type === "boolean") {
         plan.push({ column, kind: "boolean" });
@@ -41,7 +40,7 @@ function rowTransforms(schema: TableSchema): RowTransform[] {
 
 export function deserializeRow(
   row: Record<string, any>,
-  schema: TableSchema | undefined,
+  schema: StoredTableSchema | undefined,
 ): Record<string, any> {
   if (!schema) return row;
   for (const { column, kind } of rowTransforms(schema)) {
@@ -59,62 +58,11 @@ export function deserializeRow(
   return row;
 }
 
-/**
- * One condition's SQL, its parameters appended to `params`: a filter,
- * or an OR of AND groups (no group matches nothing, an empty group
- * every row).
- */
-function conditionSql(condition: Condition, params: any[]): string {
-  if (!("any" in condition)) return filterSql(condition, params);
-  if (condition.any.length === 0) return "0 = 1";
-  const groups = condition.any.map((group) =>
-    group.length === 0
-      ? "1 = 1"
-      : `(${group.map((f) => filterSql(f, params)).join(" AND ")})`,
-  );
-  return `(${groups.join(" OR ")})`;
-}
-
-export function buildWhereClause(filters: readonly Condition[]): {
-  sql: string;
-  params: any[];
-} {
-  if (filters.length === 0) return { sql: "", params: [] };
-  const params: any[] = [];
-  const parts = filters.map((condition) => conditionSql(condition, params));
-  return { sql: `WHERE ${parts.join(" AND ")}`, params };
-}
-
-/** One filter's SQL, its parameters appended to `params`. */
-function filterSql(f: Filter, params: any[]): string {
-  const column = quoteIdent(f.column);
-  if (f.operator === "IN") {
-    const values = (Array.isArray(f.value) ? f.value : [f.value]).map(
-      serializeValue,
-    );
-    const nonNull = values.filter((item) => item !== null);
-    const clauses: string[] = [];
-    if (nonNull.length > 0) {
-      clauses.push(`${column} IN (${nonNull.map(() => "?").join(", ")})`);
-      params.push(...nonNull);
-    }
-    if (values.some((item) => item === null)) {
-      clauses.push(`${column} IS NULL`);
-    }
-    return clauses.length > 0 ? `(${clauses.join(" OR ")})` : "0 = 1";
-  }
-  const value = serializeValue(f.value);
-  if (value === null && f.operator === "=") return `${column} IS NULL`;
-  if (value === null && f.operator === "!=") return `${column} IS NOT NULL`;
-  params.push(value);
-  return `${column} ${f.operator} ?`;
-}
-
 export interface DbExec {
   all(sql: string, params: any[]): Promise<any[]>;
   /** A write; the adapter records which tables it changed. */
   run(sql: string, params: any[]): Promise<{ changes: number }>;
-  schemas: Map<string, TableSchema>;
+  schemas: Map<string, StoredTableSchema>;
 }
 
 export function createQueryBuilder(exec: DbExec, table: string): QueryBuilder {

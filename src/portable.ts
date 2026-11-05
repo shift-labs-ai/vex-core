@@ -6,10 +6,13 @@
  * Durable Objects".
  */
 
+export type { Static } from "typebox";
+// The schema language: TypeBox, re-exported so an app holds the
+// engine's own version.
+export { default as Type } from "typebox";
 // Adapters
 export type { DurableObjectSqlStorage } from "./adapters/durable-object.js";
 export { durableObjectAdapter } from "./adapters/durable-object.js";
-
 // Core
 export type {
   AccessReader,
@@ -19,8 +22,17 @@ export type {
 export { narrowingDrift, UNRESTRICTED } from "./core/access.js";
 export type { PluginFunction, VexPluginAPI } from "./core/api.js";
 export { createPluginAPI, resolvePlugin } from "./core/api.js";
-export type { OperationDescription, VexOptions } from "./core/engine.js";
-export { Vex } from "./core/engine.js";
+export type {
+  OperationDescription,
+  PluginModule,
+  VexOptions,
+} from "./core/engine.js";
+// The engine, and what a query answering from untracked state throws
+// (`purityCheck`).
+export { PurityError, Vex } from "./core/engine.js";
+export type { EvaluationOptions } from "./core/evaluation.js";
+// What a handler calling the engine past its context throws.
+export { ReentryError } from "./core/frames.js";
 export { id } from "./core/id.js";
 // Rate limiting
 export type {
@@ -37,6 +49,7 @@ export type {
   Changes,
   ReadOnlyRead,
   StorageAdapter,
+  StorageReader,
 } from "./core/storage.js";
 export { ANY_TABLE } from "./core/storage.js";
 export type {
@@ -57,9 +70,12 @@ export type {
   DescribedColumn,
   Filter,
   GroupByBuilder,
+  Hold,
   JobDef,
   MiddlewareFn,
   MiddlewareInfo,
+  Migration,
+  MigrationContext,
   MutationContext,
   MutationDef,
   MutationTable,
@@ -69,9 +85,15 @@ export type {
   QueryContext,
   QueryDef,
   ReactiveBudget,
+  SubscribeContext,
   TableSchema,
+  VexEnv,
+  VexServices,
   VexUser,
   WebhookDef,
   WebhookRequest,
   WebhookResponse,
 } from "./core/types.js";
+export type { ArgsOf, ArgsShape, Schema } from "./core/values.js";
+// What a call whose args its declaration refuses throws.
+export { ArgsError } from "./core/values.js";

@@ -16,14 +16,19 @@ import { UNRESTRICTED } from "../src/core/access.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { ANY_TABLE, type StorageAdapter } from "../src/core/storage.js";
+import { storedTable } from "../src/core/tables.js";
+import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 type CreateStorage = () => Promise<StorageAdapter> | StorageAdapter;
 
 const columns = {
-  scope: { type: "string" as const, index: true },
-  name: { type: "string" as const },
-  n: { type: "number" as const, optional: true },
+  scope: Type.String({ index: true }),
+  name: Type.String(),
+  n: Type.Optional(Type.Number()),
 };
+// As storage keeps them: what an adapter is handed directly.
+const stored = storedTable("items", { columns }).columns;
 
 /** Runs `write` and answers the tables the adapter reports it changed. */
 async function changedBy(
@@ -39,7 +44,8 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
   describe(`${name}: change tracking`, () => {
     async function adapterWith(...tables: string[]) {
       const adapter = await create();
-      for (const table of tables) await adapter.ensureTable(table, { columns });
+      for (const table of tables)
+        await adapter.ensureTable(table, { columns: stored });
       return adapter;
     }
 
@@ -238,7 +244,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
         "INSERT INTO old_items (_id, scope, name) VALUES ('0', 's', 'x')",
       );
       await adapter.ensureTable("items", {
-        columns,
+        columns: stored,
         renamedFrom: ["old_items"],
       });
       expect(
@@ -314,61 +320,71 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
       function plugin(api: VexPluginAPI) {
         api.setName("ct");
         api.registerTable("items", { columns });
-        api.registerTable("other", { columns: { v: { type: "string" } } });
+        api.registerTable("other", { columns: { v: Type.String() } });
         api.registerTable("secrets", {
-          columns: { v: { type: "string", index: true } },
+          columns: { v: Type.String({ index: true }) },
           access: { prepare: () => UNRESTRICTED, row: () => true },
         });
         api.registerQuery("scope", {
-          args: { scope: "string" },
+          args: { scope: Type.String() },
           async handler(ctx, args) {
             count(`scope:${args.scope}`);
             return ctx.db.table("items").where("scope", "=", args.scope).all();
           },
         });
         api.registerQuery("byId", {
-          args: { id: "string" },
+          args: { id: Type.String() },
           async handler(ctx, args) {
             count(`id:${args.id}`);
             return ctx.db.table("items").where("_id", "=", args.id).first();
           },
         });
         api.registerQuery("raw", {
-          args: { sql: "string" },
+          args: { sql: Type.String() },
           async handler(ctx, args) {
             count(`raw:${args.sql}`);
-            return ctx.db.sql(args.sql);
+            // Every table these reads may reach, each read whole.
+            return ctx.db.sql(
+              {
+                items: "all",
+                other: "all",
+                secrets: "all",
+                loose: "all",
+                children: "all",
+              },
+              args.sql,
+            );
           },
         });
         api.registerMutation("raw", {
-          args: { sql: "string" },
+          args: { sql: Type.String() },
           handler: (ctx, args) => ctx.db.sql(args.sql),
         });
         api.registerMutation("rawThenFail", {
-          args: { sql: "string" },
+          args: { sql: Type.String() },
           async handler(ctx, args) {
             await ctx.db.sql(args.sql);
             throw new Error("after the raw write");
           },
         });
         api.registerMutation("add", {
-          args: { scope: "string", name: "string" },
+          args: { scope: Type.String(), name: Type.String() },
           handler: (ctx, args) => ctx.db.table("items").insert(args),
         });
         api.registerMutation("move", {
-          args: { id: "string", scope: "string" },
+          args: { id: Type.String(), scope: Type.String() },
           handler: (ctx, args) =>
             ctx.db.table("items").update(args.id, { scope: args.scope }),
         });
         api.registerMutation("upsertScope", {
-          args: { name: "string", scope: "string" },
+          args: { name: Type.String(), scope: Type.String() },
           handler: (ctx, args) =>
             ctx.db
               .table("items")
               .upsert({ name: args.name }, { scope: args.scope }),
         });
         api.registerMutation("remove", {
-          args: { id: "string" },
+          args: { id: Type.String() },
           handler: (ctx, args) => ctx.db.table("items").delete(args.id),
         });
         api.registerMutation("addOther", {
@@ -376,7 +392,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           handler: (ctx) => ctx.db.table("other").insert({ v: "x" }),
         });
         api.registerMutation("addBAndOther", {
-          args: { raw: "boolean" },
+          args: { raw: Type.Boolean() },
           async handler(ctx, args) {
             await ctx.db.table("items").insert({ scope: "b", name: "b1" });
             if (args.raw) {
@@ -393,10 +409,14 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
             await ctx.db.sql("UPDATE items SET n = 7 WHERE scope = 'a'");
           },
         });
+        api.registerMutation("rawWrite", {
+          args: { sql: Type.String() },
+          handler: (ctx, args) => ctx.db.sql(args.sql),
+        });
         api.registerWebhook("raw", {
           path: "/ct/raw",
           async handler(ctx, req) {
-            await ctx.db.sql(req.body.sql);
+            await ctx.mutate("ct.rawWrite", { sql: req.body.sql });
             return { ok: true };
           },
         });
@@ -467,7 +487,8 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
     test("rows a trigger writes are never narrowed away, whichever table fired it", async () => {
       for (const on of ["other", "items"]) {
         await withFixture(async ({ vex, runs }) => {
-          await vex.unsafeSql(
+          await rawSql(
+            vex,
             `CREATE TRIGGER touch_a_from_${on} AFTER INSERT ON ${on} BEGIN UPDATE items SET n = coalesce(n, 0) + 1 WHERE scope = 'a'; END`,
           );
           await vex.subscribe("ct.scope", { scope: "a" }, () => {});
@@ -477,7 +498,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
           await vex.mutate("ct.addBAndOther", { raw: false });
           expect([on, runs["scope:a"]]).toEqual([on, before + 1]);
           // A Durable Object test keeps one database across both rounds.
-          await vex.unsafeSql(`DROP TRIGGER touch_a_from_${on}`);
+          await rawSql(vex, `DROP TRIGGER touch_a_from_${on}`);
         });
       }
     });
@@ -587,8 +608,9 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
 
     test("a raw read depends on the tables a view reads, through views of views", async () => {
       await withFixture(async ({ vex, runs }) => {
-        await vex.unsafeSql("CREATE VIEW item_names AS SELECT name FROM items");
-        await vex.unsafeSql(
+        await rawSql(vex, "CREATE VIEW item_names AS SELECT name FROM items");
+        await rawSql(
+          vex,
           "CREATE VIEW item_names_2 AS SELECT * FROM item_names",
         );
         const sql = "SELECT * FROM item_names_2";
@@ -603,8 +625,8 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
 
     test("raw SQL naming a governed table is refused in every spelling and through views", async () => {
       await withFixture(async ({ vex }) => {
-        await vex.unsafeSql("CREATE VIEW leak AS SELECT v FROM secrets");
-        await vex.unsafeSql("CREATE VIEW leak_2 AS SELECT * FROM leak");
+        await rawSql(vex, "CREATE VIEW leak AS SELECT v FROM secrets");
+        await rawSql(vex, "CREATE VIEW leak_2 AS SELECT * FROM leak");
         for (const sql of [
           "SELECT * FROM items, secrets",
           "SELECT * FROM main.secrets",
@@ -633,7 +655,7 @@ export function changeTrackingSuite(name: string, create: CreateStorage) {
 
     test("a raw read of a table created by raw SQL re-runs when it is written", async () => {
       await withFixture(async ({ vex, runs }) => {
-        await vex.unsafeSql("CREATE TABLE loose (v TEXT)");
+        await rawSql(vex, "CREATE TABLE loose (v TEXT)");
         const sql = "SELECT count(*) AS c FROM loose";
         await vex.subscribe("ct.raw", { sql }, () => {});
         const before = runs[`raw:${sql}`];

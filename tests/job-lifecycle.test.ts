@@ -16,6 +16,8 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { JobDef } from "../src/core/types.js";
+import { rawSql } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 afterEach(async () => {
@@ -32,7 +34,7 @@ async function engine(
     plugins: [
       (api: VexPluginAPI) => {
         api.setName("t");
-        api.registerTable("items", { columns: { v: { type: "string" } } });
+        api.registerTable("items", { columns: { v: Type.String() } });
         // Reads nothing: it would succeed on a closed engine's storage.
         api.registerQuery("pure", { args: {}, handler: () => 1 });
         api.registerMutation("add", {
@@ -63,7 +65,8 @@ function counting(): { job: JobDef; runs: () => number } {
 const oneInterval = () => new Promise((resolve) => setTimeout(resolve, 1_200));
 
 async function jobRows(vex: Vex, name: string): Promise<number> {
-  const [row] = await vex.unsafeSql<{ c: number }>(
+  const [row] = await rawSql<{ c: number }>(
+    vex,
     "SELECT count(*) AS c FROM _jobs WHERE name = ?",
     name,
   );
@@ -92,7 +95,8 @@ describe("the last call for a job name wins", () => {
     await oneInterval();
     expect(first.runs()).toBe(0);
     expect(second.runs()).toBe(1);
-    const rows = await vex.unsafeSql<{ plugin: string }>(
+    const rows = await rawSql<{ plugin: string }>(
+      vex,
       "SELECT plugin FROM _jobs WHERE name = 'x'",
     );
     expect(rows).toEqual([{ plugin: "second" }]);

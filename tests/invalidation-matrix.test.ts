@@ -27,10 +27,13 @@
 import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
+import { UNRESTRICTED } from "../src/core/access.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { filterExcludes } from "../src/core/invalidation.js";
 import type { ColumnType, Filter } from "../src/core/types.js";
+import { rawBulkInsert } from "../src/internal.js";
+import { Type } from "../src/portable.js";
 
 const REPORT = process.env.MATRIX_REPORT;
 const sections: string[] = [];
@@ -172,6 +175,8 @@ interface Ids {
   A2: string;
   B1: string;
   C1: string;
+  G1: string;
+  G2: string;
 }
 
 type Shape = (ctx: any, ids: Ids) => Promise<unknown>;
@@ -271,7 +276,61 @@ const SHAPES: Record<string, Shape> = {
     u: await ctx.db.table("u").order("name", "asc").all(),
   }),
   "raw SELECT scope = a": (ctx) =>
-    ctx.db.sql("SELECT name FROM t WHERE scope = 'a' ORDER BY name"),
+    ctx.db.sql(
+      { t: "all" },
+      "SELECT name FROM t WHERE scope = 'a' ORDER BY name",
+    ),
+  "held scope IN [a,b]": (ctx) =>
+    ctx.db.sql(
+      { t: [{ column: "scope", operator: "IN", value: ["a", "b"] }] },
+      "SELECT scope, COUNT(*) AS n FROM t GROUP BY scope ORDER BY scope",
+    ),
+  "held _id = A1 (UNION ALL)": (ctx, ids) =>
+    ctx.db.sql(
+      { t: [{ column: "_id", operator: "=", value: ids.A1 }] },
+      "SELECT name FROM t UNION ALL SELECT name FROM t WHERE n > 0",
+    ),
+  "n = '5' (text twin)": (ctx) =>
+    ctx.db.table("t").where("n", "=", "5").order("name", "asc").all(),
+  "scope IN [a, null]": (ctx) =>
+    ctx.db
+      .table("t")
+      .where("scope", "IN", ["a", null])
+      .order("name", "asc")
+      .all(),
+  "whereAny [[scope = a],[n = null]]": (ctx) =>
+    ctx.db
+      .table("t")
+      .whereAny([
+        [{ column: "scope", operator: "=", value: "a" }],
+        [{ column: "n", operator: "=", value: null }],
+      ])
+      .order("name", "asc")
+      .all(),
+  "groupBy kind having c >= 2": (ctx) =>
+    ctx.db
+      .table("t")
+      .groupBy("kind", { c: "count" })
+      .having("c", ">=", 2)
+      .order("kind", "asc")
+      .limit(10),
+  "offset 1 scope = a": (ctx) =>
+    ctx.db
+      .table("t")
+      .where("scope", "=", "a")
+      .order("name", "asc")
+      .limit(1)
+      .offset(1)
+      .all(),
+  "first() scope = c (no order)": (ctx) =>
+    ctx.db.table("t").select("name").where("scope", "=", "c").first(),
+  "governed (alice: G1)": (ctx) =>
+    ctx.db.table("g").order("title", "asc").all(),
+  "avg(n) kind = k": (ctx) =>
+    ctx.db.table("t").where("kind", "=", "k").avg("n"),
+  "distinct(kind)": (ctx) => ctx.db.table("t").distinct("kind"),
+  "flag IN [true]": (ctx) =>
+    ctx.db.table("t").where("flag", "IN", [true]).order("name", "asc").all(),
 };
 
 type Write = (ctx: any, ids: Ids) => Promise<unknown>;
@@ -350,16 +409,51 @@ const WRITES: Record<string, Write> = {
     await ctx.db.table("t").update(ids.A1, { kind: "k4" });
   },
   "read only (no write)": (ctx) => ctx.db.table("t").count(),
+  // A text twin in a number column: only raw SQL can write one.
+  "raw update A1 n -> '5' (text twin)": (ctx, ids) =>
+    ctx.db.sql("UPDATE t SET n = '5' WHERE _id = ?", ids.A1),
+  "update missing id": (ctx) => ctx.db.table("t").update("nope", { kind: "x" }),
+  "delete missing id": (ctx) => ctx.db.table("t").delete("nope"),
+  "upsert keys{scope a,kind k} data{kind q} (key changes)": (ctx) =>
+    ctx.db
+      .table("t")
+      .upsert(
+        { scope: "a", kind: "k" },
+        { kind: "q", name: "a1", n: 5, flag: false },
+      ),
+  "insert scope a with own _id": (ctx) =>
+    ctx.db.table("t").insert({
+      _id: "own-a",
+      scope: "a",
+      kind: "k",
+      name: "a7",
+      n: 1,
+      flag: false,
+    }),
+  "delete where scope IN [c]": (ctx) =>
+    ctx.db.table("t").where("scope", "IN", ["c"]).delete(),
+  "delete where n > 40": (ctx) =>
+    ctx.db.table("t").where("n", ">", 40).delete(),
+  "raw DELETE scope = c": (ctx) =>
+    ctx.db.sql("DELETE FROM t WHERE scope = 'c'"),
+  "governed: rename G1 (alice's)": (ctx, ids) =>
+    ctx.db.table("g").update(ids.G1, { title: "mine!" }),
+  "governed: rename G2 (other's)": (ctx, ids) =>
+    ctx.db.table("g").update(ids.G2, { title: "other!" }),
+  "governed: grant alice G2": (ctx) =>
+    ctx.db.table("grants").insert({ userId: "alice", itemId: "G2" }),
+  "governed: insert G3": (ctx) =>
+    ctx.db.table("g").insert({ _id: "G3", title: "third" }),
 };
 
 /** Bulk inserts go through the engine, not a mutation context. */
 const BULK: Record<string, (vex: Vex) => Promise<unknown>> = {
-  "unsafeBulkInsert scope c": (vex) =>
-    vex.unsafeBulkInsert("t", [
+  "rawBulkInsert scope c": (vex) =>
+    rawBulkInsert(vex, "t", [
       { scope: "c", kind: "z", name: "c3", n: 100, flag: false },
     ]),
-  "unsafeBulkInsert scope a": (vex) =>
-    vex.unsafeBulkInsert("t", [
+  "rawBulkInsert scope a": (vex) =>
+    rawBulkInsert(vex, "t", [
       { scope: "a", kind: "k", name: "a8", n: 1, flag: false },
     ]),
 };
@@ -370,23 +464,47 @@ function matrixPlugin(api: VexPluginAPI) {
   api.setName("m");
   api.registerTable("t", {
     columns: {
-      scope: { type: "string", index: true },
-      kind: { type: "string", index: true },
-      name: { type: "string" },
-      n: { type: "number", optional: true },
-      flag: { type: "boolean", optional: true },
+      scope: Type.String({ index: true }),
+      kind: Type.String({ index: true }),
+      name: Type.String(),
+      n: Type.Optional(Type.Number()),
+      flag: Type.Optional(Type.Boolean()),
     },
   });
-  api.registerTable("u", { columns: { name: { type: "string" } } });
+  api.registerTable("u", { columns: { name: Type.String() } });
+  api.registerTable("g", {
+    columns: { title: Type.String() },
+    access: {
+      async prepare(user, db) {
+        if (!user) return UNRESTRICTED;
+        const grants = (await db
+          .table("grants")
+          .where("userId", "=", user.id)
+          .all()) as Array<{ itemId: string }>;
+        return { ids: grants.map((g) => g.itemId) };
+      },
+      row: (p: { ids: string[] }, row) => p.ids.includes(row._id),
+      narrow: (p: { ids: string[] }) => ({
+        where: [[{ column: "_id", operator: "IN", value: p.ids }]],
+        reads: ["_id"],
+      }),
+    },
+  });
+  api.registerTable("grants", {
+    columns: {
+      userId: Type.String({ index: true }),
+      itemId: Type.String({ index: true }),
+    },
+  });
   api.registerQuery("q", {
-    args: { shape: "string", ids: "json" },
+    args: { shape: Type.String(), ids: Type.Unknown() },
     async handler(ctx, args) {
       runs.set(args.shape, (runs.get(args.shape) ?? 0) + 1);
       return SHAPES[args.shape](ctx, args.ids as Ids);
     },
   });
   api.registerMutation("w", {
-    args: { write: "string", ids: "json" },
+    args: { write: Type.String(), ids: Type.Unknown() },
     async handler(ctx, args) {
       await WRITES[args.write](ctx, args.ids as Ids);
     },
@@ -395,7 +513,7 @@ function matrixPlugin(api: VexPluginAPI) {
     args: {},
     async handler(ctx) {
       const t = ctx.db.table("t");
-      const ids: Ids = {
+      const ids = {
         A1: await t.insert({
           scope: "a",
           kind: "k",
@@ -424,8 +542,11 @@ function matrixPlugin(api: VexPluginAPI) {
           n: null,
           flag: null,
         }),
-      };
+      } as Ids;
       await ctx.db.table("u").insert({ name: "u1" });
+      ids.G1 = await ctx.db.table("g").insert({ _id: "G1", title: "mine" });
+      ids.G2 = await ctx.db.table("g").insert({ _id: "G2", title: "other" });
+      await ctx.db.table("grants").insert({ userId: "alice", itemId: "G1" });
       return ids;
     },
   });
@@ -454,13 +575,16 @@ async function engineCell(
   try {
     const ids = (await vex.mutate("m.seed", {})) as Ids;
     const args = { shape, ids };
-    const before = JSON.stringify(await vex.query("m.q", args));
-    const unsubscribe = await vex.subscribe("m.q", args, () => {});
+    const as = shape.startsWith("governed")
+      ? { user: { id: "alice", name: "Alice", isAdmin: false } }
+      : undefined;
+    const before = JSON.stringify(await vex.query("m.q", args, as));
+    const unsubscribe = await vex.subscribe("m.q", args, () => {}, as);
     const runsBefore = runs.get(shape) ?? 0;
     await perform(vex, ids);
     const reran = (runs.get(shape) ?? 0) > runsBefore;
     unsubscribe();
-    const after = JSON.stringify(await vex.query("m.q", args));
+    const after = JSON.stringify(await vex.query("m.q", args, as));
     const changed = before !== after;
     return {
       shape,

@@ -10,26 +10,29 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { MiddlewareInfo, VexUser } from "../src/core/types.js";
+import { Type } from "../src/portable.js";
 
 type Access = { permission: string };
 
 const dana: VexUser = { id: "dana", name: "Dana", isAdmin: false };
 
+const watched: Array<AbortSignal | null> = [];
+
 function notesPlugin(api: VexPluginAPI<Access>) {
   api.setName("notes");
-  api.registerTable("notes", { columns: { text: { type: "string" } } });
+  api.registerTable("notes", { columns: { text: Type.String() } });
   api.registerQuery("list", {
     args: {},
     access: { permission: "notes.read" },
     handler: (ctx) => ctx.db.table("notes").all(),
   });
   api.registerMutation("add", {
-    args: { text: "string" },
+    args: { text: Type.String() },
     access: { permission: "notes.write" },
     handler: (ctx, args) => ctx.db.table("notes").insert({ text: args.text }),
   });
   api.registerAction("import", {
-    args: { texts: "json" },
+    args: { texts: Type.Unknown() },
     access: { permission: "notes.import" },
     async handler(ctx, args) {
       for (const text of args.texts as string[]) {
@@ -40,22 +43,27 @@ function notesPlugin(api: VexPluginAPI<Access>) {
     },
   });
   api.registerAction("relay", {
-    args: { texts: "json" },
+    args: { texts: Type.Unknown() },
     access: { permission: "notes.import" },
     handler: (ctx, args) => ctx.action("notes.import", args),
   });
   api.registerAction("wait", {
-    args: { ms: "number" },
+    args: { ms: Type.Number() },
     access: { permission: "notes.wait" },
     async handler(_ctx, args) {
       await Bun.sleep(args.ms);
       return "waited";
     },
   });
+  // What each run of `watch` saw as its caller's signal; an answer is
+  // JSON, so the signal is kept here rather than answered.
   api.registerAction("watch", {
     args: {},
     access: { permission: "notes.wait" },
-    handler: (ctx) => ctx.signal ?? null,
+    handler: (ctx) => {
+      watched.push(ctx.signal ?? null);
+      return watched.length;
+    },
   });
   api.registerAction("watchThrough", {
     args: {},
@@ -63,7 +71,7 @@ function notesPlugin(api: VexPluginAPI<Access>) {
     handler: (ctx) => ctx.action("notes.watch"),
   });
   api.registerQuery("slow", {
-    args: { ms: "number" },
+    args: { ms: Type.Number() },
     access: { permission: "notes.read" },
     async handler(_ctx, args) {
       await Bun.sleep(args.ms);
@@ -171,11 +179,11 @@ describe("actions", () => {
     const { engine } = await recording();
     const caller = new AbortController();
     const call = { user: dana, signal: caller.signal };
-    expect(await engine.action("notes.watch", {}, call)).toBe(caller.signal);
-    expect(await engine.action("notes.watchThrough", {}, call)).toBe(
-      caller.signal,
-    );
-    expect(await engine.action("notes.watch", {}, { user: dana })).toBeNull();
+    watched.length = 0;
+    await engine.action("notes.watch", {}, call);
+    await engine.action("notes.watchThrough", {}, call);
+    await engine.action("notes.watch", {}, { user: dana });
+    expect(watched).toEqual([caller.signal, caller.signal, null]);
   });
 
   test("a caller that has already stopped waiting starts nothing", async () => {
@@ -237,7 +245,7 @@ describe("actions", () => {
     ]);
     expect(engine.describeAction("notes.import")).toEqual({
       plugin: "notes",
-      args: { texts: "json" },
+      args: { texts: Type.Unknown() },
       access: { permission: "notes.import" },
     });
     expect(engine.describeAction("notes.list")).toBeNull();

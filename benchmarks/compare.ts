@@ -1,0 +1,173 @@
+/**
+ * The invalidation benchmark across engines and scales, in one table.
+ *
+ * Each engine is a git ref checked out into a temporary worktree, and
+ * runs the benchmark as written for its own API: the one it carries,
+ * or, for a ref older than the benchmark, the one `BENCH_LEGACY` (a
+ * ref) carries. Every version of the benchmark runs the same scenarios
+ * under the same names. Configurations vary the people, the handler
+ * cost and the burst; the current tree runs with and without
+ * evaluation workers.
+ *
+ *   bun benchmarks/compare.ts                      # this tree, markdown to stdout
+ *   BENCH_REFS=v0.22.1 BENCH_LEGACY=98bc8ff BENCH_OUT=report.md bun benchmarks/compare.ts
+ */
+
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const ROOT = new URL("..", import.meta.url).pathname;
+const REFS = (process.env.BENCH_REFS ?? "").split(",").filter(Boolean);
+/** The ref whose benchmark a ref without one of its own runs. */
+const LEGACY = process.env.BENCH_LEGACY;
+const ROUNDS = process.env.BENCH_ROUNDS ?? "5";
+const OUT = process.env.BENCH_OUT;
+
+interface Config {
+  users: number;
+  handlerMs: number;
+  burst: number;
+  /** Engines this scale is not worth the hour on (every view re-run × its cost). */
+  skip?: string[];
+}
+const CONFIGS: Config[] = [
+  { users: 10, handlerMs: 0, burst: 6 },
+  { users: 35, handlerMs: 0, burst: 6 },
+  { users: 35, handlerMs: 20, burst: 6 },
+  { users: 100, handlerMs: 0, burst: 6 },
+  { users: 100, handlerMs: 20, burst: 24, skip: ["v0.21.0"] },
+];
+
+interface Row {
+  scenario: string;
+  writes: number;
+  passes: number;
+  reruns: number;
+  deliveries: number;
+  invalidationMs: number;
+  wallP50: number;
+  wallMax: number;
+  stallMs: number;
+}
+
+interface Engine {
+  label: string;
+  dir: string;
+  workers: number;
+}
+
+function git(...args: string[]): string {
+  const run = spawnSync("git", args, { cwd: ROOT, encoding: "utf8" });
+  if (run.status !== 0) throw new Error(run.stderr);
+  return run.stdout.trim();
+}
+
+/** A worktree at `ref`, carrying a benchmark written for its API. */
+function checkout(ref: string, into: string): string {
+  const dir = join(into, ref.replace(/[^\w.-]/g, "_"));
+  git("worktree", "add", "--detach", "-q", dir, ref);
+  if (!existsSync(join(dir, "benchmarks", "invalidation.ts"))) {
+    if (!LEGACY) {
+      throw new Error(
+        `${ref} has no benchmark of its own: name a ref whose benchmark runs on its API (BENCH_LEGACY=<ref>)`,
+      );
+    }
+    const extract = spawnSync(
+      "sh",
+      ["-c", `git archive "${LEGACY}" benchmarks | tar -x -C "${dir}"`],
+      { cwd: ROOT },
+    );
+    if (extract.status !== 0) throw new Error(String(extract.stderr));
+  }
+  spawnSync("bun", ["install", "--silent"], { cwd: dir });
+  return dir;
+}
+
+function run(engine: Engine, config: Config): Row[] {
+  const result = spawnSync("bun", ["benchmarks/invalidation.ts"], {
+    cwd: engine.dir,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      BENCH_JSON: "1",
+      BENCH_ROUNDS: ROUNDS,
+      BENCH_USERS: String(config.users),
+      BENCH_HANDLER_MS: String(config.handlerMs),
+      BENCH_BURST: String(config.burst),
+      BENCH_WORKERS: String(engine.workers),
+    },
+  });
+  if (result.status !== 0) {
+    throw new Error(`${engine.label}: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout
+    .split("\n")
+    .filter((line) => line.startsWith("{"))
+    .map((line) => JSON.parse(line) as Row);
+}
+
+const n = (value: number, digits = 1) => value.toFixed(digits);
+
+function main() {
+  const tmp = mkdtempSync(join(tmpdir(), "vex-compare-"));
+  const engines: Engine[] = [];
+  try {
+    for (const ref of REFS) {
+      engines.push({ label: ref, dir: checkout(ref, tmp), workers: 0 });
+    }
+    const head = git("rev-parse", "--short", "HEAD");
+    engines.push({ label: `${head} (this tree)`, dir: ROOT, workers: 0 });
+    engines.push({
+      label: `${head} + 4 workers`,
+      dir: ROOT,
+      workers: 4,
+    });
+
+    const lines: string[] = [
+      "# Invalidation benchmark across engines",
+      "",
+      `Rounds per scenario: ${ROUNDS}. Each row: passes / re-runs per round, wall p50 ms, main-thread stall ms per round.`,
+      "",
+    ];
+    for (const config of CONFIGS) {
+      lines.push(
+        `## ${config.users} people, ${config.handlerMs} ms handlers, bursts of ${config.burst}`,
+        "",
+      );
+      const results = engines
+        .filter((engine) => !config.skip?.includes(engine.label))
+        .map((engine) => ({ engine, rows: run(engine, config) }));
+      const scenarios = results[0].rows.map((row) => row.scenario);
+      lines.push(
+        `| engine | ${scenarios.map((s) => `${s}: passes / re-runs / wall p50 / stall`).join(" | ")} |`,
+        `| --- | ${scenarios.map(() => "---").join(" | ")} |`,
+      );
+      for (const { engine, rows } of results) {
+        lines.push(
+          `| ${engine.label} | ${rows
+            .map(
+              (row) =>
+                `${n(row.passes)} / ${n(row.reruns)} / ${n(row.wallP50)} / ${n(row.stallMs)}`,
+            )
+            .join(" | ")} |`,
+        );
+        console.error(
+          `${config.users}p ${config.handlerMs}ms ${engine.label}: done`,
+        );
+      }
+      lines.push("");
+      // Written as each scale completes: a long run shows its progress.
+      if (OUT) writeFileSync(OUT, lines.join("\n"));
+    }
+    if (!OUT) console.log(lines.join("\n"));
+  } finally {
+    for (const engine of engines) {
+      if (engine.dir !== ROOT) git("worktree", "remove", "--force", engine.dir);
+    }
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+main();

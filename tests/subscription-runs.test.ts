@@ -11,6 +11,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
+import { outsideFrame } from "../src/core/frames.js";
+import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 /** Runs after the list query's read, before it answers. */
@@ -27,7 +29,7 @@ afterEach(async () => {
 function plugin(api: VexPluginAPI) {
   api.setName("ch");
   api.registerTable("channels", {
-    columns: { name: { type: "string" }, started: { type: "boolean" } },
+    columns: { name: Type.String(), started: Type.Boolean() },
   });
   api.registerQuery("list", {
     args: {},
@@ -36,17 +38,19 @@ function plugin(api: VexPluginAPI) {
       const rows = await ctx.db.table("channels").order("name", "asc").all();
       const hook = afterRead;
       afterRead = null;
-      if (hook) await hook();
+      // The test's own write, landing mid-run: made as the engine's own
+      // work, since a handler calling the engine is refused.
+      if (hook) await outsideFrame(hook);
       return rows.map((r: any) => `${r.name}:${r.started}`);
     },
   });
   api.registerMutation("create", {
-    args: { name: "string" },
+    args: { name: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("channels").insert({ name: args.name, started: false }),
   });
   api.registerMutation("start", {
-    args: { id: "string" },
+    args: { id: Type.String() },
     handler: (ctx, args) =>
       ctx.db.table("channels").update(args.id, { started: true }),
   });
@@ -95,9 +99,9 @@ describe("subscriptions see writes landing during a run (SHFT-2545)", () => {
         plugin,
         (api: VexPluginAPI) => {
           api.setName("other");
-          api.registerTable("notes", { columns: { text: { type: "string" } } });
+          api.registerTable("notes", { columns: { text: Type.String() } });
           api.registerMutation("add", {
-            args: { text: "string" },
+            args: { text: Type.String() },
             handler: (ctx, args) => ctx.db.table("notes").insert(args),
           });
         },
