@@ -938,6 +938,10 @@ describe("the schema changes through migrations; raw access is internal", () => 
       expect((entry as any)[name]).toBeDefined();
     }
     expect(framework.Type).toBe(entry.Type);
+    // Each error a caller catches says which it is, logged or not.
+    expect(new entry.ArgsError("x").name).toBe("ArgsError");
+    expect(new entry.PurityError("x").name).toBe("PurityError");
+    expect(new entry.ReentryError("x").name).toBe("ReentryError");
   });
 
   test("the public engine holds no raw access", async () => {

@@ -186,6 +186,7 @@ const RETURN_WORDS: ProblemWords = {
 export class ArgsError extends HttpError {
   constructor(message: string) {
     super(400, message);
+    this.name = "ArgsError";
   }
 }
 
