@@ -1670,8 +1670,10 @@ export class Vex<A = unknown> {
    * it commits while it is open. The group's dependencies are the
    * run's as it records them, so an invalidation meanwhile judges
    * what the run has read so far and marks the group stale rather
-   * than running it again; the run closes before the result is handed
-   * back, so nothing lands unseen between a run and its delivery. A
+   * than running it again. The last check of `stale` and the closing
+   * of the run are one synchronous step, with no await between them:
+   * a write lands either before it, and the run repeats, or after the
+   * run has closed, and its invalidation runs the group afresh. A
    * group already running answers with that run.
    */
   private runGroup(
@@ -1686,10 +1688,14 @@ export class Vex<A = unknown> {
     this.runningGroups.add(group);
     const run = (async () => {
       try {
-        const answer =
-          this.evaluation && group.offThread
-            ? await this.runGroupOffThread(group, this.evaluation)
-            : await this.runGroupHere(group, reg, ectx);
+        let answer: { result: unknown; measurement: ReactiveMeasurement };
+        do {
+          group.stale = false;
+          answer =
+            this.evaluation && group.offThread
+              ? await this.runGroupOffThread(group, this.evaluation)
+              : await this.runGroupHere(group, reg, ectx);
+        } while (group.stale);
         group.last = answer.measurement;
         return answer;
       } finally {
@@ -1702,6 +1708,10 @@ export class Vex<A = unknown> {
     return run;
   }
 
+  /**
+   * One run of a group's query on this thread (`runGroup` repeats it):
+   * its dependencies recorded on the group as it reads.
+   */
   private async runGroupHere(
     group: SubscriptionGroup,
     reg: RegisteredQuery,
@@ -1713,31 +1723,28 @@ export class Vex<A = unknown> {
       args: group.args,
       access: reg.def.access,
     };
-    let result: unknown;
-    do {
-      group.stale = false;
-      group.tables = new Set();
-      group.dependencies = [];
-      const ctx = this.buildQueryContext(
-        group.tables,
-        group.user,
-        group.dependencies,
-      );
-      result = await this.runMiddleware(
-        ctx,
-        info,
-        () => reg.def.handler(ctx, group.args),
-        ectx,
-      );
-    } while (group.stale);
+    group.tables = new Set();
+    group.dependencies = [];
+    const ctx = this.buildQueryContext(
+      group.tables,
+      group.user,
+      group.dependencies,
+    );
+    const result = await this.runMiddleware(
+      ctx,
+      info,
+      () => reg.def.handler(ctx, group.args),
+      ectx,
+    );
     return { result, measurement: this.measureReactiveResult(result) };
   }
 
   /**
-   * `runGroup` in a worker. What the run reads is known only when it
-   * answers, so meanwhile the group is judged by its last run's
-   * dependencies (a write those rule out cannot reach this run
-   * either), or by any write at all before a first run.
+   * One run of a group's query in a worker (`runGroup` repeats it).
+   * What the run reads is known only when it answers, so meanwhile
+   * the group is judged by its last run's dependencies (a write those
+   * rule out cannot reach this run either), or by any write at all
+   * before a first run.
    */
   private async runGroupOffThread(
     group: SubscriptionGroup,
@@ -1748,16 +1755,12 @@ export class Vex<A = unknown> {
       args: group.args,
       user: group.user,
     };
-    let evaluation: Evaluation;
-    do {
-      group.stale = false;
-      if (group.dependencies.length === 0) {
-        group.dependencies = [{ table: ANY_TABLE, raw: true }];
-      }
-      evaluation = await pool.run(request);
-      group.tables = new Set(evaluation.tables);
-      group.dependencies = evaluation.dependencies;
-    } while (group.stale);
+    if (group.dependencies.length === 0) {
+      group.dependencies = [{ table: ANY_TABLE, raw: true }];
+    }
+    const evaluation = await pool.run(request);
+    group.tables = new Set(evaluation.tables);
+    group.dependencies = evaluation.dependencies;
     return { result: evaluation.result, measurement: evaluation };
   }
 
