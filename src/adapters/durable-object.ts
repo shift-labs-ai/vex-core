@@ -33,7 +33,7 @@ import {
   statementKind,
 } from "../core/sql-text.js";
 import type { StorageAdapter } from "../core/storage.js";
-import type { StoredTableSchema } from "../core/types.js";
+import type { TableSchema } from "../core/types.js";
 import { createQueryBuilder, type DbExec } from "./shared.js";
 import {
   bulkInsertRows,
@@ -90,7 +90,6 @@ export function durableObjectAdapter(
         "SELECT rootpage, tbl_name FROM sqlite_master WHERE rootpage > 0",
         [],
       ),
-    views: () => run("SELECT name FROM sqlite_master WHERE type = 'view'", []),
   };
   const state = new SqliteAdapterState();
 
@@ -189,7 +188,7 @@ export function durableObjectAdapter(
   return {
     name: "durable-object",
 
-    ensureTable(name: string, schema: StoredTableSchema) {
+    ensureTable(name: string, schema: TableSchema) {
       open();
       state.registerSchema(
         name,
@@ -271,11 +270,6 @@ export function durableObjectAdapter(
     tablesRead(query: string) {
       open();
       return state.tablesRead(introspection, query);
-    },
-
-    viewNames() {
-      open();
-      return state.viewNames(introspection);
     },
 
     readOnlyTables(query: string) {

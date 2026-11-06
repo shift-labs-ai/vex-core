@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
-import { Type } from "../src/portable.js";
 
 let tmp = "";
 let dbPath = "";
@@ -21,7 +20,7 @@ afterEach(() => {
 });
 
 function sleep(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function peerValues(): string[] {
@@ -39,7 +38,7 @@ function peerValues(): string[] {
 
 function registerRows(api: VexPluginAPI) {
   api.registerTable("rows", {
-    columns: { v: Type.String({ index: true }) },
+    columns: { v: { type: "string", index: true } },
   });
 }
 
@@ -51,7 +50,7 @@ function makePlugin(gate: {
     api.setName("tx");
     registerRows(api);
     api.registerMutation("write", {
-      args: { v: Type.String() },
+      args: { v: "string" },
       async handler(ctx, args) {
         await ctx.db.table("rows").insert({ v: args.v });
       },
@@ -101,7 +100,7 @@ function makeJobPlugin(gate: {
     api.setName("jobtx");
     registerRows(api);
     api.registerMutation("write", {
-      args: { v: Type.String() },
+      args: { v: "string" },
       async handler(ctx, args) {
         await ctx.db.table("rows").insert({ v: args.v });
       },
@@ -109,10 +108,10 @@ function makeJobPlugin(gate: {
     api.registerJob("sweep", {
       schedule: "every 1h",
       async handler(ctx) {
-        await ctx.mutate("jobtx.write", { v: "job-before" });
+        await ctx.db.table("rows").insert({ v: "job-before" });
         gate.started.resolve();
         await gate.release;
-        await ctx.mutate("jobtx.write", { v: "job-after" });
+        await ctx.db.table("rows").insert({ v: "job-after" });
       },
     });
   };

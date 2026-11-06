@@ -7,9 +7,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import type { StorageAdapter } from "../src/core/storage.js";
-import type { StoredTableSchema } from "../src/core/types.js";
+import type { TableSchema } from "../src/core/types.js";
 
-const schema: StoredTableSchema = {
+const schema: TableSchema = {
   columns: {
     name: { type: "string" },
     age: { type: "number" },
@@ -18,7 +18,7 @@ const schema: StoredTableSchema = {
   },
 };
 
-const indexedSchema: StoredTableSchema = {
+const indexedSchema: TableSchema = {
   columns: {
     category: { type: "string", index: true },
     value: { type: "number" },
@@ -734,7 +734,7 @@ export function sqliteSchemaSuite(
 
     test("column migration rejects new required columns on non-empty tables without defaults", async () => {
       const adapter = await create();
-      const priorSchema: StoredTableSchema = {
+      const priorSchema: TableSchema = {
         columns: { name: { type: "string" } },
       };
       await adapter.ensureTable("items", priorSchema);
@@ -982,11 +982,11 @@ export function sqliteSchemaSuite(
       await adapter.ensureTable("items", {
         columns: {
           body: { type: "json", optional: true },
-          parsed: { type: "json", optional: true },
+          anything: { type: "any", optional: true },
         },
       });
       await adapter.rawExec(
-        "INSERT INTO items (_id, body, parsed) VALUES (?, ?, ?)",
+        "INSERT INTO items (_id, body, anything) VALUES (?, ?, ?)",
         "raw-row",
         "{not valid json",
         '{"parsed":1}',
@@ -995,7 +995,8 @@ export function sqliteSchemaSuite(
       const row = await adapter.query("items").first<any>();
       // Unparseable json text is preserved verbatim, never dropped.
       expect(row.body).toBe("{not valid json");
-      expect(row.parsed).toEqual({ parsed: 1 });
+      // "any" columns deserialize exactly like json columns.
+      expect(row.anything).toEqual({ parsed: 1 });
       adapter.close();
     });
 
@@ -1406,7 +1407,7 @@ export function sqliteSchemaSuite(
 
     test("case-insensitive table name aliases are rejected", async () => {
       const adapter = await create();
-      const priorSchema: StoredTableSchema = {
+      const priorSchema: TableSchema = {
         columns: { name: { type: "string" } },
       };
       await adapter.ensureTable("items", priorSchema);
@@ -1503,10 +1504,10 @@ export function sqliteSchemaSuite(
 
     test("failed unique migration leaves the physical table unchanged", async () => {
       const adapter = await create();
-      const priorSchema: StoredTableSchema = {
+      const priorSchema: TableSchema = {
         columns: { name: { type: "string" } },
       };
-      const nextSchema: StoredTableSchema = {
+      const nextSchema: TableSchema = {
         columns: { name: { type: "string" }, active: { type: "boolean" } },
         unique: [["name"]],
       };
@@ -1566,7 +1567,7 @@ export function sqliteSchemaSuite(
 
     test("schema migration rejects same-table manual index name conflicts", async () => {
       const adapter = await create();
-      const priorSchema: StoredTableSchema = {
+      const priorSchema: TableSchema = {
         columns: { name: { type: "string" }, value: { type: "number" } },
       };
       await adapter.ensureTable("items", priorSchema);
@@ -1592,7 +1593,7 @@ export function sqliteSchemaSuite(
 
     test("schema migration rejects same-table manual index name conflicts case-insensitively", async () => {
       const adapter = await create();
-      const priorSchema: StoredTableSchema = {
+      const priorSchema: TableSchema = {
         columns: { name: { type: "string" }, value: { type: "number" } },
       };
       await adapter.ensureTable("items", priorSchema);
@@ -1920,7 +1921,7 @@ export function sqliteSchemaSuite(
     });
 
     test("a migrated database changes nothing when ensured again", async () => {
-      const renamed: StoredTableSchema = {
+      const renamed: TableSchema = {
         renamedFrom: ["old_items"],
         columns: { title: { type: "string", renamedFrom: ["label"] } },
       };

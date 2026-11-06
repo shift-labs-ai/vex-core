@@ -1,6 +1,7 @@
 import type {
   ActionContext,
   ColumnDef,
+  ColumnType,
   MiddlewareFn,
   MutationContext,
   QueryContext,
@@ -8,7 +9,6 @@ import type {
   WebhookRequest,
   WebhookResponse,
 } from "../core/types.js";
-import type { ArgsOf, ArgsShape } from "../core/values.js";
 
 const KIND = Symbol.for("vex.kind");
 
@@ -16,23 +16,28 @@ export interface VexTable extends TableSchema {
   [KIND]: "table";
 }
 
-/** A file's query: its args' schemas, and a handler typed from them. */
-export interface VexQuery<S extends ArgsShape = any> {
+export interface VexQuery {
   [KIND]: "query";
-  args: S;
-  handler: (ctx: QueryContext, args: ArgsOf<S>) => Promise<any> | any;
+  args: Record<string, string>;
+  handler: (ctx: QueryContext, args: Record<string, any>) => Promise<any> | any;
 }
 
-export interface VexMutation<S extends ArgsShape = any> {
+export interface VexMutation {
   [KIND]: "mutation";
-  args: S;
-  handler: (ctx: MutationContext, args: ArgsOf<S>) => Promise<any> | any;
+  args: Record<string, string>;
+  handler: (
+    ctx: MutationContext,
+    args: Record<string, any>,
+  ) => Promise<any> | any;
 }
 
-export interface VexAction<S extends ArgsShape = any> {
+export interface VexAction {
   [KIND]: "action";
-  args: S;
-  handler: (ctx: ActionContext, args: ArgsOf<S>) => Promise<any> | any;
+  args: Record<string, string>;
+  handler: (
+    ctx: ActionContext,
+    args: Record<string, any>,
+  ) => Promise<any> | any;
 }
 
 export interface VexWebhook {
@@ -41,7 +46,7 @@ export interface VexWebhook {
   method?: "POST" | "GET" | "PUT" | "DELETE";
   verify?: (req: WebhookRequest) => boolean;
   handler: (
-    ctx: ActionContext,
+    ctx: MutationContext,
     req: WebhookRequest,
   ) => Promise<WebhookResponse | any> | WebhookResponse | any;
 }
@@ -49,7 +54,7 @@ export interface VexWebhook {
 export interface VexJob {
   [KIND]: "job";
   schedule: string;
-  handler: (ctx: ActionContext) => Promise<void> | void;
+  handler: (ctx: MutationContext) => Promise<void> | void;
   description?: string;
   enabled?: boolean;
   timeoutMs?: number;
@@ -57,16 +62,26 @@ export interface VexJob {
   retryDelayMs?: number;
 }
 
+type ColumnInput = string | (Omit<ColumnDef, "type"> & { type: string });
+
 /**
- * A table: a TypeBox schema per column. Its SQL name is its export
- * name in `schema.ts` and `<plugin>_<export>` in any other file;
- * `options.renamedFrom` lists previous SQL names.
+ * A table. Its SQL name is its export name in `schema.ts` and
+ * `<plugin>_<export>` in any other file; `options.renamedFrom` lists
+ * previous SQL names.
  */
 export function table(
-  columns: Record<string, ColumnDef>,
+  columns: Record<string, ColumnInput>,
   options: Omit<TableSchema, "columns"> = {},
 ): VexTable {
-  return { [KIND]: "table", ...options, columns };
+  const normalized: TableSchema["columns"] = {};
+  for (const [name, def] of Object.entries(columns)) {
+    normalized[name] =
+      typeof def === "string"
+        ? { type: def as ColumnType }
+        : { ...def, type: def.type as ColumnType };
+  }
+
+  return { [KIND]: "table", ...options, columns: normalized };
 }
 
 /** A definition without its kind tag: the plain def the engine registers. */
@@ -77,24 +92,24 @@ export function untag<T extends { [KIND]: string }>(
   return plain;
 }
 
-export function query<S extends ArgsShape>(
-  args: S,
-  handler: VexQuery<S>["handler"],
-): VexQuery<S> {
+export function query(
+  args: Record<string, string>,
+  handler: VexQuery["handler"],
+): VexQuery {
   return { [KIND]: "query", args, handler };
 }
 
-export function mutation<S extends ArgsShape>(
-  args: S,
-  handler: VexMutation<S>["handler"],
-): VexMutation<S> {
+export function mutation(
+  args: Record<string, string>,
+  handler: VexMutation["handler"],
+): VexMutation {
   return { [KIND]: "mutation", args, handler };
 }
 
-export function action<S extends ArgsShape>(
-  args: S,
-  handler: VexAction<S>["handler"],
-): VexAction<S> {
+export function action(
+  args: Record<string, string>,
+  handler: VexAction["handler"],
+): VexAction {
   return { [KIND]: "action", args, handler };
 }
 
@@ -162,6 +177,3 @@ export function isMiddleware(
 ): v is MiddlewareFn & { [KIND]: "middleware" } {
   return v?.[KIND] === "middleware";
 }
-
-/** The schema language args and returns are declared in. */
-export { default as Type } from "typebox";

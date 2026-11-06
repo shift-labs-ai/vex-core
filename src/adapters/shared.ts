@@ -6,7 +6,7 @@ import type {
   Filter,
   GroupByBuilder,
   QueryBuilder,
-  StoredTableSchema,
+  TableSchema,
 } from "../core/types.js";
 
 export { buildWhereClause, quoteIdent } from "../core/sql-where.js";
@@ -16,18 +16,18 @@ interface RowTransform {
   kind: "json" | "boolean";
 }
 
-// Deserialization plans are cached per schema object: only json and
+// Deserialization plans are cached per schema object: only json/any and
 // boolean columns need per-row work, and most tables have none. ensureTable
 // registers a fresh schema object on every (re)registration, so migrations
 // invalidate naturally and the WeakMap cannot outlive the schemas it keys.
-const rowTransformPlans = new WeakMap<StoredTableSchema, RowTransform[]>();
+const rowTransformPlans = new WeakMap<TableSchema, RowTransform[]>();
 
-function rowTransforms(schema: StoredTableSchema): RowTransform[] {
+function rowTransforms(schema: TableSchema): RowTransform[] {
   let plan = rowTransformPlans.get(schema);
   if (!plan) {
     plan = [];
     for (const [column, def] of Object.entries(schema.columns)) {
-      if (def.type === "json") {
+      if (def.type === "json" || def.type === "any") {
         plan.push({ column, kind: "json" });
       } else if (def.type === "boolean") {
         plan.push({ column, kind: "boolean" });
@@ -40,7 +40,7 @@ function rowTransforms(schema: StoredTableSchema): RowTransform[] {
 
 export function deserializeRow(
   row: Record<string, any>,
-  schema: StoredTableSchema | undefined,
+  schema: TableSchema | undefined,
 ): Record<string, any> {
   if (!schema) return row;
   for (const { column, kind } of rowTransforms(schema)) {
@@ -62,7 +62,7 @@ export interface DbExec {
   all(sql: string, params: any[]): Promise<any[]>;
   /** A write; the adapter records which tables it changed. */
   run(sql: string, params: any[]): Promise<{ changes: number }>;
-  schemas: Map<string, StoredTableSchema>;
+  schemas: Map<string, TableSchema>;
 }
 
 export function createQueryBuilder(exec: DbExec, table: string): QueryBuilder {

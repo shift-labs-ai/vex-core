@@ -39,7 +39,6 @@ import {
   refuseBody,
   vexHandler,
 } from "../../src/http/index.js";
-import { Type } from "../../src/portable.js";
 
 function post(
   body: BodyInit | null,
@@ -331,13 +330,13 @@ describe("vexHandler", () => {
           tables: {},
           queries: {
             size: {
-              args: { text: Type.String() },
+              args: { text: "string" },
               handler: async (_ctx, args) => args.text.length,
             },
           },
           mutations: {
             size: {
-              args: { text: Type.String() },
+              args: { text: "string" },
               handler: async (_ctx, args) => args.text.length,
             },
           },

@@ -25,9 +25,9 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
 import type { VexUser } from "../src/core/types.js";
-import { rawBulkInsert } from "../src/internal.js";
+import { scalingPlugin } from "./fixtures/scaling-plugin.js";
 
-const PLUGIN = new URL("./fixtures/scaling-plugin.ts", import.meta.url);
+const SETUP = new URL("./fixtures/scaling-setup.ts", import.meta.url);
 
 type Mode = "memory" | "file" | "workers";
 const MODES: Mode[] = ["memory", "file", "workers"];
@@ -85,12 +85,12 @@ async function create(mode: Mode): Promise<Harness> {
   const path = mode === "memory" ? ":memory:" : join(dir, "db.sqlite");
   const spans: Span[] = [];
   const vex = await Vex.create({
-    plugins: [PLUGIN],
+    plugins: [scalingPlugin],
     storage: sqliteAdapter(path),
     tracer: { onSpan: (span) => spans.push(span) },
     reactive: { maxRows: 500, maxBytes: 512 * 1024 },
     ...(mode === "workers"
-      ? { evaluation: { workers: 2, offloadAboveMs: 0 } }
+      ? { evaluation: { workers: 2, module: SETUP, setup: { path } } }
       : {}),
   });
   const watches: Watch[] = [];
@@ -166,6 +166,7 @@ async function create(mode: Mode): Promise<Harness> {
 }
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
+const withFn = { ...alice, decide: () => true } as unknown as VexUser;
 
 /** A burst: `n` writes issued together. */
 const burst = (
@@ -236,8 +237,7 @@ const scenarios: Record<string, (h: Harness) => Promise<void>> = {
     await h.watch("sum", { scope: "a" });
     await Promise.all([
       burst(h, 5, (i) => ["add", { scope: "a", n: i }]),
-      rawBulkInsert(
-        h.vex,
+      h.vex.unsafeBulkInsert(
         "items",
         Array.from({ length: 10 }, (_, i) => ({
           scope: "a",
@@ -330,6 +330,12 @@ const scenarios: Record<string, (h: Harness) => Promise<void>> = {
       h.write("renameGoverned", { id: mine, title: "mine'" }),
       h.write("addGoverned", { title: "third" }),
     ]);
+  },
+  "a caller that cannot cross to a worker, beside one that can": async (h) => {
+    await h.watch("whoami", {}, alice);
+    await h.watch("whoami", {}, withFn);
+    await h.watch("sum", { scope: "a" }, withFn);
+    await burst(h, 6, (i) => ["add", { scope: "a", n: i }]);
   },
   "three identical subscribers": async (h) => {
     for (let i = 0; i < 3; i++) await h.watch("sum", { scope: "a" });

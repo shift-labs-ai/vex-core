@@ -1,6 +1,6 @@
 /**
- * The plugin the scaling matrix drives, passed by module so each
- * evaluation worker imports it too. Every result carries `version`,
+ * The plugin the scaling matrix drives, shared by the main engine and
+ * each worker's (`scaling-setup.ts`). Every result carries `version`,
  * the highest write version it reflects, so deliveries can be judged
  * for going backwards.
  */
@@ -8,7 +8,6 @@
 import type { TableAccessPolicy } from "../../src/core/access.js";
 import { UNRESTRICTED } from "../../src/core/access.js";
 import type { VexPluginAPI } from "../../src/core/api.js";
-import { Type } from "../../src/portable.js";
 
 /**
  * Knobs a test turns through the database, so a handler honours them
@@ -41,35 +40,35 @@ const governedAccess: TableAccessPolicy<{ ids: string[] }> = {
   }),
 };
 
-export default function scalingPlugin(api: VexPluginAPI) {
+export function scalingPlugin(api: VexPluginAPI) {
   api.setName("sc");
   api.registerTable("items", {
     columns: {
-      scope: Type.String({ index: true }),
-      n: Type.Number(),
-      version: Type.Number(),
+      scope: { type: "string", index: true },
+      n: { type: "number" },
+      version: { type: "number" },
     },
   });
   api.registerTable("governed", {
-    columns: { title: Type.String(), version: Type.Number() },
+    columns: { title: { type: "string" }, version: { type: "number" } },
     access: governedAccess,
   });
   api.registerTable("grants", {
     columns: {
-      userId: Type.String({ index: true }),
-      itemId: Type.String({ index: true }),
+      userId: { type: "string", index: true },
+      itemId: { type: "string", index: true },
     },
   });
   api.registerTable("knobs", {
     columns: {
-      key: Type.String({ index: true }),
-      value: Type.Number(),
+      key: { type: "string", index: true },
+      value: { type: "number" },
     },
     unique: [["key"]],
   });
 
   api.registerQuery("sum", {
-    args: { scope: Type.String() },
+    args: { scope: "string" },
     async handler(ctx, args) {
       const rows = (await ctx.db
         .table("items")
@@ -105,10 +104,10 @@ export default function scalingPlugin(api: VexPluginAPI) {
   });
   // A raw statement over several scopes, held to their rows.
   api.registerQuery("scopes", {
-    args: { scopes: Type.Unknown() },
+    args: { scopes: "json" },
     async handler(ctx, args) {
       const scopes = args.scopes as string[];
-      const rows = (await ctx.db.sql(
+      const rows = (await ctx.db.sqlOver(
         { items: [{ column: "scope", operator: "IN", value: scopes }] },
         `SELECT scope, SUM(n) AS sum, COUNT(*) AS count, MAX(version) AS version
            FROM items WHERE scope IN (${scopes.map(() => "?").join(", ")})
@@ -152,17 +151,17 @@ export default function scalingPlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("add", {
-    args: { scope: Type.String(), n: Type.Number() },
+    args: { scope: "string", n: "number" },
     handler: (ctx, args) =>
       ctx.db.table("items").insert({ ...args, version: next() }),
   });
   api.registerMutation("set", {
-    args: { id: Type.String(), n: Type.Number() },
+    args: { id: "string", n: "number" },
     handler: (ctx, args) =>
       ctx.db.table("items").update(args.id, { n: args.n, version: next() }),
   });
   api.registerMutation("noop", {
-    args: { id: Type.String() },
+    args: { id: "string" },
     async handler(ctx, args) {
       const row = (await ctx.db
         .table("items")
@@ -174,16 +173,16 @@ export default function scalingPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("remove", {
-    args: { id: Type.String() },
+    args: { id: "string" },
     handler: (ctx, args) => ctx.db.table("items").delete(args.id),
   });
   api.registerMutation("removeScope", {
-    args: { scope: Type.String() },
+    args: { scope: "string" },
     handler: (ctx, args) =>
       ctx.db.table("items").where("scope", "=", args.scope).delete(),
   });
   api.registerMutation("raw", {
-    args: { scope: Type.String(), n: Type.Number() },
+    args: { scope: "string", n: "number" },
     handler: (ctx, args) =>
       ctx.db.sql(
         "INSERT INTO items (_id, scope, n, version) VALUES (?, ?, ?, ?)",
@@ -194,7 +193,7 @@ export default function scalingPlugin(api: VexPluginAPI) {
       ),
   });
   api.registerMutation("failing", {
-    args: { scope: Type.String() },
+    args: { scope: "string" },
     async handler(ctx, args) {
       await ctx.db
         .table("items")
@@ -203,46 +202,43 @@ export default function scalingPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("addGoverned", {
-    args: { title: Type.String() },
+    args: { title: "string" },
     handler: (ctx, args) =>
       ctx.db.table("governed").insert({ title: args.title, version: next() }),
   });
   api.registerMutation("renameGoverned", {
-    args: { id: Type.String(), title: Type.String() },
+    args: { id: "string", title: "string" },
     handler: (ctx, args) =>
       ctx.db
         .table("governed")
         .update(args.id, { title: args.title, version: next() }),
   });
   api.registerMutation("grant", {
-    args: { userId: Type.String(), itemId: Type.String() },
+    args: { userId: "string", itemId: "string" },
     async handler(ctx, args) {
       await ctx.db.table("grants").insert(args);
     },
   });
   api.registerMutation("knob", {
-    args: { key: Type.String(), value: Type.Number() },
+    args: { key: "string", value: "number" },
     async handler(ctx, args) {
       await ctx.db
         .table("knobs")
         .upsert({ key: args.key }, { value: args.value });
     },
   });
-  api.registerMutation("ingest", {
-    args: { scope: Type.String(), n: Type.Number() },
-    handler: (ctx, args) =>
-      ctx.db.table("items").insert({ ...args, version: next() }),
-  });
   api.registerJob("tick", {
     schedule: "every 1h",
     async handler(ctx) {
-      await ctx.mutate("sc.ingest", { scope: "a", n: 50 });
+      await ctx.db
+        .table("items")
+        .insert({ scope: "a", n: 50, version: next() });
     },
   });
   api.registerWebhook("in", {
     path: "/sc/in",
     async handler(ctx, req) {
-      await ctx.mutate("sc.ingest", { scope: req.body.scope, n: req.body.n });
+      await ctx.db.table("items").insert({ ...req.body, version: next() });
       return { ok: true };
     },
   });

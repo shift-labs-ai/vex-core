@@ -6,39 +6,22 @@ import {
   UNRESTRICTED,
 } from "./access.js";
 import type { PluginFunction } from "./api.js";
-import { NO_ENV, resolvePlugin } from "./api.js";
+import { resolvePlugin } from "./api.js";
 import {
   type Evaluation,
   type EvaluationOptions,
   EvaluationPool,
   type EvaluationRequest,
+  transferable,
   workersAvailable,
 } from "./evaluation.js";
-import {
-  type FrameKind,
-  inFrame,
-  outsideFrame,
-  refuseReentry,
-} from "./frames.js";
 import { holdStatement } from "./held-read.js";
 import { id as generateId } from "./id.js";
 import { INTERNAL_TABLES } from "./internal.js";
-import { RAW, type RawAccess } from "./internal-access.js";
 import { equalityKey, sameValue, writeMayAffect } from "./invalidation.js";
 import { hashResult, utf8ByteLength } from "./result-measure.js";
-import {
-  splitStatements,
-  statementKind,
-  tablesRead,
-  type ViewDefinition,
-} from "./sql-text.js";
-import {
-  ANY_TABLE,
-  CLOCK,
-  type StorageAdapter,
-  type StorageReader,
-} from "./storage.js";
-import { type RowChecks, rowChecks, storedTable } from "./tables.js";
+import { statementKind, tablesRead, type ViewDefinition } from "./sql-text.js";
+import { ANY_TABLE, type StorageAdapter } from "./storage.js";
 import {
   describeQueryDependencies,
   describeWrites,
@@ -46,18 +29,17 @@ import {
   type WriteDependency,
 } from "./trace-metadata.js";
 import type { ExecContext, Tracer } from "./tracer.js";
-import { createRootSpan, isTraceRecording, noopExecCtx } from "./tracer.js";
+import { createRootSpan, isTraceRecording } from "./tracer.js";
 import type {
   ActionContext,
   ActionDef,
   CallContext,
   ColumnType,
   DescribedColumn,
+  Hold,
   JobDef,
   MiddlewareFn,
   MiddlewareInfo,
-  Migration,
-  MigrationContext,
   MutationContext,
   MutationDef,
   MutationTable,
@@ -66,26 +48,12 @@ import type {
   QueryContext,
   QueryDef,
   ReactiveBudget,
-  Reads,
-  Scheduler,
-  StoredTableSchema,
-  SubscribeContext,
-  VexEnv,
+  TableSchema,
   VexRuntime,
-  VexServices,
   VexUser,
   WebhookRequest,
   WebhookResponse,
 } from "./types.js";
-import {
-  type ArgsCheck,
-  type ArgsShape,
-  compileArgs,
-  compileReturns,
-  frozenJson,
-  isPlainObject,
-  serializeJson,
-} from "./values.js";
 
 type SubscriptionCallback = (data: any) => void;
 type SerializedSubscriptionCallback = (data: any, serialized?: string) => void;
@@ -143,19 +111,9 @@ interface SubscriptionGroup {
    */
   run: Promise<{ result: unknown; measurement: ReactiveMeasurement }> | null;
   stale: boolean;
-  /** Its last run went to the evaluation pool (`poolFor`). */
+  /** Its runs go to the evaluation pool: there is one, and its caller
+   *  can cross to a worker. */
   offThread: boolean;
-  /** Its query and args (`Vex.families`). */
-  family: string;
-  /**
-   * The caller's fields its last run read; null before a run ends.
-   * Every member is alike in these (`callerSeen`).
-   */
-  reads: Set<string> | null;
-  /** Where its family files it (`fileCaller`), while it does. */
-  callerFiling?: { reads: string; seen: string };
-  /** When its last run's answer stops holding (`QueryContext.now`). */
-  clockUntil?: number;
   /** Filed in the index by its dependencies (`indexGroup`). */
   filed: boolean;
 }
@@ -165,139 +123,25 @@ interface Subscription {
   group: SubscriptionGroup;
   callback: SubscriptionCallback;
   lastHash: number;
-  onError?: SubscribeContext["onError"];
-  /** The caller it was made for. */
-  user: VexUser | null | undefined;
 }
 
-/**
- * A JSON value with every object's keys sorted, so two values with the
- * same data spell alike. Args and callers are JSON by the time they
- * are keyed (`compileArgs`, `normalizeCallContext`).
- */
-function canonical(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return value === undefined ? "null" : JSON.stringify(value);
-  }
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  const entries: string[] = [];
-  for (const key of Object.keys(value).sort()) {
-    const item = (value as Record<string, unknown>)[key];
-    if (item !== undefined) {
-      entries.push(`${JSON.stringify(key)}:${canonical(item)}`);
-    }
-  }
-  return `{${entries.join(",")}}`;
-}
-
-/**
- * The fields of `user` that `reads` names, spelled canonically: what a
- * group's runs saw of their caller. Unknown reads (no run yet) are the
- * whole caller.
- */
-function callerSeen(
+function groupKey(
+  queryName: string,
+  args: Record<string, any>,
   user: VexUser | null | undefined,
-  reads: ReadonlySet<string> | null,
 ): string {
-  if (user == null) return "none";
-  if (reads === null) return canonical(user);
-  const seen: Record<string, unknown> = {};
-  for (const key of reads) {
-    if (Object.hasOwn(user, key)) seen[key] = (user as any)[key];
-  }
-  return canonical(seen);
+  return `${queryName}\0${JSON.stringify(args)}\0${subscriptionUserKey(user)}`;
 }
 
-/** A set of caller fields, spelled one way; `null` (unknown) apart. */
-function readsKey(reads: ReadonlySet<string> | null): string {
-  return reads === null ? "*" : JSON.stringify([...reads].sort());
-}
-
-/**
- * A query's groups for one set of args: by the caller fields their
- * runs read, then by what their caller holds in those fields. A
- * caller finds its group with one lookup per set of fields the
- * family's runs read, however many callers it holds.
- */
-type Family = Map<
-  string,
-  {
-    reads: ReadonlySet<string> | null;
-    bySeen: Map<string, Slot>;
-  }
->;
-
-/**
- * `user` as a handler sees it, each field it reads recorded in
- * `reads`: a spread or a listing of its keys reads every field.
- */
-function trackedCaller(user: VexUser, reads: Set<string>): VexUser {
-  return new Proxy(user, {
-    get(target, prop, receiver) {
-      if (typeof prop === "string") reads.add(prop);
-      return Reflect.get(target, prop, receiver);
-    },
-    has(target, prop) {
-      if (typeof prop === "string") reads.add(prop);
-      return Reflect.has(target, prop);
-    },
-    ownKeys(target) {
-      for (const key of Object.keys(target)) reads.add(key);
-      return Reflect.ownKeys(target);
-    },
-    getOwnPropertyDescriptor(target, prop) {
-      if (typeof prop === "string") reads.add(prop);
-      return Reflect.getOwnPropertyDescriptor(target, prop);
-    },
-  });
-}
-
-/** Where a query run records what it reads (`buildQueryContext`). */
-interface QueryTracking {
-  tables?: Set<string>;
-  dependencies?: QueryDependency[];
-  /** The caller's fields the run reads. */
-  callerReads?: Set<string>;
-}
-
-/** An answer as JSON says it (`serializeJson`). */
-interface Json {
-  serialized: string | undefined;
-  /** Whether the answer is its own JSON reading. */
-  exact: boolean;
-}
-
-/**
- * `result` as an operation answers it: JSON data, refused otherwise,
- * and what its `returns` schema allows.
- */
-function checkedAnswer(
-  what: string,
-  returns: ((value: unknown) => void) | undefined,
-  result: unknown,
-): Json {
-  const json = serializeJson(result, `${what} answers`);
-  returns?.(result);
-  return json;
-}
-
-/** The rows a result holds: an array's, or a `{ rows }` object's. */
-function rowsOf(result: unknown): number | undefined {
-  if (Array.isArray(result)) return result.length;
-  const rows = (result as { rows?: unknown } | null)?.rows;
-  return Array.isArray(rows) ? rows.length : undefined;
-}
-
-/** An answer read back from its JSON: what a joiner hears of a run it did not see. */
-function parsed(json: Json): unknown {
-  return json.serialized === undefined
+/** A measured result as a joiner hears it: its serialized form, read. */
+function parsed(measurement: ReactiveMeasurement): unknown {
+  return measurement.serialized === undefined
     ? undefined
-    : JSON.parse(json.serialized);
+    : JSON.parse(measurement.serialized);
 }
 
-/** The value every caller is handed: the answer's JSON reading. */
-function reading(result: unknown, json: Json): unknown {
-  return json.exact ? result : parsed(json);
+function subscriptionUserKey(user: VexUser | null | undefined): string {
+  return JSON.stringify(user ? [user.id, user.name, user.isAdmin] : null);
 }
 
 /**
@@ -313,7 +157,7 @@ const RAW_WRITE: WriteDependency = { table: ANY_TABLE, raw: true };
 const DELETE_ROWS_RECORDED = 200;
 
 const columnTypesBySchema = new WeakMap<
-  StoredTableSchema,
+  TableSchema,
   Record<string, ColumnType>
 >();
 
@@ -465,16 +309,18 @@ function groupWritesByTable(
 // middleware without reading it, so they hold it erased (`any`): `A`
 // types what an app sees (`use`, the descriptions), and that is what
 // lets a bare `Vex` hold an engine of any declaration.
-/** An operation as registered: its definition, and its checks compiled. */
-interface Registered<D> {
+interface RegisteredQuery {
   plugin: string;
-  def: D;
-  args: ArgsCheck;
-  returns: ((value: unknown) => void) | undefined;
+  def: QueryDef<any>;
 }
-type RegisteredQuery = Registered<QueryDef<any>>;
-type RegisteredMutation = Registered<MutationDef<any>>;
-type RegisteredAction = Registered<ActionDef<any>>;
+interface RegisteredMutation {
+  plugin: string;
+  def: MutationDef<any>;
+}
+interface RegisteredAction {
+  plugin: string;
+  def: ActionDef<any>;
+}
 
 /**
  * How the engine describes an operation, wherever it does: its
@@ -483,7 +329,7 @@ type RegisteredAction = Registered<ActionDef<any>>;
  */
 export interface OperationDescription<A> {
   plugin: string;
-  args: ArgsShape;
+  args: Record<string, string>;
   access: A | undefined;
 }
 
@@ -498,10 +344,11 @@ function describeOperation<A>(
 }
 
 /** A reactive result as subscriptions compare and budget it. */
-interface ReactiveMeasurement extends Json {
+interface ReactiveMeasurement {
   hash: number;
   resultRows: number | undefined;
   resultBytes: number;
+  serialized: string | undefined;
 }
 
 /**
@@ -528,52 +375,13 @@ interface JobRunResult {
 }
 
 /**
- * `env` and `services`, each required once the app declares a field
- * it must hold (`VexEnv`, `VexServices`), optional while it declares
- * none.
- */
-type HostOptions = (Partial<VexEnv> extends VexEnv
-  ? { env?: VexEnv }
-  : { env: VexEnv }) &
-  (Partial<VexServices> extends VexServices
-    ? { services?: VexServices }
-    : { services: VexServices });
-
-/**
  * `A` is the app's access declaration (`OperationAccess`): what every
  * query, mutation and action of every plugin must declare. Unchosen,
  * there is none to declare.
  */
-export type VexOptions<A = undefined> = EngineOptions<A> & HostOptions;
-
-/**
- * A plugin by module: a `URL` (`new URL("./plugins/a.ts",
- * import.meta.url)`), an absolute path or a package name, whose default
- * export is a plugin, a plugin's definition, or an array of them. The
- * engine imports it itself, so another thread can import the same.
- */
-export type PluginModule = URL | string;
-
-interface EngineOptions<A> {
-  /**
-   * The app's plugins, each by value (a function or a definition) or
-   * by module (`PluginModule`), registered in the order given.
-   */
-  plugins: Array<PluginFunction<A> | PluginDef<A> | PluginModule>;
+export interface VexOptions<A = undefined> {
+  plugins: Array<PluginFunction<A> | PluginDef<A>>;
   storage: StorageAdapter;
-  /**
-   * The app's settings (`VexEnv`): an object of plain data, checked
-   * and frozen as the engine starts, which every context reads as
-   * `ctx.env` and every plugin's registration as `api.env`. None is
-   * an empty one.
-   */
-  env?: VexEnv;
-  /**
-   * The host's live capabilities (`VexServices`), handed to actions,
-   * jobs and webhooks as `ctx.services`, as given. No query or
-   * mutation holds them. None is an empty set.
-   */
-  services?: VexServices;
   tracer?: Tracer;
   appId?: string;
   handlerTimeoutMs?: number;
@@ -588,31 +396,10 @@ interface EngineOptions<A> {
    */
   jobScheduler?: "timers" | "external" | "none";
   /**
-   * Changes to the stored data or schema, applied once each, in order,
-   * each in a transaction, after every table is ensured and before the
-   * engine serves anything or runs a job. The one place SQL may change
-   * the schema.
-   */
-  migrations?: readonly Migration[];
-  /**
-   * Whether to check that queries answer from their context alone:
-   * a run is repeated on the same data and the answers compared, and
-   * a subscription a write skipped is run again and compared with its
-   * last answer. A query whose answers differ is refused (a run) or
-   * ended (a subscription), naming it: its answer depends on state no
-   * context tracks, such as a module's variables. "always", a share of
-   * runs (0 to 1), or "off" (the default). It runs each checked query
-   * twice.
-   */
-  purityCheck?: "always" | "off" | number;
-  /**
-   * Run expensive reads off the main thread, in workers each running a
-   * read-only engine over the same database, built from the app's own
-   * plugins, env and storage (`EvaluationOptions`): so every plugin is
-   * given by module, and the storage has a `reader()`, or the engine
-   * refuses to start. The engine starts once every worker has built
-   * its engine, and not when one cannot. Where the runtime has no
-   * workers, every read runs on the main thread.
+   * Evaluate subscriptions off the main thread, in workers each running
+   * a read-only engine over the same database (`EvaluationOptions`).
+   * Where the runtime has no workers, or for a caller that cannot
+   * cross to one, evaluation stays on the main thread.
    */
   evaluation?: EvaluationOptions;
 }
@@ -657,36 +444,6 @@ export class Vex<A = unknown> {
   // share (`invalidateAfter`).
   private pendingInvalidation: PendingInvalidation | null = null;
   private evaluation: EvaluationPool | null = null;
-  // What a query's runs cost, in ms, averaged over its recent runs
-  // in a worker; the queries whose runs the pool takes; and, for each
-  // kept here, its runs since one was last measured (`poolFor`,
-  // `noteCost`).
-  private readonly readCost = new Map<string, number>();
-  private readonly offloading = new Set<string>();
-  private readonly runsHere = new Map<string, number>();
-  private offloadAboveMs = 2;
-  private announcingStorage: StorageAdapter | null = null;
-  // Groups whose answers hold until a time (`clockUntil`), and the one
-  // timer that wakes at the soonest.
-  private readonly clockGroups = new Set<SubscriptionGroup>();
-  private clockTimer: ReturnType<typeof setTimeout> | null = null;
-  private clockAt = Number.POSITIVE_INFINITY;
-  // The one timer for the soonest scheduled function, and the runs
-  // under way (ctx.scheduler).
-  private scheduleTimer: ReturnType<typeof setTimeout> | null = null;
-  private scheduleAt = Number.POSITIVE_INFINITY;
-  private scheduledRun: Promise<void> | null = null;
-  // Each query with one set of args: its groups, one per set of
-  // callers alike in every field its runs read (`Family`).
-  private readonly families = new Map<string, Family>();
-  private groupSerial = 0;
-  // Each plugin table's write checks (tables.ts).
-  private readonly rowChecks = new Map<string, RowChecks>();
-  // The share of runs `purityCheck` repeats.
-  private purity = 0;
-  // The app's settings and the host's capabilities (`VexOptions`).
-  private env: Readonly<VexEnv> = NO_ENV;
-  private services: VexServices = NO_SERVICES;
   private subIdCounter = 0;
   private tracer: Tracer | null = null;
   private appId: string = "unknown";
@@ -753,17 +510,6 @@ export class Vex<A = unknown> {
     if (options.tracer) vex.tracer = options.tracer;
     if (options.appId) vex.appId = options.appId;
     if (options.jobScheduler) vex.jobScheduler = options.jobScheduler;
-    const purity = options.purityCheck ?? "off";
-    if (
-      purity !== "off" &&
-      purity !== "always" &&
-      !(purity >= 0 && purity <= 1)
-    ) {
-      throw new TypeError(
-        'purityCheck: "always", "off", or a share of runs from 0 to 1',
-      );
-    }
-    vex.purity = purity === "always" ? 1 : purity === "off" ? 0 : purity;
     if (options.handlerTimeoutMs)
       vex.handlerTimeoutMs = options.handlerTimeoutMs;
     if (options.reactive) {
@@ -773,26 +519,7 @@ export class Vex<A = unknown> {
       };
     }
 
-    vex.env = settings(options.env);
-    vex.services = options.services ?? NO_SERVICES;
-    const given = await loadPlugins(options.plugins);
-    // Refused before anything is built: what a worker needs.
-    const reader =
-      options.evaluation && options.evaluation.workers > 0
-        ? readsElsewhere(given, vex.storage)
-        : null;
-    if (options.evaluation) {
-      const offloadAbove = options.evaluation.offloadAboveMs ?? 2;
-      if (!(offloadAbove >= 0)) {
-        throw new TypeError(
-          "evaluation.offloadAboveMs: a run time in ms, 0 or more",
-        );
-      }
-      vex.offloadAboveMs = offloadAbove;
-    }
-    const plugins = given.plugins.map((plugin) =>
-      resolvePlugin(plugin, vex.env),
-    );
+    const plugins = options.plugins.map(resolvePlugin);
     claimTableNames(plugins);
 
     // Register internal tables
@@ -805,41 +532,25 @@ export class Vex<A = unknown> {
       vex.plugins.push(plugin);
       await vex.registerPlugin(plugin);
     }
-    await vex.migrate(options.migrations ?? []);
 
-    // After every table is ensured and migrated: a worker's read-only
-    // engine registers the tables it finds, and refuses one it does
-    // not. The engine starts with its workers built, or not at all;
-    // before any job or schedule arms, so a failure leaves nothing
-    // running, as a failed migration does.
-    if (options.evaluation && reader && workersAvailable()) {
-      const pool = new EvaluationPool(
+    // After every table is ensured: a worker's read-only engine
+    // registers the tables it finds, and refuses one it does not.
+    if (
+      options.evaluation &&
+      options.evaluation.workers > 0 &&
+      workersAvailable()
+    ) {
+      vex.evaluation = new EvaluationPool(
         new URL("./evaluation-worker.js", import.meta.url),
         options.evaluation.workers,
         {
-          plugins: given.modules,
-          env: vex.env,
-          reader,
+          module: String(options.evaluation.module),
+          setup: options.evaluation.setup,
           handlerTimeoutMs: vex.handlerTimeoutMs,
           reactive: vex.reactiveDefaults,
         },
       );
-      try {
-        await pool.ready;
-      } catch (error) {
-        pool.close();
-        throw new Error(
-          `an evaluation worker could not build its engine: ${error instanceof Error ? error.message : String(error)}`,
-          { cause: error },
-        );
-      }
-      vex.evaluation = pool;
     }
-
-    // Jobs arm last: none runs against data a migration has yet to
-    // change.
-    for (const plugin of plugins) await vex.registerJobs(plugin);
-    await vex.recoverScheduled();
 
     return vex;
   }
@@ -852,92 +563,32 @@ export class Vex<A = unknown> {
     for (const [tableName, schema] of Object.entries(plugin.tables)) {
       this.tables.add(tableName);
       if (schema.access) this.accessPolicies.set(tableName, schema.access);
-      // Refuses a column that is not a schema before compiling checks.
-      const stored = storedTable(tableName, schema);
-      this.rowChecks.set(tableName, rowChecks(tableName, schema));
-      await this.storage.ensureTable(tableName, stored);
+      await this.storage.ensureTable(tableName, schema);
     }
 
     for (const [name, def] of Object.entries(plugin.queries)) {
       const key = `${plugin.name}.${name}`;
       if (this.queries.has(key)) throw new Error(`Duplicate query: ${key}`);
-      this.queries.set(key, {
-        plugin: plugin.name,
-        def,
-        args: compileArgs("query", key, def.args),
-        returns: compileReturns("query", key, def.returns),
-      });
+      this.queries.set(key, { plugin: plugin.name, def });
     }
 
     for (const [name, def] of Object.entries(plugin.mutations)) {
       const key = `${plugin.name}.${name}`;
       if (this.mutations.has(key))
         throw new Error(`Duplicate mutation: ${key}`);
-      this.mutations.set(key, {
-        plugin: plugin.name,
-        def,
-        args: compileArgs("mutation", key, def.args),
-        returns: compileReturns("mutation", key, def.returns),
-      });
+      this.mutations.set(key, { plugin: plugin.name, def });
     }
 
     for (const [name, def] of Object.entries(plugin.actions ?? {})) {
       const key = `${plugin.name}.${name}`;
       if (this.actions.has(key)) throw new Error(`Duplicate action: ${key}`);
-      this.actions.set(key, {
-        plugin: plugin.name,
-        def,
-        args: compileArgs("action", key, def.args),
-        returns: compileReturns("action", key, def.returns),
-      });
+      this.actions.set(key, { plugin: plugin.name, def });
     }
-  }
 
-  private async registerJobs(plugin: PluginDef<any>): Promise<void> {
     if (this.jobScheduler === "none") return;
     for (const [name, job] of Object.entries(plugin.jobs ?? {})) {
       const cronName = `${plugin.name}.${name}`;
       await this.addJob(cronName, job, plugin.name);
-    }
-  }
-
-  /** Applies each migration not yet applied, in order (`migrations`). */
-  private async migrate(migrations: readonly Migration[]): Promise<void> {
-    const ids = new Set<string>();
-    for (const { id } of migrations) {
-      if (ids.has(id)) throw new Error(`Duplicate migration: ${id}`);
-      ids.add(id);
-    }
-    // A read-only engine (a worker's) changes nothing.
-    if (this.jobScheduler === "none" || migrations.length === 0) return;
-    const applied = new Set(
-      (
-        await this.storage.rawQuery<{ migrationId: string }>(
-          "SELECT migrationId FROM _migrations",
-        )
-      ).map((row) => row.migrationId),
-    );
-    const context: MigrationContext = {
-      env: this.env,
-      // The adapter forgets what it compiled when the schema moves.
-      sql: <T>(sql: string, ...params: any[]) =>
-        this.storage.rawQuery<T>(sql, ...params),
-      query: (name, args = {}, call) => this.query(name, args, call),
-      mutate: (name, args = {}, call) => this.mutate(name, args, call),
-    };
-    for (const migration of migrations) {
-      if (applied.has(migration.id)) continue;
-      await this.trace("migration", migration.id, null, () =>
-        this.storage.transaction(async () => {
-          await migration.up(context);
-          await this.storage.insert("_migrations", {
-            _id: generateId(12),
-            migrationId: migration.id,
-            appliedAt: Date.now(),
-          });
-        }),
-      );
-      await this.announceWrites();
     }
   }
 
@@ -1151,10 +802,9 @@ export class Vex<A = unknown> {
           async (ectx, meta) => {
             meta.schedule = job.schedule;
             meta.attempt = attempt;
-            // A scheduled action, as the system: what it writes goes
-            // through ctx.mutate, each a transaction of its own.
-            const ctx = this.buildActionContext(undefined, ectx, undefined);
-            await inFrame("action", cronName, () => job.handler(ctx));
+            const ctx = this.buildMutationContext();
+            await job.handler(ctx);
+            await this.invalidateAfter(ectx);
           },
         );
 
@@ -1236,17 +886,13 @@ export class Vex<A = unknown> {
   /** When the next enabled job comes due (epoch ms), or null if none will. */
   async nextJobRun(): Promise<number | null> {
     const jobs = await this.scheduledJobs();
-    const job =
-      jobs.find((entry) => this.jobHandlers.has(entry.name))?.nextRun ?? null;
-    const scheduled = await this.nextScheduled();
-    if (job === null) return scheduled;
-    return scheduled === null ? job : Math.min(job, scheduled);
+    return jobs.find((job) => this.jobHandlers.has(job.name))?.nextRun ?? null;
   }
 
   /**
-   * Runs, one after another, every enabled job due by `now`, then
-   * every scheduled function due by then. Each job run sets the job's
-   * next run one interval later; missed runs coalesce into one.
+   * Runs, one after another, every enabled job due by `now`. Each run
+   * sets the job's next run one interval later; missed runs coalesce
+   * into one.
    */
   async runDueJobs(
     now = Date.now(),
@@ -1260,7 +906,6 @@ export class Vex<A = unknown> {
       if (!handler || nextRun > now) continue;
       results.push({ name, ...(await this.executeJob(name, handler)) });
     }
-    if (!this.closing) await this.runDueScheduled(now);
     return results;
   }
 
@@ -1269,165 +914,6 @@ export class Vex<A = unknown> {
     return this.storage.rawQuery(
       "SELECT name, nextRun FROM _jobs WHERE enabled = 1 AND nextRun IS NOT NULL ORDER BY nextRun",
     );
-  }
-
-  /**
-   * A scheduler for `user`, the caller as the call was made (what
-   * middleware adds to it is decided again when the function runs):
-   * each schedule is a row of `_scheduled`, written through the
-   * storage the caller is in, so a mutation's is part of its
-   * transaction. `afterCommit` arms the timer once the row can be seen.
-   */
-  private scheduler(
-    user: VexUser | null | undefined,
-    afterCommit: (arm: () => void) => void,
-  ): Scheduler {
-    const schedule = async (
-      runAt: number,
-      name: string,
-      args: Record<string, any> = {},
-    ) => {
-      // What runs later has effects: a mutation or an action.
-      const mutation = this.mutations.get(name);
-      const reg = mutation ?? this.actions.get(name);
-      if (!reg) {
-        throw new Error(
-          `Cannot schedule ${name}: no mutation or action of that name`,
-        );
-      }
-      if (!Number.isFinite(runAt)) {
-        throw new TypeError("A schedule's time is a finite number of ms");
-      }
-      // Its args are checked now, not when it runs.
-      const checked = reg.args(args);
-      const id = generateId(12);
-      await this.storage.insert("_scheduled", {
-        _id: id,
-        name,
-        kind: mutation ? "mutation" : "action",
-        args: checked,
-        caller: user ?? null,
-        runAt,
-        status: "pending",
-        createdAt: Date.now(),
-      });
-      afterCommit(() => this.armScheduled());
-      return id;
-    };
-    return {
-      runAfter: (ms, name, args) => schedule(Date.now() + ms, name, args),
-      runAt: (time, name, args) => schedule(time, name, args),
-      cancel: async (id) => {
-        await this.storage.rawQuery(
-          "DELETE FROM _scheduled WHERE _id = ? AND status = 'pending'",
-          id,
-        );
-      },
-    };
-  }
-
-  /** When the soonest pending scheduled function is due, or null. */
-  private async nextScheduled(): Promise<number | null> {
-    const [row] = await this.storage.rawQuery<{ at: number | null }>(
-      "SELECT MIN(runAt) AS at FROM _scheduled WHERE status = 'pending'",
-    );
-    return row?.at ?? null;
-  }
-
-  /**
-   * Sets the one timer for the soonest pending scheduled function. A
-   * pass that fails is logged; the next schedule arms the timer again.
-   */
-  private armScheduled(): void {
-    if (this.closing || this.jobScheduler !== "timers") return;
-    const failed = (error: unknown) => {
-      if (!this.closing) console.error("[vex] scheduled functions:", error);
-    };
-    this.nextScheduled().then((at) => {
-      if (at === null || this.closing) return;
-      if (this.scheduleTimer && at >= this.scheduleAt) return;
-      if (this.scheduleTimer) clearTimeout(this.scheduleTimer);
-      this.scheduleAt = at;
-      this.scheduleTimer = setTimeout(
-        () => {
-          this.scheduleTimer = null;
-          this.scheduleAt = Number.POSITIVE_INFINITY;
-          this.runDueScheduled(Date.now()).then(
-            () => this.armScheduled(),
-            failed,
-          );
-        },
-        Math.max(0, at - Date.now()),
-      );
-    }, failed);
-  }
-
-  /**
-   * Runs every pending scheduled function due by `now`, one after
-   * another, each once, as the caller who scheduled it: done, or failed
-   * with its error. A finished one is kept `SCHEDULED_KEPT_MS`, then
-   * deleted.
-   */
-  private runDueScheduled(now: number): Promise<void> {
-    // One pass at a time; a pass asked for meanwhile joins it.
-    if (this.scheduledRun) return this.scheduledRun;
-    const pass = (async () => {
-      await this.storage.rawQuery(
-        "DELETE FROM _scheduled WHERE status IN ('done', 'failed') AND finishedAt < ?",
-        now - SCHEDULED_KEPT_MS,
-      );
-      const due = await this.storage.rawQuery<{
-        _id: string;
-        name: string;
-        kind: "mutation" | "action";
-        args: string;
-        caller: string | null;
-      }>(
-        "SELECT _id, name, kind, args, caller FROM _scheduled WHERE status = 'pending' AND runAt <= ? ORDER BY runAt, createdAt",
-        now,
-      );
-      for (const row of due) {
-        if (this.closing) break;
-        await this.storage.update("_scheduled", row._id, { status: "running" });
-        const args = JSON.parse(row.args) as Record<string, any>;
-        const user = row.caller
-          ? (JSON.parse(row.caller) as VexUser)
-          : undefined;
-        try {
-          if (row.kind === "mutation") {
-            await this.mutate(row.name, args, { user });
-          } else await this.action(row.name, args, { user });
-          await this.storage.update("_scheduled", row._id, {
-            status: "done",
-            finishedAt: Date.now(),
-          });
-        } catch (error) {
-          await this.storage.update("_scheduled", row._id, {
-            status: "failed",
-            error: error instanceof Error ? error.message : String(error),
-            finishedAt: Date.now(),
-          });
-        }
-      }
-    })();
-    this.scheduledRun = pass.finally(() => {
-      this.scheduledRun = null;
-    });
-    return this.scheduledRun;
-  }
-
-  /**
-   * At start: a scheduled function that was running when the engine
-   * last stopped ran at most once, so it is failed, never run again;
-   * then the timer is armed for what is pending.
-   */
-  private async recoverScheduled(): Promise<void> {
-    if (this.jobScheduler === "none") return;
-    await this.storage.rawQuery(
-      "UPDATE _scheduled SET status = 'failed', error = 'interrupted: the engine stopped while it ran', finishedAt = ? WHERE status = 'running'",
-      Date.now(),
-    );
-    this.armScheduled();
   }
 
   private runtime(): VexRuntime {
@@ -1452,38 +938,22 @@ export class Vex<A = unknown> {
     // Read at call time: middleware may have told the context more.
     const as = (): CallContext => ({ parent, user: ctx.user });
     const ctx: ActionContext = {
-      // Each call is the action's own, through its context.
-      query: (name, args = {}, caller) =>
-        outsideFrame(() => this.query(name, args, { ...as(), ...caller })),
-      mutate: (name, args = {}, caller) =>
-        outsideFrame(() => this.mutate(name, args, { ...as(), ...caller })),
-      action: (name, args = {}, caller) =>
-        outsideFrame(() =>
-          this.action(name, args, { ...as(), ...caller, signal }),
-        ),
+      query: (name, args = {}) => this.query(name, args, as()),
+      mutate: (name, args = {}) => this.mutate(name, args, as()),
+      action: (name, args = {}) => this.action(name, args, { ...as(), signal }),
       runtime: this.runtime(),
-      scheduler: this.scheduler(user, (arm) => arm()),
-      env: this.env,
-      services: this.services,
       user: user ?? undefined,
       signal,
     };
     return ctx;
   }
 
-  /**
-   * A query's context, for a run traced under `ectx` as `user`, its
-   * reads recorded where `tracking` says. A query it calls
-   * (`ctx.query`) records into the same.
-   */
   private buildQueryContext(
-    ectx: ExecContext,
-    user: VexUser | null | undefined,
-    tracking: QueryTracking = {},
+    touchedTables?: Set<string>,
+    user?: VexUser | null,
+    dependencies?: QueryDependency[],
   ): QueryContext {
     const self = this;
-    const { tables: touchedTables, dependencies, callerReads } = tracking;
-    if (user && callerReads) user = trackedCaller(user, callerReads);
     // One prepared access context per governed table per operation:
     // a handler reading `sessions` through three chains resolves the
     // caller's standing once. Subscription re-runs rebuild the whole
@@ -1514,16 +984,20 @@ export class Vex<A = unknown> {
       }
       return prepared;
     }
-    // A raw read depends on each table it reads as `reads` says: held
-    // to rows, narrowed like a builder read's; whole, on any change to
-    // it. One that reads no table depends on any change at all.
-    function trackRaw(tables: readonly string[], reads?: Reads): void {
+    // A raw read depends on every table it reads, any of whose changes
+    // re-runs it, but for a table it is held to rows of (`over`,
+    // `holdStatement`), whose filters narrow it like a builder read's;
+    // one that reads no table, on any change at all.
+    function trackRaw(
+      tables: readonly string[],
+      over?: Record<string, Hold>,
+    ): void {
       if (!touchedTables && !dependencies) return;
       for (const table of tables) {
         touchedTables?.add(table);
-        const hold = reads?.[table];
+        const hold = over?.[table];
         dependencies?.push(
-          hold === undefined || hold === "all"
+          hold === undefined
             ? { table, raw: true }
             : Array.isArray(hold)
               ? { table, filters: hold }
@@ -1533,85 +1007,44 @@ export class Vex<A = unknown> {
       if (tables.length === 0)
         dependencies?.push({ table: ANY_TABLE, raw: true });
     }
-    // A raw read as the caller, of the tables `reads` names, each held
-    // by the statement itself (`holdStatement`) or read whole; refused
-    // over a governed table or one it does not name.
+    // A raw read as the caller, refused over a governed table; held
+    // to the rows `over` names, when given, by the statement itself.
     function rawRead<T>(
-      reads: Reads,
       sql: string,
       params: any[],
+      over?: Record<string, Hold>,
     ): Promise<T[]> {
-      if (typeof reads !== "object" || reads === null) {
-        return Promise.reject(
-          new Error(
-            'ctx.db.sql(reads, sql, ...params): name each table the statement reads, held to rows ({ t: filters }) or whole ({ t: "all" })',
-          ),
-        );
-      }
-      let statement: { sql: string; params: any[] };
-      try {
-        statement = holdStatement(sql, reads, params);
-      } catch (error) {
-        return Promise.reject(error);
-      }
-      const held = Object.keys(reads).filter((t) => reads[t] !== "all");
-      const read = (tables: string[], views: string[]): Promise<T[]> => {
-        const hidden = tables.flatMap(
-          (table) => engineTableRefusal(table, false) ?? [],
-        );
-        if (hidden.length > 0) return Promise.reject(new Error(hidden[0]));
+      const held = over ? holdStatement(sql, over, params) : { sql, params };
+      const read = (tables: string[]): Promise<T[]> => {
         const governed = tables.filter((table) =>
           self.accessPolicies.has(table),
         );
         if (governed.length > 0) {
           return Promise.reject(governedRawSqlError(governed));
         }
-        // A view reads its base tables by their own names, past the
-        // expressions that hold them: a held read names no view.
-        const named = held.length > 0 ? namesIn(sql, views) : NONE;
-        if (named.length > 0) {
-          return Promise.reject(
-            new Error(
-              `ctx.db.sql cannot hold ${held.map((t) => JSON.stringify(t)).join(", ")} through a view (${named.join(", ")}): read the table itself`,
-            ),
-          );
-        }
-        const unnamed = tables.filter((table) => !(table in reads));
-        if (unnamed.length > 0) {
-          return Promise.reject(
-            new Error(
-              `ctx.db.sql reads ${unnamed.map((t) => JSON.stringify(t)).join(", ")} without naming ${unnamed.length > 1 ? "them" : "it"}: hold ${unnamed.length > 1 ? "each" : "it"} to rows ({ ${unnamed[0]}: filters }) or read ${unnamed.length > 1 ? "each" : "it"} whole ({ ${unnamed[0]}: "all" })`,
-            ),
-          );
-        }
-        trackRaw(tables, reads);
-        return self.storage.rawQuery<T>(statement.sql, ...statement.params);
+        trackRaw(tables, over);
+        return self.storage.rawQuery<T>(held.sql, ...held.params);
       };
-      // Known tables and views are answered at once, without a
-      // microtask hop.
-      const tables = self.rawReadTables(statement.sql);
-      const views = held.length > 0 ? self.viewNames() : NONE;
-      if (Array.isArray(tables) && Array.isArray(views)) {
-        return read(tables, views);
-      }
-      return Promise.all([tables, views]).then(([t, v]) => read(t, v));
+      // Known tables are answered at once, without a microtask hop.
+      const tables = self.rawReadTables(held.sql);
+      return Array.isArray(tables) ? read(tables) : tables.then(read);
     }
     ctx = {
       db: {
         table(name: string) {
-          const refused = engineTableRefusal(name, false);
-          if (refused) throw new Error(refused);
           const policy = self.accessPolicies.get(name);
           if (!policy) return baseBuilder(name);
           return guardQueryBuilder(name, baseBuilder(name), policy, () =>
             resolvePrepared(name, policy),
           );
         },
-        sql: <T = Record<string, any>>(
-          reads: Reads,
+        sql: <T = Record<string, any>>(sql: string, ...params: any[]) =>
+          rawRead<T>(sql, params),
+        sqlOver: <T = Record<string, any>>(
+          over: Record<string, Hold>,
           sql: string,
           ...params: any[]
-        ) => rawRead<T>(reads, sql, params),
+        ) => rawRead<T>(sql, params, over),
         async publishedSql<T = Record<string, any>>(
           sql: string,
           ...params: any[]
@@ -1660,100 +1093,10 @@ export class Vex<A = unknown> {
           });
         },
       },
-      query: <T>(
-        name: string,
-        args: Record<string, any> = {},
-        as?: { user: VexUser | null },
-      ) => {
-        // As the context's caller as middleware left it (whose reads
-        // its tracked view records), unless `as` names another, which
-        // is plain data as any caller is.
-        if (as?.user != null) {
-          try {
-            serializeJson(as.user, "a caller");
-          } catch (error) {
-            return Promise.reject(error);
-          }
-        }
-        const caller = as ? as.user : ctx.user;
-        // Its middleware runs outside the calling handler's frame, as
-        // every call's does; its handler, in a frame of its own.
-        return outsideFrame(() =>
-          self.composedQuery(name, args, caller, ectx, {
-            tables: touchedTables,
-            dependencies,
-          }),
-        ) as Promise<T>;
-      },
-      env: self.env,
-      now(resolutionMs: number): number {
-        if (!Number.isInteger(resolutionMs) || resolutionMs < 1000) {
-          throw new TypeError(
-            "ctx.now(resolutionMs): a whole number of milliseconds, at least 1000",
-          );
-        }
-        const at = Math.floor(Date.now() / resolutionMs) * resolutionMs;
-        dependencies?.push({ table: CLOCK, until: at + resolutionMs });
-        return at;
-      },
+      runtime: this.runtime(),
       user: user ?? undefined,
     };
     return ctx;
-  }
-
-  /**
-   * Query `name` called from another query's handler (`ctx.query`): a
-   * call of its own, its args checked, decided by middleware, its
-   * handler in its frame, its answer checked; what it reads is the
-   * calling run's, so a subscription re-runs when it changes. Its
-   * caller's reads are the caller's own: when that is the calling
-   * context's caller, its tracked view already records them.
-   */
-  private composedQuery(
-    name: string,
-    given: Record<string, any>,
-    user: VexUser | null | undefined,
-    parent: ExecContext,
-    tracking: QueryTracking,
-  ): Promise<unknown> {
-    const reg = this.queries.get(name);
-    if (!reg) return Promise.reject(new Error(`Query not found: ${name}`));
-    let args: Readonly<Record<string, any>>;
-    try {
-      args = reg.args(given);
-    } catch (error) {
-      return Promise.reject(error);
-    }
-    return this.trace("query", name, parent, async (ectx) => {
-      const result = await this.runRead(reg, name, args, user, ectx, tracking);
-      return reading(
-        result,
-        checkedAnswer(`query ${name}`, reg.returns, result),
-      );
-    });
-  }
-
-  /**
-   * One run of query `name`: its handler inside every middleware, as
-   * `user`, what it reads recorded where `tracking` says. Every read
-   * runs through it, a one-shot call's, a subscription's, a worker's
-   * and a composed one's: they differ only in where they record.
-   */
-  private runRead(
-    reg: RegisteredQuery,
-    name: string,
-    args: Readonly<Record<string, any>>,
-    user: VexUser | null | undefined,
-    ectx: ExecContext,
-    tracking?: QueryTracking,
-  ): Promise<unknown> {
-    const ctx = this.buildQueryContext(ectx, user, tracking);
-    return this.runMiddleware(
-      ctx,
-      { type: "query", name, args, access: reg.def.access },
-      () => reg.def.handler(ctx, args),
-      ectx,
-    );
   }
 
   private trackQueryBuilder(
@@ -1870,18 +1213,6 @@ export class Vex<A = unknown> {
     return tracked;
   }
 
-  /** Every view, from the adapter's per-schema list where it keeps one. */
-  private viewNames(): string[] | Promise<string[]> {
-    return (
-      this.storage.viewNames?.() ??
-      this.storage
-        .rawQuery<{ name: string }>(
-          "SELECT name FROM sqlite_master WHERE type = 'view'",
-        )
-        .then((rows) => rows.map(({ name }) => name))
-    );
-  }
-
   /**
    * The tables a raw statement reads: exactly, when the adapter can
    * compile it (views and subqueries included); otherwise each registered
@@ -1909,42 +1240,19 @@ export class Vex<A = unknown> {
   private buildMutationContext(
     user?: VexUser | null,
     writes?: WriteDependency[],
-    afterCommit: Array<() => void> = [],
   ): MutationContext {
     const self = this;
-    const began = Date.now();
     return {
-      now: () => began,
-      env: this.env,
-      // Its schedules are its transaction's: armed once it commits.
-      scheduler: this.scheduler(user, (arm) => afterCommit.push(arm)),
-      id: () => generateId(),
-      random: () => {
-        const bytes = crypto.getRandomValues(new Uint8Array(7));
-        // 53 random bits over 2^53.
-        let n = bytes[0]! & 0x1f;
-        for (let i = 1; i < 7; i++) n = n * 256 + bytes[i]!;
-        return n / 2 ** 53;
-      },
       db: {
         sql<T = Record<string, any>>(
           sql: string,
           ...params: any[]
         ): Promise<T[]> {
-          const refused = rawWriteRefusal(sql);
-          if (refused) return Promise.reject(new Error(refused));
           if (statementKind(sql) !== "read" && !writes?.includes(RAW_WRITE))
             writes?.push(RAW_WRITE);
           return self.storage.rawQuery<T>(sql, ...params);
         },
         table(name: string): MutationTable {
-          const hidden = engineTableRefusal(name, false);
-          if (hidden) throw new Error(hidden);
-          // Refused at the write, so the engine's tables stay readable.
-          const writable = () => {
-            const refused = engineTableRefusal(name, true);
-            if (refused) throw new Error(refused);
-          };
           const adapter = self.storage;
           const recording = writes !== undefined;
           const held = (id: string) =>
@@ -2009,8 +1317,6 @@ export class Vex<A = unknown> {
               // with the id it is given here, an update's or upsert's
               // columns left as they were, a delete's whole row.
               insert: (row) => {
-                writable();
-                self.rowChecks.get(name)?.insert(row);
                 const _id = row._id ?? generateId(12);
                 const full = { ...row, _id };
                 writes?.push({
@@ -2021,8 +1327,6 @@ export class Vex<A = unknown> {
                 return adapter.insert(name, full);
               },
               upsert: async (keys, data) => {
-                writable();
-                self.rowChecks.get(name)?.update({ ...keys, ...data });
                 const _id = generateId(12);
                 if (recording) {
                   let lookup = adapter.query(name);
@@ -2043,8 +1347,6 @@ export class Vex<A = unknown> {
                 return adapter.upsert(name, keys, data, _id);
               },
               update: async (id, data) => {
-                writable();
-                self.rowChecks.get(name)?.update(data);
                 const target = rowId(name, "update", id);
                 writes?.push(updateWrite(target, await held(target), data));
                 return adapter.update(name, target, data);
@@ -2054,7 +1356,6 @@ export class Vex<A = unknown> {
               // string: read as "no argument", a missing id would empty
               // the table.
               delete: async (...args: [id?: string]) => {
-                writable();
                 if (args.length === 0) {
                   if (recording) {
                     // The rows about to go, each as it is: every row
@@ -2087,6 +1388,7 @@ export class Vex<A = unknown> {
           return build(adapter.query(name), {});
         },
       },
+      runtime: this.runtime(),
       user: user ?? undefined,
     };
   }
@@ -2118,16 +1420,9 @@ export class Vex<A = unknown> {
     handler: () => Promise<any> | any,
     ectx: ExecContext,
   ): Promise<any> {
-    // The handler runs in its frame (`frames.ts`): it reaches the
-    // engine only through its context. Middleware is the app's own
-    // authority and runs outside it: a gate may ask the engine how to
-    // decide. A webhook runs as an action does.
-    const kind: FrameKind = info.type === "webhook" ? "action" : info.type;
     const run = () => {
-      const result = Promise.resolve(inFrame(kind, info.name, handler));
-      return info.type === "action" || info.type === "webhook"
-        ? result
-        : this.withTimeout(result);
+      const result = Promise.resolve(handler());
+      return info.type === "action" ? result : this.withTimeout(result);
     };
     if (this.middleware.length === 0) {
       return this.trace("handler", info.name, ectx, run);
@@ -2135,10 +1430,8 @@ export class Vex<A = unknown> {
     return this.trace("middleware", info.name, ectx, (mwEctx) => {
       let i = 0;
       const chain = (): Promise<any> | any => {
-        if (i < this.middleware.length) {
-          const middleware = this.middleware[i++]!;
-          return middleware(ctx, info, chain);
-        }
+        if (i < this.middleware.length)
+          return this.middleware[i++](ctx, info, chain);
         return this.trace("handler", info.name, mwEctx, run);
       };
       return chain();
@@ -2155,18 +1448,20 @@ export class Vex<A = unknown> {
     };
   }
 
-  private measureReactiveResult(
-    result: any,
-    { serialized, exact }: Json,
-  ): ReactiveMeasurement {
+  private measureReactiveResult(result: any): ReactiveMeasurement {
+    const serialized = JSON.stringify(result);
     // An undefined result measures as the literal "undefined".
     const measured = serialized ?? "undefined";
+    const resultRows = Array.isArray(result)
+      ? result.length
+      : result && typeof result === "object" && Array.isArray(result.rows)
+        ? result.rows.length
+        : undefined;
     return {
       hash: hashResult(measured),
-      resultRows: rowsOf(result),
+      resultRows,
       resultBytes: utf8ByteLength(measured),
       serialized,
-      exact,
     };
   }
 
@@ -2317,61 +1612,7 @@ export class Vex<A = unknown> {
       this.groups.delete(group.key);
       this.runningGroups.delete(group);
       this.unindexGroup(group);
-      this.clockGroups.delete(group);
-      this.unfileCaller(group);
     }
-  }
-
-  /**
-   * Files `group` in its family under what its runs read of its
-   * caller (the whole caller, before a run ends), so a caller alike
-   * in it finds the group by lookup (`joinableGroup`).
-   */
-  private fileCaller(group: SubscriptionGroup): void {
-    const at = {
-      reads: readsKey(group.reads),
-      seen: callerSeen(group.user, group.reads),
-    };
-    const was = group.callerFiling;
-    if (was && was.reads === at.reads && was.seen === at.seen) return;
-    let family = this.families.get(group.family);
-    if (!family) {
-      family = new Map();
-      this.families.set(group.family, family);
-    }
-    let file = family.get(at.reads);
-    if (!file) {
-      // Its own copy: the set it is keyed by does not move.
-      file = {
-        reads: group.reads && new Set(group.reads),
-        bySeen: new Map(),
-      };
-      family.set(at.reads, file);
-    }
-    slotAdd(file.bySeen, at.seen, group);
-    group.callerFiling = at;
-    // Filed anew before leaving where it was, so its family stays.
-    if (was) this.leaveFiling(group, was);
-  }
-
-  /** Unfiles `group` from where its family filed it. */
-  private unfileCaller(group: SubscriptionGroup): void {
-    const at = group.callerFiling;
-    if (!at) return;
-    group.callerFiling = undefined;
-    this.leaveFiling(group, at);
-  }
-
-  private leaveFiling(
-    group: SubscriptionGroup,
-    at: { reads: string; seen: string },
-  ): void {
-    const family = this.families.get(group.family);
-    const file = family?.get(at.reads);
-    if (!family || !file) return;
-    slotDelete(file.bySeen, at.seen, group);
-    if (file.bySeen.size === 0) family.delete(at.reads);
-    if (family.size === 0) this.families.delete(group.family);
   }
 
   /**
@@ -2443,25 +1684,18 @@ export class Vex<A = unknown> {
     // the index before its dependencies change, and returns after.
     this.unindexGroup(group);
     this.runningGroups.add(group);
-    const pool = this.poolFor(group.queryName);
-    group.offThread = pool !== null;
     const run = (async () => {
       try {
-        const answer = pool
-          ? await this.runGroupOffThread(group, pool)
-          : await this.runGroupHere(group, reg, ectx);
+        const answer =
+          this.evaluation && group.offThread
+            ? await this.runGroupOffThread(group, this.evaluation)
+            : await this.runGroupHere(group, reg, ectx);
         group.last = answer.measurement;
-        // Filed again under what this run read of its caller.
-        if (this.groups.get(group.key) === group) this.fileCaller(group);
-        this.rehomeStrangers(group);
         return answer;
       } finally {
         group.run = null;
         this.runningGroups.delete(group);
-        if (this.groups.get(group.key) === group) {
-          this.indexGroup(group);
-          this.timeGroup(group);
-        }
+        if (this.groups.get(group.key) === group) this.indexGroup(group);
       }
     })();
     group.run = run;
@@ -2473,33 +1707,30 @@ export class Vex<A = unknown> {
     reg: RegisteredQuery,
     ectx: ExecContext,
   ): Promise<{ result: unknown; measurement: ReactiveMeasurement }> {
+    const info: MiddlewareInfo<any> = {
+      type: "query",
+      name: group.queryName,
+      args: group.args,
+      access: reg.def.access,
+    };
     let result: unknown;
     do {
       group.stale = false;
-      result = await this.checkedRun(group.queryName, async () => {
-        // Recorded into the group as the run reads, so a write
-        // meanwhile is judged by what it has read so far.
-        group.tables = new Set();
-        group.dependencies = [];
-        const reads = new Set<string>();
-        const answer = await this.runRead(
-          reg,
-          group.queryName,
-          group.args,
-          group.user,
-          ectx,
-          {
-            tables: group.tables,
-            dependencies: group.dependencies,
-            callerReads: reads,
-          },
-        );
-        group.reads = reads;
-        return answer;
-      });
+      group.tables = new Set();
+      group.dependencies = [];
+      const ctx = this.buildQueryContext(
+        group.tables,
+        group.user,
+        group.dependencies,
+      );
+      result = await this.runMiddleware(
+        ctx,
+        info,
+        () => reg.def.handler(ctx, group.args),
+        ectx,
+      );
     } while (group.stale);
-    const json = checkedAnswer(`query ${group.queryName}`, reg.returns, result);
-    return { result, measurement: this.measureReactiveResult(result, json) };
+    return { result, measurement: this.measureReactiveResult(result) };
   }
 
   /**
@@ -2524,83 +1755,42 @@ export class Vex<A = unknown> {
         group.dependencies = [{ table: ANY_TABLE, raw: true }];
       }
       evaluation = await pool.run(request);
-      this.noteCost(group.queryName, evaluation.durationMs);
       group.tables = new Set(evaluation.tables);
       group.dependencies = evaluation.dependencies;
-      group.reads = new Set(evaluation.callerReads);
     } while (group.stale);
     return { result: evaluation.result, measurement: evaluation };
   }
 
   /**
-   * @internal A query run here for another engine (`EvaluationPool`):
-   * its result, measured, what it read, and how long it took.
+   * @internal A subscription's query run here for another engine's
+   * subscription (`EvaluationPool`): its result, measured, and what
+   * it read.
    */
   async evaluate(request: EvaluationRequest): Promise<Evaluation> {
     const reg = this.queries.get(request.name);
     if (!reg) throw new Error(`Query not found: ${request.name}`);
-    const args = reg.args(request.args);
-    const began = performance.now();
     const tables = new Set<string>();
     const dependencies: QueryDependency[] = [];
-    const callerReads = new Set<string>();
+    const ctx = this.buildQueryContext(tables, request.user, dependencies);
     const result = await this.trace("evaluate", request.name, null, (ectx) =>
-      this.runRead(reg, request.name, args, request.user, ectx, {
-        tables,
-        dependencies,
-        callerReads,
-      }),
+      this.runMiddleware(
+        ctx,
+        {
+          type: "query",
+          name: request.name,
+          args: request.args,
+          access: reg.def.access,
+        },
+        () => reg.def.handler(ctx, request.args),
+        ectx,
+      ),
     );
-    const json = checkedAnswer(`query ${request.name}`, reg.returns, result);
     return {
       result,
-      ...this.measureReactiveResult(result, json),
+      ...this.measureReactiveResult(result),
       tables: [...tables],
       dependencies,
-      callerReads: [...callerReads],
-      durationMs: performance.now() - began,
     };
-  }
-
-  /**
-   * The pool that takes this run of `name`, or null when it runs here.
-   * A run is timed only in a worker, which runs one at a time: on this
-   * thread runs interleave, so their times say little. The pool takes
-   * every run of a query whose runs cost past `offloadAboveMs`
-   * (`offloading`). A run that would time a query, its first and one
-   * in every `REMEASURE_EVERY` kept here, goes to the pool when a
-   * worker is idle: one waiting behind costly runs would only add
-   * their wait, so it runs here and a later run times it. Under
-   * `purityCheck`, which repeats runs on this thread, every run is
-   * here.
-   */
-  private poolFor(name: string): EvaluationPool | null {
-    const pool = this.evaluation;
-    if (!pool || this.purity > 0) return null;
-    if (this.offloadAboveMs === 0 || this.offloading.has(name)) return pool;
-    const runs = this.readCost.has(name)
-      ? (this.runsHere.get(name) ?? 0) + 1
-      : REMEASURE_EVERY;
-    if (runs >= REMEASURE_EVERY && pool.idleNow()) {
-      this.runsHere.delete(name);
-      return pool;
-    }
-    this.runsHere.set(name, runs);
-    return null;
-  }
-
-  /**
-   * A run of `name` in a worker took `ms`: its average moves a third
-   * of the way there. Past `offloadAboveMs` the pool takes its runs;
-   * under half of it they return here, so a query near the line does
-   * not flap.
-   */
-  private noteCost(name: string, ms: number): void {
-    const before = this.readCost.get(name);
-    const cost = before === undefined ? ms : before + (ms - before) / 3;
-    this.readCost.set(name, cost);
-    if (cost > this.offloadAboveMs) this.offloading.add(name);
-    else if (cost < this.offloadAboveMs / 2) this.offloading.delete(name);
   }
 
   /**
@@ -2696,271 +1886,57 @@ export class Vex<A = unknown> {
         meta.commits = commits;
         meta.judged = judged.size;
         meta.affectedGroups = affected.length;
+        if (this.evaluation) {
+          meta.offThread = affected.filter((group) => group.offThread).length;
+        }
         meta.activeSubs = this.subscriptions.size;
         meta.reEvaluated = affected.map((group) => group.queryName);
 
         // Groups run together: each is one query for one caller, with
         // nothing shared but the pool that bounds how many evaluate at
         // once off the main thread.
-        await Promise.all([
-          ...affected.map((group) => this.rerunGroup(group, _invEctx, meta)),
-          ...this.skippedToCheck(new Set(affected)).map((group) =>
-            this.recheckSkipped(group, _invEctx),
-          ),
-        ]);
-        // Where each run went is decided as it starts (`poolFor`).
-        if (this.evaluation) {
-          meta.offThread = affected.filter((group) => group.offThread).length;
-        }
+        const reEvaluate = async (group: SubscriptionGroup) => {
+          // Another invalidation, since this one chose its groups, may
+          // have opened a run of this one: that run repeats instead.
+          if (group.run) {
+            group.stale = true;
+            return;
+          }
+          try {
+            const reg = this.queries.get(group.queryName);
+            if (!reg) return;
+            const budget = this.resolveReactive(reg.def);
+            if (budget === false) {
+              meta.disabledSubscriptions =
+                (meta.disabledSubscriptions ?? 0) + group.members.size;
+              this.dropGroup(group);
+              return;
+            }
+            const { result, measurement } = await this.runGroup(
+              group,
+              reg,
+              _invEctx,
+            );
+            try {
+              this.assertReactiveBudget(measurement, budget);
+            } catch {
+              meta.budgetExceeded = true;
+              meta.disabledSubscriptions =
+                (meta.disabledSubscriptions ?? 0) + group.members.size;
+              meta.resultRows = measurement.resultRows;
+              meta.resultBytes = measurement.resultBytes;
+              meta.budget = budget;
+              this.dropGroup(group);
+              return;
+            }
+            this.deliver(group, result, measurement);
+          } catch (err) {
+            console.error(`[vex] subscription ${group.queryName} failed:`, err);
+          }
+        };
+        await Promise.all(affected.map(reEvaluate));
       },
     );
-  }
-
-  /**
-   * The group of `family` whose members `user` is alike in every field
-   * its runs read (the whole caller, before a run ends): one run serves
-   * them all.
-   */
-  private joinableGroup(
-    family: string,
-    user: VexUser | null | undefined,
-  ): SubscriptionGroup | undefined {
-    for (const file of this.families.get(family)?.values() ?? []) {
-      const slot = file.bySeen.get(callerSeen(user, file.reads));
-      if (slot instanceof Set) for (const group of slot) return group;
-      else if (slot) return slot;
-    }
-    return undefined;
-  }
-
-  private newGroup(
-    family: string,
-    queryName: string,
-    args: Record<string, any>,
-    user: VexUser | null | undefined,
-  ): SubscriptionGroup {
-    const group: SubscriptionGroup = {
-      key: `${family}\0${++this.groupSerial}`,
-      queryName,
-      args,
-      user,
-      members: new Set(),
-      tables: new Set(),
-      dependencies: [],
-      last: null,
-      run: null,
-      stale: false,
-      // Set by each run (`runGroup`): where it ran.
-      offThread: false,
-      filed: false,
-      family,
-      reads: null,
-    };
-    this.groups.set(group.key, group);
-    this.fileCaller(group);
-    return group;
-  }
-
-  /**
-   * After a run that read a field its members are not alike in, each
-   * member who differs leaves for the group of callers alike in what
-   * the runs read, and hears that group's answer: no one is answered
-   * from what another caller is.
-   */
-  private rehomeStrangers(group: SubscriptionGroup): void {
-    const own = callerSeen(group.user, group.reads);
-    const strangers = [...group.members].filter(
-      (sub) => callerSeen(sub.user, group.reads) !== own,
-    );
-    for (const sub of strangers) {
-      group.members.delete(sub);
-      const home =
-        this.joinableGroup(group.family, sub.user) ??
-        this.newGroup(group.family, group.queryName, group.args, sub.user);
-      sub.group = home;
-      home.members.add(sub);
-      if (home.last && home.last.hash !== sub.lastHash) {
-        sub.lastHash = home.last.hash;
-        try {
-          deliverSubscriptionResult(
-            sub.callback,
-            parsed(home.last),
-            home.last.serialized,
-          );
-        } catch (err) {
-          console.error(
-            `[vex] subscription ${group.queryName} callback failed:`,
-            err,
-          );
-        }
-      } else if (!home.last && !home.run) {
-        void this.trace("invalidation", "rehome", null, (ectx, meta) =>
-          this.rerunGroup(home, ectx, meta),
-        );
-      }
-    }
-  }
-
-  /**
-   * Runs `group` again and hands its members the answer: ended, each
-   * told why, when it outgrows its budget; on failure, its last answer
-   * kept and each member told. A group with a run open repeats that
-   * run instead.
-   */
-  private async rerunGroup(
-    group: SubscriptionGroup,
-    ectx: ExecContext,
-    meta: Record<string, any>,
-  ): Promise<void> {
-    if (group.run) {
-      group.stale = true;
-      return;
-    }
-    try {
-      const reg = this.queries.get(group.queryName);
-      if (!reg) return;
-      // A group exists only for a reactive query (`subscribe`).
-      const budget = this.resolveReactive(reg.def) as Required<ReactiveBudget>;
-      const { result, measurement } = await this.runGroup(group, reg, ectx);
-      try {
-        this.assertReactiveBudget(measurement, budget);
-      } catch (err) {
-        meta.budgetExceeded = true;
-        meta.disabledSubscriptions =
-          (meta.disabledSubscriptions ?? 0) + group.members.size;
-        meta.resultRows = measurement.resultRows;
-        meta.resultBytes = measurement.resultBytes;
-        meta.budget = budget;
-        // It cannot be answered within its budget: it ends, and each
-        // member is told why.
-        const members = [...group.members];
-        this.dropGroup(group);
-        for (const sub of members) this.notify(sub, err as Error, true);
-        return;
-      }
-      this.deliver(group, result, measurement);
-    } catch (err) {
-      // A failed run keeps the last answer and runs again on the next
-      // write or clock boundary that reaches it; each member is told.
-      console.error(`[vex] subscription ${group.queryName} failed:`, err);
-      for (const sub of group.members) this.notify(sub, err as Error, false);
-    }
-  }
-
-  /**
-   * `run`, or under `purityCheck`, `run` twice on the same data with
-   * the answers compared: a query answering two ways reads state no
-   * context tracks.
-   */
-  private async checkedRun<T>(name: string, run: () => Promise<T>): Promise<T> {
-    if (this.purity === 0 || Math.random() >= this.purity) return run();
-    return this.storage.transaction(async () => {
-      const first = await run();
-      const second = await run();
-      const a = serializeJson(first, `query ${name} answers`).serialized;
-      const b = serializeJson(second, `query ${name} answers`).serialized;
-      if (a !== b) {
-        throw new PurityError(
-          `query ${name} answered two ways on the same data: its answer depends on state its context does not track, such as a module's variables`,
-        );
-      }
-      return first;
-    });
-  }
-
-  /** Under `purityCheck`, the groups a pass skipped that it checks. */
-  private skippedToCheck(
-    affected: ReadonlySet<SubscriptionGroup>,
-  ): SubscriptionGroup[] {
-    if (this.purity === 0) return [];
-    const at = Date.now();
-    return [...this.groups.values()].filter(
-      (group) =>
-        !affected.has(group) &&
-        !group.run &&
-        group.last !== null &&
-        !(group.clockUntil !== undefined && group.clockUntil <= at) &&
-        Math.random() < this.purity,
-    );
-  }
-
-  /**
-   * Runs a group nothing it read changed and compares the answer with
-   * its last: one that differs ends, each member told why.
-   */
-  private async recheckSkipped(
-    group: SubscriptionGroup,
-    ectx: ExecContext,
-  ): Promise<void> {
-    const reg = this.queries.get(group.queryName);
-    const before = group.last;
-    if (!reg || !before) return;
-    try {
-      const { measurement } = await this.runGroup(group, reg, ectx);
-      if (measurement.hash === before.hash) return;
-    } catch {
-      // A failure is the next write's to report, as any run's is.
-      return;
-    }
-    const error = new PurityError(
-      `query ${group.queryName} answered differently though nothing it read changed: its answer depends on state its context does not track (or a change went unseen)`,
-    );
-    const members = [...group.members];
-    this.dropGroup(group);
-    for (const sub of members) this.notify(sub, error, true);
-  }
-
-  /** Files `group` under the clock when its answer holds until a time. */
-  private timeGroup(group: SubscriptionGroup): void {
-    let until: number | undefined;
-    for (const dep of group.dependencies) {
-      if (dep.table === CLOCK && dep.until !== undefined) {
-        until = until === undefined ? dep.until : Math.min(until, dep.until);
-      }
-    }
-    group.clockUntil = until;
-    if (until === undefined) this.clockGroups.delete(group);
-    else this.clockGroups.add(group);
-    this.armClock();
-  }
-
-  /** Sets the one clock timer for the soonest boundary any group holds. */
-  private armClock(): void {
-    let soonest = Number.POSITIVE_INFINITY;
-    for (const group of this.clockGroups) {
-      if (group.clockUntil !== undefined && group.clockUntil < soonest) {
-        soonest = group.clockUntil;
-      }
-    }
-    if (soonest === this.clockAt && this.clockTimer) return;
-    if (this.clockTimer) clearTimeout(this.clockTimer);
-    this.clockTimer = null;
-    this.clockAt = soonest;
-    if (this.closing || soonest === Number.POSITIVE_INFINITY) return;
-    this.clockTimer = setTimeout(
-      () => void this.clockTick(),
-      Math.max(0, soonest - Date.now()),
-    );
-  }
-
-  /** Re-runs every group whose answer has stopped holding. */
-  private async clockTick(): Promise<void> {
-    this.clockTimer = null;
-    this.clockAt = Number.POSITIVE_INFINITY;
-    if (this.closing) return;
-    const at = Date.now();
-    const due = [...this.clockGroups].filter(
-      (group) => group.clockUntil !== undefined && group.clockUntil <= at,
-    );
-    // Not due again until a run says when: each run re-times its group.
-    for (const group of due) this.clockGroups.delete(group);
-    this.armClock();
-    if (due.length === 0) return;
-    await this.trace("invalidation", "clock", null, async (ectx, meta) => {
-      meta.affectedGroups = due.length;
-      meta.reEvaluated = due.map((group) => group.queryName);
-      await Promise.all(due.map((group) => this.rerunGroup(group, ectx, meta)));
-    });
   }
 
   /** Hands a run's result to each member that has not heard it. */
@@ -2969,32 +1945,17 @@ export class Vex<A = unknown> {
     result: unknown,
     measurement: ReactiveMeasurement,
   ): void {
-    // Every member hears one value: the result itself when it is its
-    // own JSON reading, else that reading, which a joiner hears too.
-    const answer = reading(result, measurement);
     for (const sub of group.members) {
       if (measurement.hash === sub.lastHash) continue;
       sub.lastHash = measurement.hash;
       try {
-        deliverSubscriptionResult(sub.callback, answer, measurement.serialized);
+        deliverSubscriptionResult(sub.callback, result, measurement.serialized);
       } catch (err) {
         console.error(
           `[vex] subscription ${group.queryName} callback failed:`,
           err,
         );
       }
-    }
-  }
-
-  /** Tells a subscriber its view failed; a throwing listener is logged. */
-  private notify(sub: Subscription, error: Error, ended: boolean): void {
-    try {
-      sub.onError?.(error, ended);
-    } catch (err) {
-      console.error(
-        `[vex] subscription ${sub.group.queryName} onError failed:`,
-        err,
-      );
     }
   }
 
@@ -3005,76 +1966,65 @@ export class Vex<A = unknown> {
 
   // ─── Public API ───
 
+  use(fn: MiddlewareFn<A>) {
+    this.middleware.push(fn);
+  }
+
   async query<T = any>(
     name: string,
-    given: Record<string, any> = {},
+    args: Record<string, any> = {},
     callCtx?: ExecContext | CallContext,
   ): Promise<T> {
-    refuseReentry("vex.query");
     const { parent, user } = normalizeCallContext(callCtx);
     return this.trace("query", name, parent, async (ectx, meta) => {
       const reg = this.queries.get(name);
       if (!reg) throw new Error(`Query not found: ${name}`);
-      const args = reg.args(given);
       const recording = isTraceRecording(ectx);
-      const pool = this.poolFor(name);
-      if (pool) {
-        // Run where the pool runs it, as a subscription's would be.
-        const evaluation = await pool.run({ name, args, user });
-        this.noteCost(name, evaluation.durationMs);
-        if (recording) {
-          meta.offThread = true;
-          recordRead(meta, reg.plugin, evaluation);
-        }
-        return reading(evaluation.result, evaluation) as T;
-      }
       const tables = recording ? new Set<string>() : undefined;
       const dependencies = recording ? ([] as QueryDependency[]) : undefined;
-      const result = await this.checkedRun(name, () =>
-        this.runRead(reg, name, args, user, ectx, { tables, dependencies }),
+      const ctx = this.buildQueryContext(tables, user, dependencies);
+      const result = await this.runMiddleware(
+        ctx,
+        { type: "query", name, args, access: reg.def.access },
+        () => reg.def.handler(ctx, args),
+        ectx,
       );
-      const json = checkedAnswer(`query ${name}`, reg.returns, result);
       if (tables && dependencies) {
-        recordRead(meta, reg.plugin, {
-          tables: [...tables],
-          dependencies,
-          resultRows: rowsOf(result),
-          // As `measureReactiveResult` counts it: an undefined result
-          // is the literal "undefined".
-          resultBytes: utf8ByteLength(json.serialized ?? "undefined"),
-        });
+        meta.plugin = reg.plugin;
+        meta.tables = [...tables];
+        meta.dependencies = describeQueryDependencies(dependencies);
+        if (Array.isArray(result)) meta.resultRows = result.length;
+        else if (result && typeof result === "object" && "rows" in result)
+          meta.resultRows = (result as any).rows?.length;
+        try {
+          // Same convention as measureReactiveResult: undefined results
+          // are counted as the literal "undefined".
+          meta.resultBytes = utf8ByteLength(
+            JSON.stringify(result) ?? "undefined",
+          );
+        } catch {}
       }
-      return reading(result, json) as T;
+      return result as T;
     });
   }
 
   async mutate<T = any>(
     name: string,
-    given: Record<string, any> = {},
+    args: Record<string, any> = {},
     callCtx?: ExecContext | CallContext,
   ): Promise<T> {
-    refuseReentry("vex.mutate");
     const { parent, user } = normalizeCallContext(callCtx);
     return this.trace("mutation", name, parent, async (ectx, meta) => {
       const reg = this.mutations.get(name);
       if (!reg) throw new Error(`Mutation not found: ${name}`);
-      const args = reg.args(given);
       const writes: WriteDependency[] = [];
-      const committed: Array<() => void> = [];
-      const ctx = this.buildMutationContext(user, writes, committed);
+      const ctx = this.buildMutationContext(user, writes);
       const result = await this.storage.transaction(() =>
         this.runMiddleware(
           ctx,
           { type: "mutation", name, args, access: reg.def.access },
           () => reg.def.handler(ctx, args),
           ectx,
-        ).then((answer) =>
-          // Checked inside the transaction: a refused answer commits
-          // nothing.
-          reading(
-            answer,
-            checkedAnswer(`mutation ${name}`, reg.returns, answer),
-          ),
         ),
       );
       if (isTraceRecording(ectx)) {
@@ -3082,7 +2032,6 @@ export class Vex<A = unknown> {
         meta.writes = describeWrites(writes);
       }
       await this.invalidateAfter(ectx, writes);
-      for (const arm of committed) arm();
       return result as T;
     });
   }
@@ -3096,45 +2045,37 @@ export class Vex<A = unknown> {
    */
   async action<T = any>(
     name: string,
-    given: Record<string, any> = {},
+    args: Record<string, any> = {},
     callCtx?: ExecContext | CallContext,
   ): Promise<T> {
-    refuseReentry("vex.action");
     const { parent, user, signal } = normalizeCallContext(callCtx);
     return this.trace("action", name, parent, async (ectx, meta) => {
       const reg = this.actions.get(name);
       if (!reg) throw new Error(`Action not found: ${name}`);
-      const args = reg.args(given);
       signal?.throwIfAborted();
       if (isTraceRecording(ectx)) meta.plugin = reg.plugin;
       const ctx = this.buildActionContext(user, ectx, signal);
-      const result = await this.runMiddleware(
+      return (await this.runMiddleware(
         ctx,
         { type: "action", name, args, access: reg.def.access },
         () => reg.def.handler(ctx, args),
         ectx,
-      );
-      return reading(
-        result,
-        checkedAnswer(`action ${name}`, reg.returns, result),
-      ) as T;
+      )) as T;
     });
   }
 
   async subscribe(
     name: string,
-    given: Record<string, any>,
+    args: Record<string, any>,
     callback: SubscriptionCallback,
-    callCtx?: SubscribeContext,
+    callCtx?: CallContext,
   ): Promise<() => void> {
-    refuseReentry("vex.subscribe");
     this.assertOpen();
     const { user } = callCtx ? normalizeCallContext(callCtx) : {};
     const subId = `sub_${++this.subIdCounter}`;
     return this.trace("subscribe", name, null, async (_ectx, meta) => {
       const reg = this.queries.get(name);
       if (!reg) throw new Error(`Query not found: ${name}`);
-      const args = reg.args(given);
       const recording = isTraceRecording(_ectx);
       const budget = this.resolveReactive(reg.def);
       if (recording) meta.reactive = budget !== false;
@@ -3144,26 +2085,31 @@ export class Vex<A = unknown> {
       // made and registered before its first run, so a write
       // committing during the run finds it (`runGroup`). A group with
       // an answer already hands it over without a run.
-      const family = `${name}\0${canonical(args)}`;
-      const group =
-        this.joinableGroup(family, user) ??
-        this.newGroup(family, name, args, user);
-      const sub: Subscription = {
-        id: subId,
-        group,
-        callback,
-        lastHash: 0,
-        onError: callCtx?.onError,
-        user,
-      };
+      const key = groupKey(name, args, user);
+      let group = this.groups.get(key);
+      if (!group) {
+        group = {
+          key,
+          queryName: name,
+          args,
+          user,
+          members: new Set(),
+          tables: new Set(),
+          dependencies: [],
+          last: null,
+          run: null,
+          stale: false,
+          offThread: this.evaluation !== null && transferable(user),
+          filed: false,
+        };
+        this.groups.set(key, group);
+      }
+      const sub: Subscription = { id: subId, group, callback, lastHash: 0 };
       group.members.add(sub);
       this.subscriptions.set(subId, sub);
       try {
         const { result, measurement } = group.last
-          ? {
-              result: parsed(group.last),
-              measurement: group.last,
-            }
+          ? { result: parsed(group.last), measurement: group.last }
           : await this.runGroup(group, reg, _ectx);
         if (recording) {
           meta.resultRows = measurement.resultRows;
@@ -3180,11 +2126,7 @@ export class Vex<A = unknown> {
         // subscription; this one must not outlive it.
         this.assertOpen();
         sub.lastHash = measurement.hash;
-        deliverSubscriptionResult(
-          callback,
-          reading(result, measurement),
-          measurement.serialized,
-        );
+        deliverSubscriptionResult(callback, result, measurement.serialized);
       } catch (err) {
         this.dropSubscription(sub);
         throw err;
@@ -3225,20 +2167,23 @@ export class Vex<A = unknown> {
             body: { error: "Verification failed" },
           } as WebhookResponse;
         }
-        // An action reached over HTTP: what it writes goes through
-        // ctx.mutate, each a transaction of its own.
-        const ctx = this.buildActionContext(undefined, ectx, undefined);
+        const writes: WriteDependency[] = [];
+        const ctx = this.buildMutationContext(undefined, writes);
         const info: MiddlewareInfo<any> = {
           type: "webhook",
           name: `${match.plugin}.${match.name}`,
           args: req.body ?? {},
         };
-        const result = await this.runMiddleware(
-          ctx,
-          info,
-          () => match.def.handler(ctx, req),
-          ectx,
+        const result = await this.storage.transaction(() =>
+          this.runMiddleware(
+            ctx,
+            info,
+            () => match.def.handler(ctx, req),
+            ectx,
+          ),
         );
+        if (isTraceRecording(ectx)) meta.writes = describeWrites(writes);
+        await this.invalidateAfter(ectx, writes);
         if (result && typeof result === "object" && "status" in result) {
           meta.status = (result as any).status;
           return result as WebhookResponse;
@@ -3263,24 +2208,16 @@ export class Vex<A = unknown> {
     return null;
   }
 
-  // ─── Raw (vex-core/internal) ───
+  // ─── Unsafe ───
 
-  /**
-   * Runs SQL on the storage as it is: no access policy, no tracking
-   * of what it reads. What it writes is announced like any write:
-   * subscriptions over what it changed re-run, judged as an
-   * unattributed change (every one over the tables it touched).
-   */
-  private async rawSql<T = Record<string, any>>(
+  async unsafeSql<T = Record<string, any>>(
     sql: string,
     ...params: any[]
   ): Promise<T[]> {
-    const rows = await this.storage.rawQuery<T>(sql, ...params);
-    if (statementKind(sql) !== "read") await this.announceWrites();
-    return rows;
+    return this.storage.rawQuery<T>(sql, ...params);
   }
 
-  private async rawBulkInsert(
+  async unsafeBulkInsert(
     table: string,
     rows: Record<string, any>[],
   ): Promise<void> {
@@ -3299,61 +2236,8 @@ export class Vex<A = unknown> {
     });
   }
 
-  /**
-   * The storage, for code that keeps tables of its own on it: every
-   * write through it is announced as `rawSql`'s are, a
-   * transaction's once it commits, so no write can leave a
-   * subscription unaware of it. Every call answers the same handle.
-   */
-  private rawStorage(): StorageAdapter {
-    this.announcingStorage ??= this.announcing(this.storage);
-    return this.announcingStorage;
-  }
-
-  /** `storage`, with every write through it announced. */
-  private announcing(storage: StorageAdapter): StorageAdapter {
-    const announced =
-      <F extends (...args: any[]) => Promise<any>>(write: F) =>
-      async (...args: Parameters<F>) => {
-        const result = await write(...args);
-        await this.announceWrites();
-        return result;
-      };
-    return {
-      ...storage,
-      insert: announced(storage.insert),
-      upsert: announced(storage.upsert),
-      update: announced(storage.update),
-      delete: announced(storage.delete),
-      bulkInsert: announced(storage.bulkInsert),
-      rawExec: announced(storage.rawExec),
-      rawQuery: async <T>(sql: string, ...params: any[]) => {
-        const rows = await storage.rawQuery<T>(sql, ...params);
-        if (statementKind(sql) !== "read") await this.announceWrites();
-        return rows;
-      },
-      transaction: announced(
-        storage.transaction,
-      ) as StorageAdapter["transaction"],
-    };
-  }
-
-  /** Raw access for `vex-core/internal`; no public name reaches it. */
-  [RAW](): RawAccess {
-    return {
-      sql: (sql, ...params) => this.rawSql(sql, ...params),
-      storage: () => this.rawStorage(),
-      bulkInsert: (table, rows) => this.rawBulkInsert(table, rows),
-    };
-  }
-
-  /**
-   * Invalidates for writes the engine did not make itself, so did not
-   * record: whatever the storage reports changed, judged whole. Not
-   * traced, since a tracer may itself write through the storage.
-   */
-  private announceWrites(): Promise<void> {
-    return this.invalidateAfter(noopExecCtx);
+  unsafeGetStorage(): StorageAdapter {
+    return this.storage;
   }
 
   // ─── Introspection ───
@@ -3439,20 +2323,25 @@ export class Vex<A = unknown> {
     };
   }
 
+  async readTable(table: string, opts?: { limit?: number; offset?: number }) {
+    return this.trace("query", `_system.readTable:${table}`, null, async () => {
+      const total = await this.storage.query(table).count();
+      const reader = this.storage.query(table);
+      if (opts?.limit) reader.limit(opts.limit);
+      if (opts?.offset) reader.offset(opts.offset);
+      reader.order("_id", "desc");
+      return { rows: await reader.all(), total };
+    });
+  }
+
   /**
    * Closes the engine. From the call on it refuses job changes, job runs
-   * and subscriptions, and no timer starts a job or a scheduled
-   * function. A scheduled function under way finishes and no later
-   * one starts, job changes in flight finish without arming a timer,
-   * running jobs settle, and then storage closes. Calling it again
-   * returns the same promise.
+   * and subscriptions, and no timer starts a job. Job changes in flight
+   * finish without arming a timer, running jobs settle, and then storage
+   * closes. Calling it again returns the same promise.
    */
   close(): Promise<void> {
     if (!this.closing) {
-      if (this.clockTimer) clearTimeout(this.clockTimer);
-      this.clockTimer = null;
-      if (this.scheduleTimer) clearTimeout(this.scheduleTimer);
-      this.scheduleTimer = null;
       for (const timer of this.cronTimers.values()) clearTimeout(timer);
       this.cronTimers.clear();
       this.closing = this.shutDown();
@@ -3461,12 +2350,10 @@ export class Vex<A = unknown> {
   }
 
   private async shutDown(): Promise<void> {
-    await this.scheduledRun?.catch(() => {});
     await Promise.allSettled([...this.jobChanges.values()]);
     await Promise.allSettled([...this.runningJobs.values()]);
     this.subscriptions.clear();
     this.groups.clear();
-    this.families.clear();
     this.groupIndex.clear();
     this.anyTableGroups.clear();
     this.runningGroups.clear();
@@ -3509,7 +2396,7 @@ function claimTableNames<A>(plugins: PluginDef<A>[]): void {
 
 /** A schema's columns as it declares them. */
 function declaredColumns(
-  schema: StoredTableSchema | null,
+  schema: TableSchema | null,
 ): Record<string, DescribedColumn> {
   const columns: Record<string, DescribedColumn> = {};
   for (const [name, def] of Object.entries(schema?.columns ?? {})) {
@@ -3548,9 +2435,6 @@ function normalizeCallContext(callCtx?: ExecContext | CallContext): {
     return { parent: callCtx as ExecContext };
   }
   const cc = callCtx as CallContext;
-  // A caller is plain data: what its runs read of it is keyed, and
-  // it crosses to a worker and into a schedule.
-  if (cc.user != null) serializeJson(cc.user, "a caller");
   return { parent: cc.parent, user: cc.user, signal: cc.signal };
 }
 
@@ -3568,205 +2452,4 @@ function parseSchedule(schedule: string): number {
     default:
       return 0;
   }
-}
-
-const NONE: string[] = [];
-
-/** One run in this many of a query kept here is measured in a worker. */
-const REMEASURE_EVERY = 32;
-
-// The services of an app that gives none: its types then require none
-// (`HostOptions`).
-const NO_SERVICES = Object.freeze({}) as VexServices;
-
-/** A one-shot read as its trace records it, wherever it ran. */
-function recordRead(
-  meta: Record<string, any>,
-  plugin: string,
-  read: {
-    tables: string[];
-    dependencies: QueryDependency[];
-    resultRows: number | undefined;
-    resultBytes: number;
-  },
-): void {
-  meta.plugin = plugin;
-  meta.tables = read.tables;
-  meta.dependencies = describeQueryDependencies(read.dependencies);
-  if (read.resultRows !== undefined) meta.resultRows = read.resultRows;
-  meta.resultBytes = read.resultBytes;
-}
-
-/** The app's plugins as `loadPlugins` found them. */
-interface LoadedPlugins<A> {
-  plugins: Array<PluginFunction<A> | PluginDef<A>>;
-  /** Each module given, in order. */
-  modules: string[];
-  /** How many plugins were given by value, which no module names. */
-  byValue: number;
-}
-
-/** The plugins `given` names, in order, each module's imported. */
-async function loadPlugins<A>(
-  given: ReadonlyArray<PluginFunction<A> | PluginDef<A> | PluginModule>,
-): Promise<LoadedPlugins<A>> {
-  const plugins: Array<PluginFunction<A> | PluginDef<A>> = [];
-  const modules: string[] = [];
-  let byValue = 0;
-  for (const entry of given) {
-    if (!(entry instanceof URL) && typeof entry !== "string") {
-      plugins.push(entry);
-      byValue++;
-      continue;
-    }
-    const specifier = entry instanceof URL ? entry.href : entry;
-    if (specifier.startsWith("./") || specifier.startsWith("../")) {
-      throw new Error(
-        `plugin module "${specifier}" is relative: pass new URL(path, import.meta.url)`,
-      );
-    }
-    const exported = (await import(specifier)).default;
-    const each = Array.isArray(exported) ? exported : [exported];
-    if (each.length === 0 || !each.every(isPlugin)) {
-      throw new Error(
-        `plugin module "${specifier}" has no default export of a plugin (a function, a definition, or an array of them)`,
-      );
-    }
-    plugins.push(...each);
-    modules.push(specifier);
-  }
-  return { plugins, modules, byValue };
-}
-
-function isPlugin(
-  value: unknown,
-): value is PluginFunction<any> | PluginDef<any> {
-  if (typeof value === "function") return true;
-  const def = value as Partial<PluginDef<any>> | null;
-  return (
-    typeof def === "object" &&
-    def !== null &&
-    typeof def.name === "string" &&
-    typeof def.queries === "object" &&
-    typeof def.mutations === "object"
-  );
-}
-
-/**
- * How a worker opens the storage, once it is clear a worker can build
- * the engine: every plugin given by module, and a storage another
- * thread can open to read.
- */
-function readsElsewhere<A>(
-  given: LoadedPlugins<A>,
-  storage: StorageAdapter,
-): StorageReader {
-  if (given.byValue > 0) {
-    throw new Error(
-      `evaluation workers build their engine from the app's plugins, so each is given by module (PluginModule): ${given.byValue} given by value`,
-    );
-  }
-  const reader = storage.reader?.() ?? null;
-  if (!reader) {
-    throw new Error(
-      "evaluation workers open the storage from another thread, which this one cannot be (a database in memory, or one with no reader())",
-    );
-  }
-  return reader;
-}
-
-/** `env` as every context reads it: plain data, copied and frozen. */
-function settings(env: VexEnv | undefined): Readonly<VexEnv> {
-  if (env === undefined) return NO_ENV;
-  if (!isPlainObject(env)) {
-    throw new TypeError("env is an object of settings, as plain data");
-  }
-  return frozenJson(env, "env");
-}
-
-const WORD = /[\w$]/;
-
-// The tables the engine writes itself, and of them the one no handler
-// reads either: `_scheduled` holds each schedule's caller and args, and
-// a row written there would run as whoever it names. `_spans` is
-// provided for an app's tracer to keep, and is the app's to write.
-const ENGINE_TABLES = ["_jobs", "_migrations", "_scheduled"];
-const ENGINE_PRIVATE_TABLES = ["_scheduled"];
-
-// How long a finished scheduled function is kept: what ran, and how
-// it ended.
-const SCHEDULED_KEPT_MS = 7 * 24 * 60 * 60 * 1000;
-
-/**
- * Why a handler is refused `table` through `ctx.db`, or null: an
- * engine table is the engine's to write, and `_scheduled` its alone.
- * Names compare as SQLite's do, ignoring case.
- */
-function engineTableRefusal(table: string, writes: boolean): string | null {
-  const name = table.toLowerCase();
-  if (ENGINE_PRIVATE_TABLES.includes(name)) {
-    return `ctx.db reads and writes no ${table}: it is the engine's`;
-  }
-  if (writes && ENGINE_TABLES.includes(name)) {
-    return `ctx.db writes no ${table}: the engine keeps it`;
-  }
-  return null;
-}
-
-/**
- * Why a mutation's raw SQL is refused, or null: each statement reads
- * or changes rows (SELECT, VALUES, WITH, INSERT, UPDATE, DELETE,
- * REPLACE), never the schema, a PRAGMA, an attached database or the
- * transaction the mutation runs in; it writes no table the engine
- * keeps, and touches none it keeps to itself.
- */
-function rawWriteRefusal(sql: string): string | null {
-  for (const statement of splitStatements(sql)) {
-    const hidden = namesIn(statement, ENGINE_PRIVATE_TABLES);
-    if (hidden.length > 0) {
-      return `ctx.db.sql reads and writes no ${hidden.join(", ")}: it is the engine's`;
-    }
-    const kind = statementKind(statement);
-    if (kind === "other") {
-      const word = statement.trim().split(/\s+/)[0]?.toUpperCase() ?? "";
-      return `ctx.db.sql in a mutation reads and changes rows; ${word || "this statement"} is refused (schema changes are migrations)`;
-    }
-    if (kind !== "read") {
-      const named = namesIn(statement, ENGINE_TABLES);
-      if (named.length > 0) {
-        return `ctx.db.sql in a mutation writes no table the engine keeps (${named.join(", ")})`;
-      }
-    }
-  }
-  return null;
-}
-
-/**
- * The names of `names` that `sql` holds as a whole word, any case. A
- * statement reaches a view or a table only by naming it (a view naming
- * another is reached through the first); a name inside a string
- * literal counts too, so nothing is missed and more than needed may
- * be refused.
- */
-function namesIn(sql: string, names: string[]): string[] {
-  if (names.length === 0) return NONE;
-  const text = sql.toLowerCase();
-  return names.filter((candidate) => {
-    const name = candidate.toLowerCase();
-    for (
-      let at = text.indexOf(name);
-      at !== -1;
-      at = text.indexOf(name, at + 1)
-    ) {
-      const before = text[at - 1] ?? "";
-      const after = text[at + name.length] ?? "";
-      if (!WORD.test(before) && !WORD.test(after)) return true;
-    }
-    return false;
-  });
-}
-
-/** A query that answered differently from the same data (`purityCheck`). */
-export class PurityError extends Error {
-  override readonly name = "PurityError";
 }

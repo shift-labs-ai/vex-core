@@ -25,11 +25,11 @@ import { performance } from "node:perf_hooks";
 import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
-import { rawBulkInsert } from "../src/internal.js";
 import {
   cellOf,
   guildOf,
   ITEMS_PER_PLAYER,
+  mmoPlugin,
   partyOf,
   playerId,
   zoneOf,
@@ -42,11 +42,6 @@ const PLAYERS = (process.env.BENCH_PLAYERS ?? "1000,10000")
 const BURST = Number(process.env.BENCH_BURST ?? 100);
 const SECONDS = Number(process.env.BENCH_SECONDS ?? 5);
 const WORKERS = Number(process.env.BENCH_WORKERS ?? 0);
-/** The run time past which a read goes to the pool; the engine's default unless set. */
-const OFFLOAD_MS =
-  process.env.BENCH_OFFLOAD_MS === undefined
-    ? undefined
-    : Number(process.env.BENCH_OFFLOAD_MS);
 const JSON_LINES = process.env.BENCH_JSON === "1";
 
 function percentile(sorted: number[], fraction: number): number {
@@ -80,7 +75,7 @@ async function tier(players: number) {
   const path = join(dir, "world.db");
   const passes: Pass[] = [];
   const vex = await Vex.create({
-    plugins: [new URL("./mmo-plugin.ts", import.meta.url)],
+    plugins: [mmoPlugin],
     storage: sqliteAdapter(path),
     reactive: { maxRows: 10_000, maxBytes: 16 * 1024 * 1024 },
     tracer: {
@@ -99,7 +94,8 @@ async function tier(players: number) {
       ? {
           evaluation: {
             workers: WORKERS,
-            ...(OFFLOAD_MS !== undefined ? { offloadAboveMs: OFFLOAD_MS } : {}),
+            module: new URL("./mmo-setup.ts", import.meta.url),
+            setup: { path },
           },
         }
       : {}),
@@ -127,7 +123,7 @@ async function tier(players: number) {
       row.y = Math.floor(random() * 1000);
       row.cell = cellOf(row.x, row.y);
     }
-    await rawBulkInsert(vex, "players", rows);
+    await vex.unsafeBulkInsert("players", rows);
     const items: Record<string, any>[] = [];
     const kinds = ["weapon", "armor", "potion", "gem", "scroll"];
     for (let p = 0; p < players; p++) {
@@ -139,10 +135,10 @@ async function tier(players: number) {
         });
       }
       if (items.length >= 50_000) {
-        await rawBulkInsert(vex, "items", items.splice(0));
+        await vex.unsafeBulkInsert("items", items.splice(0));
       }
     }
-    if (items.length > 0) await rawBulkInsert(vex, "items", items);
+    if (items.length > 0) await vex.unsafeBulkInsert("items", items);
     const messages: Record<string, any>[] = [];
     for (let p = 0; p < players; p++) {
       for (let m = 0; m < 5; m++) {
@@ -154,10 +150,10 @@ async function tier(players: number) {
         });
       }
       if (messages.length >= 50_000) {
-        await rawBulkInsert(vex, "messages", messages.splice(0));
+        await vex.unsafeBulkInsert("messages", messages.splice(0));
       }
     }
-    if (messages.length > 0) await rawBulkInsert(vex, "messages", messages);
+    if (messages.length > 0) await vex.unsafeBulkInsert("messages", messages);
     const seedMs = performance.now() - seedStart;
 
     // ─── Every player logs in ───

@@ -4,7 +4,6 @@ export {
   middleware,
   mutation,
   query,
-  Type,
   table,
   webhook,
 } from "./define.js";

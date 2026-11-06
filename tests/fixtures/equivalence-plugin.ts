@@ -3,8 +3,8 @@
  * spec (any filter, any OR group, any selection, order, window and
  * terminal; as a builder read, a raw read, or a raw read held to rows
  * and columns; of a plain table or a governed one), and a mutation
- * for every way a row can be written. Passed by module, so each
- * evaluation worker imports it too.
+ * for every way a row can be written. Shared with evaluation workers
+ * (`equivalence-setup.ts`).
  */
 
 import type { TableAccessPolicy } from "../../src/core/access.js";
@@ -12,7 +12,6 @@ import { UNRESTRICTED } from "../../src/core/access.js";
 import type { VexPluginAPI } from "../../src/core/api.js";
 import { quoteIdent } from "../../src/core/sql-where.js";
 import type { Filter } from "../../src/core/types.js";
-import { Type } from "../../src/portable.js";
 
 export type Terminal =
   | "all"
@@ -82,27 +81,27 @@ function versionOf(rows: unknown): number | null {
   return null;
 }
 
-export default function equivalencePlugin(api: VexPluginAPI) {
+export function equivalencePlugin(api: VexPluginAPI) {
   api.setName("eq");
   const columns = {
-    s: Type.Optional(Type.String({ index: true })),
-    n: Type.Optional(Type.Number()),
-    b: Type.Optional(Type.Boolean()),
-    j: Type.Optional(Type.Unknown()),
-    k: Type.String({ index: true }),
-    version: Type.Number(),
+    s: { type: "string" as const, optional: true, index: true },
+    n: { type: "number" as const, optional: true },
+    b: { type: "boolean" as const, optional: true },
+    j: { type: "json" as const, optional: true },
+    k: { type: "string" as const, index: true },
+    version: { type: "number" as const },
   };
   api.registerTable("t", { columns });
   api.registerTable("g", { columns, access: governed });
   api.registerTable("grants", {
     columns: {
-      userId: Type.String({ index: true }),
-      itemId: Type.String({ index: true }),
+      userId: { type: "string", index: true },
+      itemId: { type: "string", index: true },
     },
   });
 
   api.registerQuery("read", {
-    args: { spec: Type.Unknown() },
+    args: { spec: "json" },
     async handler(ctx, args) {
       const spec = args.spec as Spec;
       let data: unknown;
@@ -113,8 +112,8 @@ export default function equivalencePlugin(api: VexPluginAPI) {
         const sql = `SELECT ${cols.map((c) => (c === "*" ? c : quoteIdent(c))).join(", ")} FROM ${quoteIdent(spec.table)} ORDER BY _id`;
         data =
           spec.raw === "sql"
-            ? await ctx.db.sql({ [spec.table]: "all" }, sql)
-            : await ctx.db.sql(
+            ? await ctx.db.sql(sql)
+            : await ctx.db.sqlOver(
                 {
                   [spec.table]:
                     spec.raw === "over" || !spec.select
@@ -173,26 +172,26 @@ export default function equivalencePlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("insert", {
-    args: { table: Type.String(), row: Type.Unknown() },
+    args: { table: "string", row: "json" },
     handler: (ctx, args) =>
       ctx.db
         .table(args.table)
         .insert({ ...(args.row as object), version: next() }),
   });
   api.registerMutation("update", {
-    args: { table: Type.String(), id: Type.String(), data: Type.Unknown() },
+    args: { table: "string", id: "string", data: "json" },
     handler: (ctx, args) =>
       ctx.db
         .table(args.table)
         .update(args.id, { ...(args.data as object), version: next() }),
   });
   api.registerMutation("touch", {
-    args: { table: Type.String(), id: Type.String(), data: Type.Unknown() },
+    args: { table: "string", id: "string", data: "json" },
     handler: (ctx, args) =>
       ctx.db.table(args.table).update(args.id, args.data as object),
   });
   api.registerMutation("upsert", {
-    args: { table: Type.String(), keys: Type.Unknown(), data: Type.Unknown() },
+    args: { table: "string", keys: "json", data: "json" },
     handler: (ctx, args) =>
       ctx.db.table(args.table).upsert(args.keys as object, {
         ...(args.data as object),
@@ -200,11 +199,11 @@ export default function equivalencePlugin(api: VexPluginAPI) {
       }),
   });
   api.registerMutation("delete", {
-    args: { table: Type.String(), id: Type.String() },
+    args: { table: "string", id: "string" },
     handler: (ctx, args) => ctx.db.table(args.table).delete(args.id),
   });
   api.registerMutation("deleteWhere", {
-    args: { table: Type.String(), filters: Type.Unknown() },
+    args: { table: "string", filters: "json" },
     handler: (ctx, args) => {
       let q = ctx.db.table(args.table);
       for (const f of args.filters as Filter[])
@@ -212,29 +211,18 @@ export default function equivalencePlugin(api: VexPluginAPI) {
       return q.delete();
     },
   });
-  // Raw SQL may leave a value's affinity twin in a column (`"5"` in a
-  // number column): what no schema-checked write can.
   api.registerMutation("rawInsert", {
-    args: {
-      table: Type.String(),
-      k: Type.String(),
-      s: Type.Unknown(),
-      n: Type.Unknown(),
-      b: Type.Unknown(),
-    },
+    args: { table: "string", k: "string" },
     handler: (ctx, args) =>
       ctx.db.sql(
-        `INSERT INTO ${quoteIdent(args.table)} (_id, k, s, n, b, version) VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO ${quoteIdent(args.table)} (_id, k, version) VALUES (?, ?, ?)`,
         `raw${next()}`,
         args.k,
-        args.s,
-        args.n,
-        args.b,
         version,
       ),
   });
   api.registerMutation("rawUpdate", {
-    args: { table: Type.String(), id: Type.String(), k: Type.String() },
+    args: { table: "string", id: "string", k: "string" },
     handler: (ctx, args) =>
       ctx.db.sql(
         `UPDATE ${quoteIdent(args.table)} SET k = ?, version = ? WHERE _id = ?`,
@@ -244,20 +232,20 @@ export default function equivalencePlugin(api: VexPluginAPI) {
       ),
   });
   api.registerMutation("failing", {
-    args: { table: Type.String() },
+    args: { table: "string" },
     async handler(ctx, args) {
       await ctx.db.table(args.table).insert({ k: "x", version: next() });
       throw new Error("rolled back");
     },
   });
   api.registerMutation("grant", {
-    args: { userId: Type.String(), itemId: Type.String() },
+    args: { userId: "string", itemId: "string" },
     async handler(ctx, args) {
       await ctx.db.table("grants").insert(args);
     },
   });
   api.registerMutation("revoke", {
-    args: { userId: Type.String(), itemId: Type.String() },
+    args: { userId: "string", itemId: "string" },
     handler: (ctx, args) =>
       ctx.db
         .table("grants")

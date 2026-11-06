@@ -1,6 +1,6 @@
 {
   "name": "vex-core",
-  "version": "0.23.0",
+  "version": "0.24.0",
   "description": "Local-first reactive backend engine. Plugin architecture, SQLite storage, real-time subscriptions.",
   "type": "module",
   "main": "./dist/index.js",
@@ -11,11 +11,6 @@
       "workerd": "./dist/portable.js",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
-    },
-    "./internal": {
-      "types": "./dist/internal.d.ts",
-      "import": "./dist/internal.js",
-      "default": "./dist/internal.js"
     },
     "./client": {
       "types": "./dist/client/index.d.ts",
@@ -45,7 +40,6 @@
   },
   "files": [
     "dist",
-    "docs",
     "README.md",
     "LICENSE"
   ],
@@ -61,7 +55,7 @@
     "format": "bunx biome format --write src/",
     "lint": "bunx biome lint src/",
     "check": "bunx biome check src/",
-    "typecheck": "tsc --noEmit && tsc -p tests/types && tsc -p tests/types-env",
+    "typecheck": "tsc --noEmit && tsc -p tests/types",
     "prepublishOnly": "bun run typecheck && bun run build"
   },
   "keywords": [
@@ -99,7 +93,7 @@
     "vitest": "^4.1.0"
   },
   "dependencies": {
-    "typebox": "^1.4.3"
+    "nanoid": "^5.1.7"
   },
   "peerDependencies": {
     "react": "^19.2.4"

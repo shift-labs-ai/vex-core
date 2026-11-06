@@ -1,7 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { durableObjectAdapter, Vex, type VexPluginAPI } from "vex-core";
 import { cors, createRouter, sessions, vexHandler } from "vex-core/http";
-import { Type } from "../../src/portable.js";
 
 /**
  * A bare SQLite-backed Durable Object. The tests reach its storage
@@ -12,10 +11,10 @@ export class TestStore extends DurableObject {}
 function counterPlugin(api: VexPluginAPI) {
   api.setName("counter");
   api.registerTable("counters", {
-    columns: { key: Type.String(), value: Type.Number() },
+    columns: { key: { type: "string" }, value: { type: "number" } },
   });
   api.registerMutation("set", {
-    args: { key: Type.String(), value: Type.Number() },
+    args: { key: "string", value: "number" },
     async handler(ctx, args) {
       return ctx.db.table("counters").insert(args);
     },
@@ -44,15 +43,11 @@ export class App extends DurableObject {
 
 function tickerPlugin(api: VexPluginAPI) {
   api.setName("ticker");
-  api.registerTable("ticks", { columns: { at: Type.Number() } });
-  api.registerMutation("record", {
-    args: {},
-    handler: (ctx) => ctx.db.table("ticks").insert({ at: ctx.now() }),
-  });
+  api.registerTable("ticks", { columns: { at: { type: "number" } } });
   api.registerJob("tick", {
     schedule: "every 1s",
     async handler(ctx) {
-      await ctx.mutate("ticker.record");
+      await ctx.db.table("ticks").insert({ at: Date.now() });
     },
   });
   api.registerQuery("count", {

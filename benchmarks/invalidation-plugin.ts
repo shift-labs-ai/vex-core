@@ -1,14 +1,13 @@
 /**
- * The plugin `invalidation.ts` measures: a governed `sessions` table
- * and the views a dashboard keeps open on it. Passed by module, so
- * each evaluation worker imports it too.
+ * The plugin `invalidation.ts` measures, shared with its evaluation
+ * workers (`invalidation-setup.ts`): a governed `sessions` table and
+ * the views a dashboard keeps open on it.
  */
 
 import { performance } from "node:perf_hooks";
 import type { TableAccessPolicy } from "../src/core/access.js";
 import { UNRESTRICTED } from "../src/core/access.js";
 import type { VexPluginAPI } from "../src/core/api.js";
-import { Type } from "../src/portable.js";
 
 /**
  * CPU each query handler burns besides its reads, in ms: the policy
@@ -46,28 +45,28 @@ const sessionsAccess: TableAccessPolicy<Grants> = {
   }),
 };
 
-export default function benchmarkPlugin(api: VexPluginAPI) {
+export function benchmarkPlugin(api: VexPluginAPI) {
   api.setName("b");
   api.registerTable("sessions", {
     columns: {
-      workspaceId: Type.String({ index: true }),
-      platform: Type.String({ index: true }),
-      title: Type.String(),
-      lastSeenAt: Type.Number({ index: true }),
-      enabled: Type.Number(),
+      workspaceId: { type: "string", index: true },
+      platform: { type: "string", index: true },
+      title: { type: "string" },
+      lastSeenAt: { type: "number", index: true },
+      enabled: { type: "number" },
     },
     access: sessionsAccess,
   });
   api.registerTable("grants", {
     columns: {
-      userId: Type.String({ index: true }),
-      sessionId: Type.String({ index: true }),
+      userId: { type: "string", index: true },
+      sessionId: { type: "string", index: true },
     },
   });
   api.registerTable("messages", {
     columns: {
-      sessionId: Type.String({ index: true }),
-      text: Type.String(),
+      sessionId: { type: "string", index: true },
+      text: { type: "string" },
     },
   });
 
@@ -86,7 +85,7 @@ export default function benchmarkPlugin(api: VexPluginAPI) {
   });
   // One conversation: its session row and its message count.
   api.registerQuery("conversation", {
-    args: { id: Type.String() },
+    args: { id: "string" },
     handler: async (ctx, args) => {
       work();
       const sessions = ctx.db.table("sessions");
@@ -107,7 +106,7 @@ export default function benchmarkPlugin(api: VexPluginAPI) {
   });
   // A workspace's effective bindings: its sessions, enabled or not.
   api.registerQuery("effective", {
-    args: { workspaceId: Type.String() },
+    args: { workspaceId: "string" },
     handler: (ctx, args) => {
       work();
       return ctx.db
@@ -119,7 +118,7 @@ export default function benchmarkPlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("seed", {
-    args: { users: Type.Number(), conversations: Type.Number() },
+    args: { users: "number", conversations: "number" },
     async handler(ctx, args) {
       const ids: string[][] = [];
       for (let u = 0; u < args.users; u++) {
@@ -144,7 +143,7 @@ export default function benchmarkPlugin(api: VexPluginAPI) {
   });
   // `conversations.touch`: an inbound message's mark on its session.
   api.registerMutation("touch", {
-    args: { id: Type.String(), at: Type.Number() },
+    args: { id: "string", at: "number" },
     async handler(ctx, args) {
       await ctx.db
         .table("sessions")
@@ -152,7 +151,7 @@ export default function benchmarkPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("message", {
-    args: { id: Type.String(), text: Type.String() },
+    args: { id: "string", text: "string" },
     async handler(ctx, args) {
       await ctx.db
         .table("messages")

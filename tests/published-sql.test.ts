@@ -15,8 +15,6 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { StorageAdapter } from "../src/core/storage.js";
 import type { VexUser } from "../src/core/types.js";
-import { rawSql } from "../src/internal.js";
-import { Type } from "../src/portable.js";
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
 const admin: VexUser = { id: "root", name: "Root", isAdmin: true };
@@ -30,14 +28,14 @@ afterEach(async () => {
 function plugin(api: VexPluginAPI) {
   api.setName("ps");
   api.registerTable("notes", {
-    columns: { body: Type.String() },
+    columns: { body: { type: "string" } },
     published: true,
   });
   api.registerTable("keys", {
-    columns: { token: Type.String({ index: true }) },
+    columns: { token: { type: "string", index: true } },
   });
   api.registerTable("docs", {
-    columns: { ownerId: Type.String(), title: Type.String() },
+    columns: { ownerId: { type: "string" }, title: { type: "string" } },
     published: true,
     access: {
       prepare: (user) => (!user || user.isAdmin ? UNRESTRICTED : user.id),
@@ -45,7 +43,7 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("read", {
-    args: { sql: Type.String(), params: Type.Unknown() },
+    args: { sql: "string", params: "json" },
     handler: (ctx, args) =>
       ctx.db.publishedSql(args.sql, ...((args.params as unknown[]) ?? [])),
   });
@@ -60,14 +58,17 @@ function plugin(api: VexPluginAPI) {
       await ctx.db.table("keys").insert({ token: "secret" });
       await ctx.db.table("docs").insert({ ownerId: "alice", title: "mine" });
       await ctx.db.table("docs").insert({ ownerId: "bob", title: "his" });
+      await ctx.db.sql(
+        "CREATE VIEW IF NOT EXISTS key_view AS SELECT token FROM keys",
+      );
     },
   });
   api.registerMutation("key", {
-    args: { token: Type.String() },
+    args: { token: "string" },
     handler: (ctx, args) => ctx.db.table("keys").insert({ token: args.token }),
   });
   api.registerMutation("note", {
-    args: { body: Type.String() },
+    args: { body: "string" },
     handler: (ctx, args) => ctx.db.table("notes").insert({ body: args.body }),
   });
 }
@@ -76,11 +77,6 @@ async function boot(storage: StorageAdapter = sqliteAdapter(":memory:")) {
   const vex = await Vex.create({ plugins: [plugin], storage });
   open.push(vex);
   await vex.mutate("ps.seed", {});
-  // Schema is not a mutation's to change: the view is the setup's.
-  await rawSql(
-    vex,
-    "CREATE VIEW IF NOT EXISTS key_view AS SELECT token FROM keys",
-  );
   return vex;
 }
 
@@ -94,14 +90,14 @@ describe("publishedSql", () => {
       {
         name: "docs",
         columns: {
-          _id: Type.String(),
-          ownerId: Type.String(),
-          title: Type.String(),
+          _id: { type: "string" },
+          ownerId: { type: "string" },
+          title: { type: "string" },
         },
       },
       {
         name: "notes",
-        columns: { _id: Type.String(), body: Type.String() },
+        columns: { _id: { type: "string" }, body: { type: "string" } },
       },
     ]);
   });

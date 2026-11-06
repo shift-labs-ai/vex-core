@@ -1,5 +1,5 @@
 /**
- * A raw read held to rows (`ctx.db.sql`) is held by the statement the
+ * A raw read held to rows (`sqlOver`) is held by the statement the
  * engine runs, not by the handler's word: inside it, a held table is
  * the rows its filters match and nothing else.
  */
@@ -9,8 +9,6 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { holdStatement } from "../src/core/held-read.js";
-import { rawSql } from "../src/internal.js";
-import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 afterEach(async () => {
@@ -22,18 +20,18 @@ function plugin(api: VexPluginAPI) {
   api.setName("h");
   api.registerTable("messages", {
     columns: {
-      sessionId: Type.String({ index: true }),
-      text: Type.String(),
-      at: Type.Number(),
+      sessionId: { type: "string", index: true },
+      text: { type: "string" },
+      at: { type: "number" },
     },
     indexes: [["idx_messages_sessionId_at", ["sessionId", "at"]]],
   });
-  api.registerTable("sessions", { columns: { title: Type.String() } });
+  api.registerTable("sessions", { columns: { title: { type: "string" } } });
   // Reads the whole table, held to one session: hears only that one.
   api.registerQuery("count", {
-    args: { sessionId: Type.String() },
+    args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sql(
+      ctx.db.sqlOver(
         {
           messages: [
             { column: "sessionId", operator: "=", value: args.sessionId },
@@ -44,10 +42,10 @@ function plugin(api: VexPluginAPI) {
   });
   // The sidebar's shape: a UNION ALL of per-session branches.
   api.registerQuery("latest", {
-    args: { sessionIds: Type.Unknown() },
+    args: { sessionIds: "json" },
     handler: (ctx, args) => {
       const ids = args.sessionIds as string[];
-      return ctx.db.sql(
+      return ctx.db.sqlOver(
         { messages: [{ column: "sessionId", operator: "IN", value: ids }] },
         ids
           .map(
@@ -60,9 +58,9 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("withOwnCte", {
-    args: { sessionId: Type.String() },
+    args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sql(
+      ctx.db.sqlOver(
         {
           messages: [
             { column: "sessionId", operator: "=", value: args.sessionId },
@@ -72,9 +70,9 @@ function plugin(api: VexPluginAPI) {
       ),
   });
   api.registerQuery("bypass", {
-    args: { sessionId: Type.String() },
+    args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sql(
+      ctx.db.sqlOver(
         {
           messages: [
             { column: "sessionId", operator: "=", value: args.sessionId },
@@ -85,9 +83,9 @@ function plugin(api: VexPluginAPI) {
   });
   // Held to a session's rows and to two columns of them.
   api.registerQuery("texts", {
-    args: { sessionId: Type.String() },
+    args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sql(
+      ctx.db.sqlOver(
         {
           messages: {
             where: [
@@ -100,9 +98,9 @@ function plugin(api: VexPluginAPI) {
       ),
   });
   api.registerQuery("pastColumns", {
-    args: { sessionId: Type.String() },
+    args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sql(
+      ctx.db.sqlOver(
         {
           messages: {
             where: [
@@ -115,14 +113,14 @@ function plugin(api: VexPluginAPI) {
       ),
   });
   api.registerMutation("retime", {
-    args: { id: Type.String(), at: Type.Number() },
+    args: { id: "string", at: "number" },
     handler: (ctx, args) =>
       ctx.db.table("messages").update(args.id, { at: args.at }),
   });
   api.registerQuery("twoTables", {
-    args: { sessionId: Type.String() },
+    args: { sessionId: "string" },
     handler: (ctx, args) =>
-      ctx.db.sql(
+      ctx.db.sqlOver(
         {
           messages: [
             { column: "sessionId", operator: "=", value: args.sessionId },
@@ -133,11 +131,11 @@ function plugin(api: VexPluginAPI) {
       ),
   });
   api.registerMutation("say", {
-    args: { sessionId: Type.String(), text: Type.String(), at: Type.Number() },
+    args: { sessionId: "string", text: "string", at: "number" },
     handler: (ctx, args) => ctx.db.table("messages").insert(args),
   });
   api.registerMutation("open", {
-    args: { id: Type.String(), title: Type.String() },
+    args: { id: "string", title: "string" },
     handler: (ctx, args) =>
       ctx.db.table("sessions").insert({ _id: args.id, title: args.title }),
   });
@@ -181,8 +179,7 @@ describe("a raw read held to rows", () => {
       ["a", "b"],
     );
     const plan = (
-      (await rawSql(
-        vex,
+      (await vex.unsafeSql(
         `EXPLAIN QUERY PLAN ${held.sql}`,
         ...held.params,
       )) as Array<{
@@ -214,7 +211,7 @@ describe("a raw read held to rows", () => {
   test("naming a held table under its schema is refused, in every spelling", async () => {
     const vex = await create();
     await expect(vex.query("h.bypass", { sessionId: "a" })).rejects.toThrow(
-      'ctx.db.sql cannot hold "messages"',
+      'sqlOver cannot hold "messages"',
     );
     for (const spelling of [
       "main.messages",
@@ -238,11 +235,11 @@ describe("a raw read held to rows", () => {
         [],
       );
     const upper = held("SELECT COUNT(*) AS n FROM MESSAGES");
-    expect(await rawSql(vex, upper.sql, ...upper.params)).toEqual([{ n: 2 }]);
+    expect(await vex.unsafeSql(upper.sql, ...upper.params)).toEqual([{ n: 2 }]);
     const own = held(
       "WITH messages AS (SELECT 1) SELECT COUNT(*) AS n FROM messages",
     );
-    await expect(rawSql(vex, own.sql, ...own.params)).rejects.toThrow(
+    await expect(vex.unsafeSql(own.sql, ...own.params)).rejects.toThrow(
       "duplicate WITH table name",
     );
   });
@@ -260,8 +257,7 @@ describe("a raw read held to rows", () => {
     await vex.subscribe("h.texts", { sessionId: "a" }, () => {
       runs++;
     });
-    const ids = (await rawSql(
-      vex,
+    const ids = (await vex.unsafeSql(
       "SELECT _id FROM messages WHERE sessionId = 'a'",
     )) as Array<{
       _id: string;
@@ -275,7 +271,7 @@ describe("a raw read held to rows", () => {
   test("only a read is held", () => {
     for (const sql of ["DELETE FROM messages", "VALUES (1)", ""]) {
       expect(() => holdStatement(sql, { messages: [] }, [])).toThrow(
-        "ctx.db.sql holds a read",
+        "sqlOver holds a read",
       );
     }
   });

@@ -10,7 +10,6 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
-import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 let runs = 0;
@@ -26,37 +25,29 @@ afterEach(async () => {
 function plugin(api: VexPluginAPI) {
   api.setName("c");
   api.registerTable("items", {
-    columns: { scope: Type.String({ index: true }), n: Type.Number() },
+    columns: { scope: { type: "string", index: true }, n: { type: "number" } },
   });
   api.registerQuery("sum", {
-    args: { scope: Type.String() },
+    args: { scope: "string" },
     async handler(ctx, args) {
       runs++;
       return ctx.db.table("items").where("scope", "=", args.scope).sum("n");
     },
   });
   api.registerMutation("add", {
-    args: { scope: Type.String(), n: Type.Number() },
+    args: { scope: "string", n: "number" },
     handler: (ctx, args) => ctx.db.table("items").insert(args),
   });
   api.registerMutation("set", {
-    args: { id: Type.String(), n: Type.Number() },
+    args: { id: "string", n: "number" },
     handler: (ctx, args) =>
       ctx.db.table("items").update(args.id, { n: args.n }),
   });
   api.registerJob("tick", {
     schedule: "every 1h",
     async handler(ctx) {
-      await ctx.mutate("c.add", { scope: "a", n: 100 });
+      await ctx.db.table("items").insert({ scope: "a", n: 100 });
     },
-  });
-  // A raw write: it names no rows.
-  api.registerMutation("rawAdd", {
-    args: {},
-    handler: (ctx) =>
-      ctx.db.sql(
-        "INSERT INTO items (_id, scope, n) VALUES (lower(hex(randomblob(6))), 'a', 100)",
-      ),
   });
 }
 
@@ -126,8 +117,8 @@ describe("invalidation coalescing", () => {
     const after = runs;
     await Promise.all([
       vex.mutate("c.add", { scope: "a", n: 1 }),
-      // A raw write records nothing of its rows.
-      vex.mutate("c.rawAdd"),
+      // A job records nothing of its rows.
+      vex.triggerJob("c.tick"),
     ]);
     expect(invalidations().at(-1)).toEqual(
       expect.objectContaining({ commits: 2 }),

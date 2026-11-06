@@ -26,8 +26,6 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
 import type { VexUser } from "../src/core/types.js";
-import { rawBulkInsert, rawSql } from "../src/internal.js";
-import { Type } from "../src/portable.js";
 
 let open: Vex[] = [];
 const runs = new Map<string, number>();
@@ -74,19 +72,19 @@ function plugin(api: VexPluginAPI) {
   api.setName("s");
   api.registerTable("sessions", {
     columns: {
-      title: Type.String(),
-      platform: Type.String({ index: true }),
-      n: Type.Optional(Type.Number()),
+      title: { type: "string" },
+      platform: { type: "string", index: true },
+      n: { type: "number", optional: true },
     },
   });
   api.registerTable("grants", {
     columns: {
-      userId: Type.String({ index: true }),
-      sessionId: Type.String({ index: true }),
+      userId: { type: "string", index: true },
+      sessionId: { type: "string", index: true },
     },
   });
   api.registerTable("governed", {
-    columns: { title: Type.String() },
+    columns: { title: { type: "string" } },
     access: bySessionGrant,
   });
 
@@ -95,7 +93,7 @@ function plugin(api: VexPluginAPI) {
     fn: (ctx: any, args: any) => Promise<unknown>,
   ) => {
     api.registerQuery(name, {
-      args: { arg: Type.Optional(Type.Unknown()) },
+      args: { arg: "json" },
       async handler(ctx, args) {
         runs.set(name, ran(name) + 1);
         return fn(ctx, args.arg);
@@ -150,7 +148,7 @@ function plugin(api: VexPluginAPI) {
   // A sidebar's previews: one raw statement over many sessions' rows,
   // held to those sessions.
   counted("previews", (ctx, ids: string[]) =>
-    ctx.db.sql(
+    ctx.db.sqlOver(
       { sessions: [{ column: "_id", operator: "IN", value: ids }] },
       `SELECT _id, title FROM sessions WHERE _id IN (${ids.map(() => "?").join(", ")}) ORDER BY title`,
       ...ids,
@@ -158,30 +156,26 @@ function plugin(api: VexPluginAPI) {
   );
 
   api.registerMutation("open", {
-    args: {
-      title: Type.String(),
-      platform: Type.String(),
-      n: Type.Optional(Type.Unknown()),
-    },
+    args: { title: "string", platform: "string", n: "any" },
     async handler(ctx, args) {
       return ctx.db.table("sessions").insert(args);
     },
   });
   api.registerMutation("openGoverned", {
-    args: { title: Type.String() },
+    args: { title: "string" },
     async handler(ctx, args) {
       return ctx.db.table("governed").insert(args);
     },
   });
   api.registerMutation("grant", {
-    args: { userId: Type.String(), sessionId: Type.String() },
+    args: { userId: "string", sessionId: "string" },
     async handler(ctx, args) {
       await ctx.db.table("grants").insert(args);
     },
   });
   // `conversations.touch`: one row's columns, by update.
   api.registerMutation("touch", {
-    args: { table: Type.String(), id: Type.String(), data: Type.Unknown() },
+    args: { table: "string", id: "string", data: "json" },
     async handler(ctx, args) {
       await ctx.db
         .table(args.table)
@@ -189,13 +183,13 @@ function plugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("close", {
-    args: { id: Type.String() },
+    args: { id: "string" },
     async handler(ctx, args) {
       await ctx.db.table("sessions").delete(args.id);
     },
   });
   api.registerMutation("closePlatform", {
-    args: { platform: Type.String() },
+    args: { platform: "string" },
     async handler(ctx, args) {
       await ctx.db
         .table("sessions")
@@ -205,7 +199,7 @@ function plugin(api: VexPluginAPI) {
   });
   // A limit on the chain bounds a read of it, not the delete.
   api.registerMutation("closePlatformLimited", {
-    args: { platform: Type.String() },
+    args: { platform: "string" },
     async handler(ctx, args) {
       await ctx.db
         .table("sessions")
@@ -214,20 +208,17 @@ function plugin(api: VexPluginAPI) {
         .delete();
     },
   });
-  api.registerMutation("retitle", {
-    args: { id: Type.String(), title: Type.String() },
-    handler: (ctx, args) =>
-      ctx.db.table("sessions").update(args.id, { title: args.title }),
-  });
   api.registerWebhook("ingest", {
     path: "/s/ingest",
     async handler(ctx, req) {
-      await ctx.mutate("s.retitle", { id: req.body.id, title: req.body.title });
+      await ctx.db
+        .table("sessions")
+        .update(req.body.id, { title: req.body.title });
       return { ok: true };
     },
   });
   api.registerMutation("upsertTitle", {
-    args: { title: Type.String(), platform: Type.String() },
+    args: { title: "string", platform: "string" },
     async handler(ctx, args) {
       await ctx.db
         .table("sessions")
@@ -326,7 +317,7 @@ describe("invalidation narrowing (SHFT-2537)", () => {
     const after = ran("mine");
     await vex.mutate("s.open", { title: "new", platform: "web", n: 1 });
     expect(ran("mine")).toBe(after);
-    await rawBulkInsert(vex, "sessions", [
+    await vex.unsafeBulkInsert("sessions", [
       { title: "bulk", platform: "web", n: 1 },
     ]);
     expect(ran("mine")).toBe(after);
@@ -485,8 +476,7 @@ describe("invalidation narrowing (SHFT-2537)", () => {
 
   test("a filtered delete past the recording bound still deletes every matching row", async () => {
     const vex = await create();
-    await rawBulkInsert(
-      vex,
+    await vex.unsafeBulkInsert(
       "sessions",
       Array.from({ length: 250 }, (_, i) => ({
         title: `t${i}`,
@@ -544,7 +534,7 @@ describe("invalidation narrowing (SHFT-2537)", () => {
     expect(ran("mine")).toBe(mineRuns);
   });
 
-  test("a raw read held to rows is skipped like a builder read, and traced as narrowed", async () => {
+  test("a raw read held to rows (sqlOver) is skipped like a builder read, and traced as narrowed", async () => {
     const spans: Span[] = [];
     const vex = await create({
       tracer: { onSpan: (span) => spans.push(span) },
@@ -620,8 +610,7 @@ describe("invalidation narrowing (SHFT-2537)", () => {
 
     // A filtered delete of many rows is recorded by its filter alone,
     // naming no row: every view on the table is judged.
-    await rawBulkInsert(
-      vex,
+    await vex.unsafeBulkInsert(
       "sessions",
       Array.from({ length: 250 }, (_, i) => ({
         title: `i${i}`,
@@ -643,34 +632,31 @@ describe("invalidation narrowing (SHFT-2537)", () => {
     expect(pass().judged).toBe(3);
   });
 
-  test("an update writing the value a stored affinity twin already is changes nothing", async () => {
+  test("an update writing a value's affinity twin changes nothing", async () => {
     const vex = await create();
     const id = await vex.mutate("s.open", {
       title: "a",
       platform: "web",
       n: 5,
     });
-    // Raw SQL can leave `"5"` in the number column; no schema-checked
-    // write can.
-    await rawSql(vex, "UPDATE sessions SET n = '5' WHERE _id = ?", id);
     await watch(vex, "all");
     const all = ran("all");
-    // 5 over `"5"`: to SQLite the row is as it was.
-    await vex.mutate("s.touch", { table: "sessions", id, data: { n: 5 } });
+    // `"5"` in a number column is 5: the row is as it was.
+    await vex.mutate("s.touch", { table: "sessions", id, data: { n: "5" } });
     expect(ran("all")).toBe(all);
-    await vex.mutate("s.touch", { table: "sessions", id, data: { n: 5.5 } });
+    await vex.mutate("s.touch", { table: "sessions", id, data: { n: "5.5" } });
     expect(ran("all")).toBe(all + 1);
   });
 
-  test("NULL never matches a comparison, and a matching value re-runs", async () => {
+  test("SQL affinity, not ===, decides a miss: NULL spellings and numeric text", async () => {
     const vex = await create();
     await watch(vex, "small"); // n < 10
     const small = ran("small");
-    // `n: null` is NULL: `n < 10` never matches NULL, skipped.
-    await vex.mutate("s.open", { title: "x", platform: "web", n: null });
+    // `n: undefined` is NULL: `n < 10` never matches NULL, skipped.
+    await vex.mutate("s.open", { title: "x", platform: "web", n: undefined });
     expect(ran("small")).toBe(small);
-    // 5 matches `n < 10`: re-run.
-    await vex.mutate("s.open", { title: "y", platform: "web", n: 5 });
+    // `"5"` in a REAL column is 5: it matches, re-run.
+    await vex.mutate("s.open", { title: "y", platform: "web", n: "5" });
     expect(ran("small")).toBe(small + 1);
   });
 

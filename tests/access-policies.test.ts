@@ -36,8 +36,6 @@ import { UNRESTRICTED } from "../src/core/access.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { VexUser } from "../src/core/types.js";
-import { rawSql } from "../src/internal.js";
-import { Type } from "../src/portable.js";
 
 const alice: VexUser = { id: "alice", name: "Alice", isAdmin: false };
 const bob: VexUser = { id: "bob", name: "Bob", isAdmin: false };
@@ -64,16 +62,16 @@ function docsPlugin(api: VexPluginAPI) {
   api.setName("dx");
   api.registerTable("grants", {
     columns: {
-      userId: Type.String({ index: true }),
-      docId: Type.String({ index: true }),
+      userId: { type: "string", index: true },
+      docId: { type: "string", index: true },
     },
   });
   api.registerTable("docs", {
     columns: {
-      ownerId: Type.String({ index: true }),
-      title: Type.String(),
-      kind: Type.String(),
-      score: Type.Optional(Type.Number()),
+      ownerId: { type: "string", index: true },
+      title: { type: "string" },
+      kind: { type: "string" },
+      score: { type: "number", optional: true },
     },
     access: {
       async prepare(user, db) {
@@ -103,10 +101,10 @@ function docsPlugin(api: VexPluginAPI) {
   for (const oracle of ["mirror", "mirrorAll"]) {
     api.registerTable(oracle, {
       columns: {
-        ownerId: Type.String({ index: true }),
-        title: Type.String(),
-        kind: Type.String(),
-        score: Type.Optional(Type.Number()),
+        ownerId: { type: "string", index: true },
+        title: { type: "string" },
+        kind: { type: "string" },
+        score: { type: "number", optional: true },
       },
     });
   }
@@ -114,8 +112,8 @@ function docsPlugin(api: VexPluginAPI) {
   // both must resolve two independent prepared contexts.
   api.registerTable("pets", {
     columns: {
-      ownerId: Type.String({ index: true }),
-      name: Type.String(),
+      ownerId: { type: "string", index: true },
+      name: { type: "string" },
     },
     access: {
       prepare(user) {
@@ -130,7 +128,7 @@ function docsPlugin(api: VexPluginAPI) {
   // A governed table whose policy fails — failures must reject the
   // operation, never fail open.
   api.registerTable("vault", {
-    columns: { name: Type.String() },
+    columns: { name: { type: "string" } },
     access: {
       prepare(user) {
         if (!user) return UNRESTRICTED;
@@ -145,7 +143,7 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerQuery("run", {
-    args: { op: Type.Unknown() },
+    args: { op: "json" },
     // The test drives arbitrary builder chains through one query so
     // every read path is exercised inside a real query context.
     async handler(ctx, args) {
@@ -201,7 +199,7 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerQuery("grouped", {
-    args: { table: Type.String(), spec: Type.Unknown() },
+    args: { table: "string", spec: "json" },
     async handler(ctx, args) {
       const spec = (args.spec ?? {}) as {
         columns?: string | string[];
@@ -244,10 +242,7 @@ function docsPlugin(api: VexPluginAPI) {
   api.registerQuery("rawRead", {
     args: {},
     async handler(ctx) {
-      return ctx.db.sql(
-        { docs: "all" },
-        "SELECT * FROM docs ORDER BY title ASC",
-      );
+      return ctx.db.sql("SELECT * FROM docs ORDER BY title ASC");
     },
   });
 
@@ -255,7 +250,6 @@ function docsPlugin(api: VexPluginAPI) {
     args: {},
     async handler(ctx) {
       return ctx.db.sql(
-        { grants: "all", docs: "all" },
         "SELECT g.userId FROM grants g JOIN docs d ON d._id = g.docId",
       );
     },
@@ -264,7 +258,7 @@ function docsPlugin(api: VexPluginAPI) {
   api.registerQuery("rawUngoverned", {
     args: {},
     async handler(ctx) {
-      return ctx.db.sql({ grants: "all" }, "SELECT COUNT(*) AS n FROM grants");
+      return ctx.db.sql("SELECT COUNT(*) AS n FROM grants");
     },
   });
 
@@ -280,12 +274,7 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("addDoc", {
-    args: {
-      id: Type.String(),
-      ownerId: Type.String(),
-      title: Type.String(),
-      kind: Type.String(),
-    },
+    args: { id: "string", ownerId: "string", title: "string", kind: "string" },
     async handler(ctx, args) {
       await ctx.db.table("docs").insert({
         _id: args.id,
@@ -298,7 +287,7 @@ function docsPlugin(api: VexPluginAPI) {
   });
 
   api.registerMutation("grant", {
-    args: { userId: Type.String(), docId: Type.String() },
+    args: { userId: "string", docId: "string" },
     async handler(ctx, args) {
       await ctx.db.table("grants").insert(args);
     },
@@ -346,8 +335,7 @@ async function seed(vex: Vex, total = 20): Promise<DocRow[]> {
       kind: row.kind,
     });
     if (row.score !== null) {
-      await rawSql(
-        vex,
+      await vex.unsafeSql(
         "UPDATE docs SET score = ? WHERE _id = ?",
         row.score,
         row._id,
@@ -358,8 +346,7 @@ async function seed(vex: Vex, total = 20): Promise<DocRow[]> {
     if (mine || granted) accessible.push(row);
   }
   for (const row of accessible) {
-    await rawSql(
-      vex,
+    await vex.unsafeSql(
       "INSERT INTO mirror (_id, ownerId, title, kind, score) VALUES (?, ?, ?, ?, ?)",
       `m-${row._id}`,
       row.ownerId,
@@ -368,8 +355,7 @@ async function seed(vex: Vex, total = 20): Promise<DocRow[]> {
       row.score,
     );
   }
-  await rawSql(
-    vex,
+  await vex.unsafeSql(
     "INSERT INTO mirrorAll (_id, ownerId, title, kind, score) SELECT 'a-' || _id, ownerId, title, kind, score FROM docs",
   );
   return accessible;
@@ -793,8 +779,7 @@ describe("table access policies", () => {
   test("two governed tables resolve independent prepared contexts", async () => {
     const vex = await create();
     await seed(vex, 4);
-    await rawSql(
-      vex,
+    await vex.unsafeSql(
       "INSERT INTO pets (_id, ownerId, name) VALUES ('p1','alice','rex'), ('p2','bob','tux')",
     );
     prepareCalls = 0;
@@ -815,7 +800,7 @@ describe("table access policies", () => {
 
   test("policy failures reject the operation — never fail open", async () => {
     const vex = await create();
-    await rawSql(vex, "INSERT INTO vault (_id, name) VALUES ('v1','mine')");
+    await vex.unsafeSql("INSERT INTO vault (_id, name) VALUES ('v1','mine')");
     // prepare throwing rejects the query…
     await expect(
       vex.query("dx.vaultRead", {}, { user: alice }),

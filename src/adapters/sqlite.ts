@@ -7,7 +7,7 @@ import {
   statementKind,
 } from "../core/sql-text.js";
 import type { StorageAdapter } from "../core/storage.js";
-import type { StoredTableSchema } from "../core/types.js";
+import type { TableSchema } from "../core/types.js";
 import { createQueryBuilder, type DbExec } from "./shared.js";
 import {
   bulkInsertRows,
@@ -126,9 +126,8 @@ export interface SqliteOptions {
    * Open the database to read only: another adapter owns its writes
    * and its schema. `ensureTable` registers each table's schema and
    * refuses one the database lacks; every write refuses; planner
-   * statistics are read, never gathered; reads run on its one
-   * connection. What the other adapter commits is visible to each
-   * read after it.
+   * statistics are read, never gathered. What the other adapter
+   * commits is visible to each read after it.
    */
   readonly?: boolean;
 }
@@ -243,9 +242,7 @@ export function sqliteAdapter(
       // with them.
       gatherStatistics(db);
     }
-    // The pool keeps reads off a writer's open transaction; a read-only
-    // adapter has none, so it reads on its one connection.
-    readConnections = readonly ? [] : openReadConnections(path, opts);
+    readConnections = openReadConnections(path, opts);
   } catch (error) {
     db.close();
     throw error;
@@ -367,6 +364,7 @@ export function sqliteAdapter(
   // outside any caller's transaction, so its ANALYZE commits alone.
   let statisticsDue: ReturnType<typeof setTimeout> | undefined;
   async function refreshStatistics(): Promise<void> {
+    if (readonly) return;
     try {
       const changed = await withConnectionLock(() => gatherStatistics(db));
       if (changed) {
@@ -389,17 +387,14 @@ export function sqliteAdapter(
       }, 0),
     );
   }
-  // A read-only adapter gathers none, so it keeps no timer for them.
-  const statisticsTimer = readonly
-    ? undefined
-    : transactionContext.exit(() =>
-        setInterval(
-          () => void refreshStatistics(),
-          opts?.statisticsIntervalMs ?? SQLITE_STATISTICS_INTERVAL_MS,
-        ),
-      );
+  const statisticsTimer = transactionContext.exit(() =>
+    setInterval(
+      () => void refreshStatistics(),
+      opts?.statisticsIntervalMs ?? SQLITE_STATISTICS_INTERVAL_MS,
+    ),
+  );
   // A timer of the adapter's own never keeps a process alive.
-  statisticsTimer?.unref?.();
+  statisticsTimer.unref?.();
 
   async function withConnectionLock<T>(fn: () => Promise<T> | T): Promise<T> {
     if (closed) throw closedError();
@@ -425,8 +420,7 @@ export function sqliteAdapter(
 
   // Transaction-owned reads must use the write handle to see uncommitted
   // changes. Connection-local state (TEMP tables, ATTACH, PRAGMAs) also pins
-  // reads to that handle. An in-memory database has no shareable backing
-  // file, and a read-only adapter no pool: each reads on its one handle.
+  // reads to that handle. In-memory databases have no shareable backing file.
   function readsUseWriter(): boolean {
     return (
       transactionContext.getStore()?.active === true ||
@@ -460,10 +454,6 @@ export function sqliteAdapter(
         all(
           "SELECT rootpage, tbl_name FROM sqlite_master WHERE rootpage > 0",
         ) as { rootpage: number; tbl_name: string }[],
-      views: () =>
-        all("SELECT name FROM sqlite_master WHERE type = 'view'") as {
-          name: string;
-        }[],
     };
   }
   const writerIntrospection = introspection(db);
@@ -622,7 +612,7 @@ export function sqliteAdapter(
   return {
     name: "sqlite",
 
-    ensureTable(name: string, schema: StoredTableSchema) {
+    ensureTable(name: string, schema: TableSchema) {
       if (readonly) {
         if (existingTableName(migrationDriver, name) === undefined) {
           throw new Error(
@@ -797,24 +787,6 @@ export function sqliteAdapter(
 
     readOnlyTables(sql: string) {
       return analyzeRead((on) => state.readOnlyTables(on, sql));
-    },
-
-    viewNames() {
-      return (
-        state.cachedViewNames() ?? analyzeRead((on) => state.viewNames(on))
-      );
-    },
-
-    reader() {
-      if (isMemoryDatabase(path)) return null;
-      return {
-        adapter: "sqlite" as const,
-        path,
-        ...(opts?.busyTimeout !== undefined
-          ? { busyTimeout: opts.busyTimeout }
-          : {}),
-        ...(opts?.cacheSize !== undefined ? { cacheSize: opts.cacheSize } : {}),
-      };
     },
 
     getSchema(table: string) {

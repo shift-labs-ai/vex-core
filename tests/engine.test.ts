@@ -7,22 +7,20 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span, Tracer } from "../src/core/tracer.js";
 import type { MiddlewareInfo, MutationContext } from "../src/core/types.js";
-import { rawSql } from "../src/internal.js";
-import { Type } from "../src/portable.js";
 
 // Inline KV plugin for testing (replaces app-specific plugin imports)
 function kvPlugin(api: VexPluginAPI) {
   api.setName("kv");
   api.registerTable("kv", {
     columns: {
-      scope: Type.String({ index: true }),
-      key: Type.String(),
-      value: Type.Unknown(),
+      scope: { type: "string", index: true },
+      key: { type: "string" },
+      value: { type: "json" },
     },
     unique: [["scope", "key"]],
   });
   api.registerQuery("get", {
-    args: { scope: Type.String(), key: Type.String() },
+    args: { scope: "string", key: "string" },
     async handler(ctx, args) {
       const row = await ctx.db
         .table("kv")
@@ -33,7 +31,7 @@ function kvPlugin(api: VexPluginAPI) {
     },
   });
   api.registerQuery("getAll", {
-    args: { scope: Type.String() },
+    args: { scope: "string" },
     async handler(ctx, args) {
       const rows = await ctx.db
         .table("kv")
@@ -45,11 +43,7 @@ function kvPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("set", {
-    args: {
-      scope: Type.String(),
-      key: Type.String(),
-      value: Type.Optional(Type.Unknown()),
-    },
+    args: { scope: "string", key: "string", value: "any" },
     async handler(ctx, args) {
       await ctx.db
         .table("kv")
@@ -57,7 +51,7 @@ function kvPlugin(api: VexPluginAPI) {
     },
   });
   api.registerMutation("delete", {
-    args: { scope: Type.String(), key: Type.String() },
+    args: { scope: "string", key: "string" },
     async handler(ctx, args) {
       const row = await ctx.db
         .table("kv")
@@ -171,7 +165,7 @@ describe("subscriptions", () => {
         (api: VexPluginAPI) => {
           api.setName("secure");
           api.registerTable("events", {
-            columns: { value: Type.String() },
+            columns: { value: { type: "string" } },
           });
           api.registerQuery("viewer", {
             args: {},
@@ -182,7 +176,7 @@ describe("subscriptions", () => {
             },
           });
           api.registerMutation("touch", {
-            args: { value: Type.String() },
+            args: { value: "string" },
             async handler(ctx, args) {
               await ctx.db.table("events").insert({ value: args.value });
             },
@@ -219,17 +213,13 @@ describe("mutation context chaining", () => {
           api.setName("t");
           api.registerTable("items", {
             columns: {
-              category: Type.String(),
-              status: Type.String(),
-              name: Type.String(),
+              category: { type: "string" },
+              status: { type: "string" },
+              name: { type: "string" },
             },
           });
           api.registerMutation("add", {
-            args: {
-              category: Type.String(),
-              status: Type.String(),
-              name: Type.String(),
-            },
+            args: { category: "string", status: "string", name: "string" },
             async handler(ctx, args) {
               await ctx.db.table("items").insert({
                 category: args.category,
@@ -239,7 +229,7 @@ describe("mutation context chaining", () => {
             },
           });
           api.registerMutation("findAndDelete", {
-            args: { category: Type.String(), status: Type.String() },
+            args: { category: "string", status: "string" },
             async handler(ctx, args) {
               const row = await ctx.db
                 .table("items")
@@ -299,12 +289,12 @@ describe("custom plugin", () => {
           api.setName("todo");
           api.registerTable("todos", {
             columns: {
-              text: Type.String(),
-              done: Type.Boolean(),
+              text: { type: "string" },
+              done: { type: "boolean" },
             },
           });
           api.registerMutation("add", {
-            args: { text: Type.String() },
+            args: { text: "string" },
             async handler(ctx, args) {
               return ctx.db
                 .table("todos")
@@ -340,19 +330,15 @@ describe("webhooks", () => {
         (api: VexPluginAPI) => {
           api.setName("billing");
           api.registerTable("payments", {
-            columns: { amount: Type.Number(), status: Type.String() },
-          });
-          api.registerMutation("paid", {
-            args: { amount: Type.Number() },
-            handler: (ctx, args) =>
-              ctx.db
-                .table("payments")
-                .insert({ amount: args.amount, status: "paid" }),
+            columns: { amount: { type: "number" }, status: { type: "string" } },
           });
           api.registerWebhook("stripePayment", {
             path: "/stripe",
             async handler(ctx, req) {
-              await ctx.mutate("billing.paid", { amount: req.body.amount });
+              await ctx.db.table("payments").insert({
+                amount: req.body.amount,
+                status: "paid",
+              });
               return { received: true };
             },
           });
@@ -372,7 +358,7 @@ describe("webhooks", () => {
     expect(result.status).toBe(200);
     expect(result.body.received).toBe(true);
 
-    const payments = await rawSql(wvex, "SELECT * FROM payments");
+    const payments = await wvex.unsafeSql("SELECT * FROM payments");
     expect(payments).toHaveLength(1);
     expect(payments[0].amount).toBe(99);
 
@@ -581,7 +567,7 @@ describe("middleware", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("test");
-          api.registerTable("items", { columns: { name: Type.String() } });
+          api.registerTable("items", { columns: { name: { type: "string" } } });
           api.registerQuery("list", {
             args: {},
             handler: async (ctx) => ctx.db.table("items").all(),
@@ -609,9 +595,9 @@ describe("middleware", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("test");
-          api.registerTable("items", { columns: { name: Type.String() } });
+          api.registerTable("items", { columns: { name: { type: "string" } } });
           api.registerMutation("add", {
-            args: { name: Type.String() },
+            args: { name: "string" },
             handler: async (ctx, args) =>
               ctx.db.table("items").insert({ name: args.name }),
           });
@@ -640,7 +626,7 @@ describe("plugin name collisions", () => {
           (api: VexPluginAPI) => {
             api.setName("items");
             api.registerTable("items", {
-              columns: { name: Type.String() },
+              columns: { name: { type: "string" } },
             });
             api.registerQuery("list", {
               args: {},
@@ -667,10 +653,10 @@ describe("plugin name collisions", () => {
           (api: VexPluginAPI) => {
             api.setName("items");
             api.registerTable("items", {
-              columns: { name: Type.String() },
+              columns: { name: { type: "string" } },
             });
             api.registerMutation("add", {
-              args: { name: Type.String() },
+              args: { name: "string" },
               handler: async (ctx, args) =>
                 ctx.db.table("items").insert({ name: args.name }),
             });
@@ -678,7 +664,7 @@ describe("plugin name collisions", () => {
           (api: VexPluginAPI) => {
             api.setName("items");
             api.registerMutation("add", {
-              args: { name: Type.String() },
+              args: { name: "string" },
               handler: async (ctx, args) =>
                 ctx.db.table("items").insert({ name: args.name }),
             });
@@ -696,13 +682,13 @@ describe("plugin name collisions", () => {
           (api: VexPluginAPI) => {
             api.setName("a");
             api.registerTable("runs", {
-              columns: { name: Type.String() },
+              columns: { name: { type: "string" } },
             });
           },
           (api: VexPluginAPI) => {
             api.setName("b");
             api.registerTable("runs", {
-              columns: { other: Type.String() },
+              columns: { other: { type: "string" } },
             });
           },
         ],
@@ -718,7 +704,7 @@ describe("plugin name collisions", () => {
         api.setName(name);
         api.registerTable(table, {
           renamedFrom,
-          columns: { name: Type.String() },
+          columns: { name: { type: "string" } },
         });
       };
     const create = (...plugins: Array<(api: VexPluginAPI) => void>) =>
@@ -765,7 +751,7 @@ describe("plugin name collisions", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("users");
-          api.registerTable("users", { columns: { name: Type.String() } });
+          api.registerTable("users", { columns: { name: { type: "string" } } });
           api.registerQuery("list", {
             args: {},
             handler: async (ctx) => ctx.db.table("users").all(),
@@ -774,7 +760,7 @@ describe("plugin name collisions", () => {
         (api: VexPluginAPI) => {
           api.setName("posts");
           api.registerTable("posts", {
-            columns: { title: Type.String() },
+            columns: { title: { type: "string" } },
           });
           api.registerQuery("list", {
             args: {},
@@ -894,8 +880,7 @@ describe("jobs", () => {
     expect(active).toBe(0);
     expect(maxActive).toBe(1);
 
-    const [job] = await rawSql<any>(
-      jvex,
+    const [job] = await jvex.unsafeSql<any>(
       "SELECT runs, lastStatus, lastError FROM _jobs WHERE name = ?",
       "timeout.tick",
     );
@@ -976,8 +961,7 @@ describe("jobs", () => {
     expect(active).toBe(0);
     expect(maxActive).toBe(1);
 
-    const [job] = await rawSql<any>(
-      jvex,
+    const [job] = await jvex.unsafeSql<any>(
       "SELECT runs, lastStatus, lastError FROM _jobs WHERE name = ?",
       "retrying.tick",
     );
@@ -1034,18 +1018,12 @@ describe("jobs", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("shutdown");
-          api.registerTable("marks", { columns: { at: Type.Number() } });
-          api.registerQuery("count", {
-            args: {},
-            handler: (ctx) => ctx.db.table("marks").count(),
-          });
           api.registerJob("tick", {
             schedule: "every 1h",
             async handler(ctx) {
               active += 1;
               await new Promise((resolve) => setTimeout(resolve, 100));
-              // Storage is still open for a job close() waits on.
-              await ctx.query("shutdown.count");
+              await ctx.db.table("_jobs").count();
               active -= 1;
               completed = true;
             },
@@ -1118,7 +1096,10 @@ describe("jobs", () => {
         storage: sqliteAdapter(path),
         plugins: [counter({ count: 0 })],
       });
-      await rawSql(first, "UPDATE _jobs SET nextRun = ?", Date.now() - 60_000);
+      await first.unsafeSql(
+        "UPDATE _jobs SET nextRun = ?",
+        Date.now() - 60_000,
+      );
       await first.close();
 
       const runs = { count: 0 };
@@ -1182,7 +1163,8 @@ describe("jobs", () => {
 });
 
 describe("trace metadata", () => {
-  test("a query's answer is checked as JSON whether or not a trace records", async () => {
+  test("does not serialize query results when no trace is recording", async () => {
+    let serializations = 0;
     const tracers: Array<Tracer | undefined> = [
       undefined,
       { shouldRecord: () => false, onSpan: () => {} },
@@ -1197,17 +1179,22 @@ describe("trace metadata", () => {
             api.setName("sampled");
             api.registerQuery("result", {
               args: {},
-              handler: () => new Map([["ok", true]]),
+              handler: () => ({
+                toJSON() {
+                  serializations++;
+                  return { ok: true };
+                },
+              }),
             });
           },
         ],
       });
 
-      await expect(tvex.query("sampled.result")).rejects.toThrow(
-        "query sampled.result answers holds a Map",
-      );
+      await tvex.query("sampled.result");
       await tvex.close();
     }
+
+    expect(serializations).toBe(0);
   });
 
   test("emits safe metadata for every query and write shape", async () => {
@@ -1220,12 +1207,12 @@ describe("trace metadata", () => {
           api.setName("safe");
           api.registerTable("documents", {
             columns: {
-              workspaceId: Type.String(),
-              content: Type.String(),
+              workspaceId: { type: "string" },
+              content: { type: "string" },
             },
           });
           api.registerQuery("read", {
-            args: { workspaceId: Type.String() },
+            args: { workspaceId: "string" },
             handler: (ctx, args) =>
               ctx.db
                 .table("documents")
@@ -1233,11 +1220,11 @@ describe("trace metadata", () => {
                 .all(),
           });
           api.registerMutation("insert", {
-            args: { workspaceId: Type.String(), content: Type.String() },
+            args: { workspaceId: "string", content: "string" },
             handler: (ctx, args) => ctx.db.table("documents").insert(args),
           });
           api.registerMutation("upsert", {
-            args: { workspaceId: Type.String(), content: Type.String() },
+            args: { workspaceId: "string", content: "string" },
             handler: (ctx, args) =>
               ctx.db
                 .table("documents")
@@ -1247,18 +1234,18 @@ describe("trace metadata", () => {
                 ),
           });
           api.registerMutation("update", {
-            args: { id: Type.String(), content: Type.String() },
+            args: { id: "string", content: "string" },
             handler: (ctx, args) =>
               ctx.db
                 .table("documents")
                 .update(args.id, { content: args.content }),
           });
           api.registerMutation("delete", {
-            args: { id: Type.String() },
+            args: { id: "string" },
             handler: (ctx, args) => ctx.db.table("documents").delete(args.id),
           });
           api.registerMutation("rawDelete", {
-            args: { workspaceId: Type.String() },
+            args: { workspaceId: "string" },
             handler: (ctx, args) =>
               ctx.db.sql(
                 "DELETE FROM documents WHERE workspaceId = ?",
@@ -1327,7 +1314,7 @@ describe("trace metadata", () => {
     await tvex.close();
   });
 
-  test("traced queries measure undefined results; a cyclic one is refused", async () => {
+  test("traced queries measure undefined and cyclic results safely", async () => {
     const spans: Span[] = [];
     const tvex = await Vex.create({
       storage: sqliteAdapter(":memory:"),
@@ -1354,9 +1341,7 @@ describe("trace metadata", () => {
     });
 
     await tvex.query("edge.nothing");
-    await expect(tvex.query("edge.cyclic")).rejects.toThrow(
-      "query edge.cyclic answers holds a cycle",
-    );
+    await tvex.query("edge.cyclic");
 
     const metaFor = (name: string) => {
       const span = spans.find(
@@ -1370,6 +1355,8 @@ describe("trace metadata", () => {
     expect(metaFor("edge.nothing").resultBytes).toBe(
       Buffer.byteLength("undefined"),
     );
+    // Cyclic results cannot be measured; the span still records cleanly.
+    expect(metaFor("edge.cyclic").resultBytes).toBeUndefined();
 
     await tvex.close();
   });
@@ -1417,13 +1404,13 @@ describe("trace metadata", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("echo");
-          api.registerTable("items", { columns: { text: Type.String() } });
+          api.registerTable("items", { columns: { text: { type: "string" } } });
           api.registerQuery("get", {
-            args: { text: Type.String(), token: Type.String() },
+            args: { text: "string", token: "string" },
             handler: async (_ctx, args) => args.text.length,
           });
           api.registerMutation("big", {
-            args: { text: Type.String(), token: Type.String() },
+            args: { text: "string", token: "string" },
             handler: async (_ctx, args) => args.text.length,
           });
           api.registerWebhook("hook", {
@@ -1470,8 +1457,7 @@ describe("handler timeout", () => {
           api.registerQuery("hang", {
             args: {},
             async handler() {
-              // Waits on what never comes: no timer of its own.
-              await new Promise(() => {});
+              await new Promise((r) => setTimeout(r, 500));
               return "done";
             },
           });
@@ -1518,9 +1504,9 @@ describe("writes by row id", () => {
       plugins: [
         (api: VexPluginAPI) => {
           api.setName("del");
-          api.registerTable("rows", { columns: { name: Type.String() } });
+          api.registerTable("rows", { columns: { name: { type: "string" } } });
           api.registerMutation("deleteRead", {
-            args: { name: Type.String() },
+            args: { name: "string" },
             async handler(ctx, args) {
               const row = await ctx.db
                 .table("rows")
@@ -1530,12 +1516,12 @@ describe("writes by row id", () => {
             },
           });
           api.registerMutation("deleteMatching", {
-            args: { name: Type.String() },
+            args: { name: "string" },
             handler: (ctx, args) =>
               ctx.db.table("rows").where("name", "=", args.name).delete(),
           });
           api.registerMutation("renameRead", {
-            args: { name: Type.String(), to: Type.String() },
+            args: { name: "string", to: "string" },
             async handler(ctx, args) {
               const row = await ctx.db
                 .table("rows")
@@ -1550,15 +1536,14 @@ describe("writes by row id", () => {
       ],
       storage: sqliteAdapter(":memory:"),
     });
-    await rawSql(
-      vex,
+    await vex.unsafeSql(
       "INSERT INTO rows (_id, name) VALUES (NULL, 'nameless'), ('a1', 'keep'), ('b2', 'gone')",
     );
     return vex;
   }
   const names = async (vex: Vex) =>
     (
-      (await rawSql(vex, "SELECT name FROM rows ORDER BY name")) as Array<{
+      (await vex.unsafeSql("SELECT name FROM rows ORDER BY name")) as Array<{
         name: string;
       }>
     ).map((r) => r.name);

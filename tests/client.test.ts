@@ -13,7 +13,6 @@ import {
   vexHandler,
   vexWebSocket,
 } from "../src/http/index.js";
-import { Type } from "../src/portable.js";
 
 /** What the `items.refused` query throws: a refusal with a code. */
 const REFUSAL = {
@@ -34,16 +33,14 @@ beforeAll(async () => {
     plugins: [
       {
         name: "items",
-        tables: {
-          items: { columns: { name: Type.String(), value: Type.Number() } },
-        },
+        tables: { items: { columns: { name: "string", value: "number" } } },
         queries: {
           list: {
             args: {},
             handler: async (ctx) => ctx.db.table("items").all(),
           },
           byName: {
-            args: { name: Type.String() },
+            args: { name: "string" },
             handler: async (ctx, args) =>
               ctx.db.table("items").where("name", "=", args.name).all(),
           },
@@ -73,7 +70,7 @@ beforeAll(async () => {
         },
         mutations: {
           create: {
-            args: { name: Type.String(), value: Type.Number() },
+            args: { name: "string", value: "number" },
             handler: async (ctx, args) => ctx.db.table("items").insert(args),
           },
         },
@@ -81,7 +78,7 @@ beforeAll(async () => {
           // Writes through a mutation, then reads through a query, as
           // its caller: the answer names who it ran as.
           tally: {
-            args: { name: Type.String() },
+            args: { name: "string" },
             handler: async (ctx, args) => {
               await ctx.mutate("items.create", { name: args.name, value: 1 });
               const rows = await ctx.query("items.byName", { name: args.name });
@@ -949,66 +946,6 @@ function idleKillingProxy(
     },
   };
 }
-
-describe("WebSocket subscription end", () => {
-  test("a view that outgrows its budget ends on the client too, with the reason", async () => {
-    const { VexClient } = await import("../src/client/client.js");
-    const own = await Vex.create({
-      storage: sqliteAdapter(":memory:"),
-      plugins: [
-        {
-          name: "b",
-          tables: { rows: { columns: { v: Type.Number() } } },
-          queries: {
-            small: {
-              args: {},
-              reactive: { maxRows: 1, maxBytes: 100_000 },
-              handler: async (ctx) => ctx.db.table("rows").all(),
-            },
-          },
-          mutations: {
-            add: {
-              args: { v: Type.Number() },
-              handler: async (ctx, args) => ctx.db.table("rows").insert(args),
-            },
-          },
-        },
-      ],
-    });
-    const handlers = vexWebSocket(own, {});
-    const srv = Bun.serve({
-      port: 0,
-      fetch: (req, s) => handlers.upgrade(req, s),
-      websocket: {
-        open: handlers.open as any,
-        message: handlers.message as any,
-        close: handlers.close as any,
-      },
-    });
-    const client = new VexClient({ basePath: `http://localhost:${srv.port}` });
-    try {
-      let heard!: () => void;
-      let ended!: (error: Error) => void;
-      const first = new Promise<void>((resolve) => {
-        heard = resolve;
-      });
-      const end = new Promise<Error>((resolve) => {
-        ended = resolve;
-      });
-      client.subscribe("b.small", {}, () => heard(), ended);
-      await first;
-      await own.mutate("b.add", { v: 1 });
-      await own.mutate("b.add", { v: 2 });
-      const error = await end;
-      expect(error.message).toContain("budget exceeded");
-      expect(own.activeSubscriptionCount()).toBe(0);
-    } finally {
-      client.close();
-      srv.stop(true);
-      await own.close();
-    }
-  });
-});
 
 describe("WebSocket heartbeat", () => {
   test("an idle client survives an ingress idle timeout", async () => {

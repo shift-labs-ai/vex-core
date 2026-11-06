@@ -21,7 +21,7 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import { Vex } from "../src/core/engine.js";
 import type { Span } from "../src/core/tracer.js";
 import type { VexUser } from "../src/core/types.js";
-import { rawBulkInsert } from "../src/internal.js";
+import { benchmarkPlugin } from "./invalidation-plugin.js";
 
 const PLAYERS = (process.env.BENCH_PLAYERS ?? "1000,5000,20000")
   .split(",")
@@ -32,11 +32,6 @@ const CONVERSATIONS = 3;
 const BURST = Number(process.env.BENCH_BURST ?? 50);
 const SECONDS = Number(process.env.BENCH_SECONDS ?? 5);
 const WORKERS = Number(process.env.BENCH_WORKERS ?? 0);
-/** The run time past which a read goes to the pool; the engine's default unless set. */
-const OFFLOAD_MS =
-  process.env.BENCH_OFFLOAD_MS === undefined
-    ? undefined
-    : Number(process.env.BENCH_OFFLOAD_MS);
 
 function percentile(sorted: number[], fraction: number): number {
   return (
@@ -52,7 +47,7 @@ async function tier(players: number) {
   const path = join(dir, "scale.db");
   const passes: Array<{ duration: number; reEvaluated: number }> = [];
   const vex = await Vex.create({
-    plugins: [new URL("./invalidation-plugin.ts", import.meta.url)],
+    plugins: [benchmarkPlugin],
     storage: sqliteAdapter(path),
     reactive: { maxRows: 10_000, maxBytes: 16 * 1024 * 1024 },
     tracer: {
@@ -69,7 +64,8 @@ async function tier(players: number) {
       ? {
           evaluation: {
             workers: WORKERS,
-            ...(OFFLOAD_MS !== undefined ? { offloadAboveMs: OFFLOAD_MS } : {}),
+            module: new URL("./invalidation-setup.ts", import.meta.url),
+            setup: { path },
           },
         }
       : {}),
@@ -97,8 +93,8 @@ async function tier(players: number) {
       }
       ids.push(mine);
     }
-    await rawBulkInsert(vex, "sessions", sessions);
-    await rawBulkInsert(vex, "grants", grants);
+    await vex.unsafeBulkInsert("sessions", sessions);
+    await vex.unsafeBulkInsert("grants", grants);
     const seedMs = performance.now() - seedStart;
 
     // Open every player's views.

@@ -26,11 +26,12 @@ import type { Span } from "../src/core/tracer.js";
 import type { Filter, VexUser } from "../src/core/types.js";
 import {
   COLUMNS,
+  equivalencePlugin,
   type Spec,
   type Terminal,
 } from "./fixtures/equivalence-plugin.js";
 
-const PLUGIN = new URL("./fixtures/equivalence-plugin.ts", import.meta.url);
+const SETUP = new URL("./fixtures/equivalence-setup.ts", import.meta.url);
 const SEEDS = Number(process.env.EQ_SEEDS ?? 8);
 const MODES = ["memory", "file", "workers"] as const;
 type Mode = (typeof MODES)[number];
@@ -55,19 +56,11 @@ const VALUES: Record<string, unknown[]> = {
   k: ["x", "y", "z"],
   version: [0, 1, 5],
 };
-// What a mutation may write: each column's own type (a table's schema
-// refuses the rest), or nothing.
 const WRITE_VALUES: Record<string, unknown[]> = {
   ...VALUES,
-  n: [...VALUES.n, undefined],
-  s: [...VALUES.s, undefined],
-};
-// What raw SQL may leave in a column besides: each value's affinity
-// twin, which reads as the same value to SQLite and not to `===`.
-const TWINS: Record<string, unknown[]> = {
-  n: ["5", "5.0", null],
-  s: [5, null],
-  b: [1, 0, null],
+  n: [...VALUES.n, "5", "5.0", undefined],
+  s: [...VALUES.s, 5, undefined],
+  b: [...VALUES.b, 1, 0],
 };
 const OPERATORS: Filter["operator"][] = ["=", "!=", "IN", "<", ">", "<=", ">="];
 const TERMINALS: Terminal[] = [
@@ -177,22 +170,15 @@ afterEach(async () => {
   dirs = [];
 });
 
-// EQ_PURITY=1: every run repeated on the same data, and every group a
-// write skipped run again and compared: the engine's narrowing and
-// each query's purity checked at once. Runs double, so the waste
-// bound does not apply.
-const PURITY = process.env.EQ_PURITY === "1";
-
 async function create(mode: Mode) {
   const dir = mkdtempSync(join(tmpdir(), "vex-eq-"));
   dirs.push(dir);
   const path = mode === "memory" ? ":memory:" : join(dir, "db.sqlite");
   const passes: Array<{ groups: number }> = [];
   const vex = await Vex.create({
-    plugins: [PLUGIN],
+    plugins: [equivalencePlugin],
     storage: sqliteAdapter(path),
     reactive: { maxRows: 1000, maxBytes: 1024 * 1024 },
-    purityCheck: PURITY ? "always" : "off",
     tracer: {
       onSpan(span: Span) {
         if (span.type === "invalidation" && span.meta) {
@@ -201,7 +187,7 @@ async function create(mode: Mode) {
       },
     },
     ...(mode === "workers"
-      ? { evaluation: { workers: 2, offloadAboveMs: 0 } }
+      ? { evaluation: { workers: 2, module: SETUP, setup: { path } } }
       : {}),
   });
   engines.push(vex);
@@ -248,8 +234,6 @@ async function run(mode: Mode, seed: number) {
   await vex.mutate("eq.grant", { userId: "alice", itemId: gids[1] });
 
   const watches: Watch[] = [];
-  // Views that ended: under EQ_PURITY, a check that failed.
-  const endings: string[] = [];
   for (let i = 0; i < 12; i++) {
     const s = spec(random, ids);
     const w: Watch = {
@@ -262,12 +246,7 @@ async function run(mode: Mode, seed: number) {
       { spec: s },
       (result: { data: unknown; version: number | null }) =>
         w.deliveries.push({ ...result, count: rowCount(result.data) }),
-      {
-        ...(w.user ? { user: w.user } : {}),
-        onError: (error: Error, ended: boolean) => {
-          if (ended) endings.push(error.message);
-        },
-      },
+      w.user ? { user: w.user } : undefined,
     );
     watches.push(w);
   }
@@ -313,13 +292,7 @@ async function run(mode: Mode, seed: number) {
         filters: [filter(random, pool)],
       });
     if (roll < 0.8)
-      return vex.mutate("eq.rawInsert", {
-        table,
-        k: pick(random, VALUES.k),
-        s: pick(random, TWINS.s),
-        n: pick(random, TWINS.n),
-        b: pick(random, TWINS.b),
-      });
+      return vex.mutate("eq.rawInsert", { table, k: pick(random, VALUES.k) });
     if (roll < 0.86)
       return vex.mutate("eq.rawUpdate", {
         table,
@@ -376,10 +349,6 @@ async function run(mode: Mode, seed: number) {
     // (a first row is a window of one): only an unwindowed read's
     // falls on a delete alone.
     if (w.spec.limit !== undefined || w.spec.terminal === "first") continue;
-    // On the governed table a grant shows a row at the version it has
-    // and a revoke hides one: what a caller sees can fall in version
-    // with no write. Only an ungoverned read's rows arrive by writes.
-    if (w.spec.table === "g") continue;
     for (let i = 1; i < w.deliveries.length; i++) {
       const prev = w.deliveries[i - 1];
       const cur = w.deliveries[i];
@@ -395,7 +364,6 @@ async function run(mode: Mode, seed: number) {
       }
     }
   }
-  expect(endings).toEqual([]);
   return { changed, spent };
 }
 
@@ -417,7 +385,7 @@ describe("equivalence under every read shape and write kind", () => {
       console.log(
         `${mode}: ${spent} group runs for ${changed} changed results (${wasted} beyond)`,
       );
-      if (!PURITY) expect(wasted).toBeLessThanOrEqual(changed * 1.5);
+      expect(wasted).toBeLessThanOrEqual(changed * 1.5);
     }, 120_000);
   }
 });

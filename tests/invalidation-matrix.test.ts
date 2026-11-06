@@ -32,8 +32,6 @@ import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import { filterExcludes } from "../src/core/invalidation.js";
 import type { ColumnType, Filter } from "../src/core/types.js";
-import { rawBulkInsert } from "../src/internal.js";
-import { Type } from "../src/portable.js";
 
 const REPORT = process.env.MATRIX_REPORT;
 const sections: string[] = [];
@@ -276,17 +274,14 @@ const SHAPES: Record<string, Shape> = {
     u: await ctx.db.table("u").order("name", "asc").all(),
   }),
   "raw SELECT scope = a": (ctx) =>
-    ctx.db.sql(
-      { t: "all" },
-      "SELECT name FROM t WHERE scope = 'a' ORDER BY name",
-    ),
-  "held scope IN [a,b]": (ctx) =>
-    ctx.db.sql(
+    ctx.db.sql("SELECT name FROM t WHERE scope = 'a' ORDER BY name"),
+  "sqlOver scope IN [a,b]": (ctx) =>
+    ctx.db.sqlOver(
       { t: [{ column: "scope", operator: "IN", value: ["a", "b"] }] },
       "SELECT scope, COUNT(*) AS n FROM t GROUP BY scope ORDER BY scope",
     ),
-  "held _id = A1 (UNION ALL)": (ctx, ids) =>
-    ctx.db.sql(
+  "sqlOver _id = A1 (UNION ALL)": (ctx, ids) =>
+    ctx.db.sqlOver(
       { t: [{ column: "_id", operator: "=", value: ids.A1 }] },
       "SELECT name FROM t UNION ALL SELECT name FROM t WHERE n > 0",
     ),
@@ -409,9 +404,8 @@ const WRITES: Record<string, Write> = {
     await ctx.db.table("t").update(ids.A1, { kind: "k4" });
   },
   "read only (no write)": (ctx) => ctx.db.table("t").count(),
-  // A text twin in a number column: only raw SQL can write one.
-  "raw update A1 n -> '5' (text twin)": (ctx, ids) =>
-    ctx.db.sql("UPDATE t SET n = '5' WHERE _id = ?", ids.A1),
+  "update A1 n -> '5' (text twin)": (ctx, ids) =>
+    ctx.db.table("t").update(ids.A1, { n: "5" }),
   "update missing id": (ctx) => ctx.db.table("t").update("nope", { kind: "x" }),
   "delete missing id": (ctx) => ctx.db.table("t").delete("nope"),
   "upsert keys{scope a,kind k} data{kind q} (key changes)": (ctx) =>
@@ -448,12 +442,12 @@ const WRITES: Record<string, Write> = {
 
 /** Bulk inserts go through the engine, not a mutation context. */
 const BULK: Record<string, (vex: Vex) => Promise<unknown>> = {
-  "rawBulkInsert scope c": (vex) =>
-    rawBulkInsert(vex, "t", [
+  "unsafeBulkInsert scope c": (vex) =>
+    vex.unsafeBulkInsert("t", [
       { scope: "c", kind: "z", name: "c3", n: 100, flag: false },
     ]),
-  "rawBulkInsert scope a": (vex) =>
-    rawBulkInsert(vex, "t", [
+  "unsafeBulkInsert scope a": (vex) =>
+    vex.unsafeBulkInsert("t", [
       { scope: "a", kind: "k", name: "a8", n: 1, flag: false },
     ]),
 };
@@ -464,16 +458,16 @@ function matrixPlugin(api: VexPluginAPI) {
   api.setName("m");
   api.registerTable("t", {
     columns: {
-      scope: Type.String({ index: true }),
-      kind: Type.String({ index: true }),
-      name: Type.String(),
-      n: Type.Optional(Type.Number()),
-      flag: Type.Optional(Type.Boolean()),
+      scope: { type: "string", index: true },
+      kind: { type: "string", index: true },
+      name: { type: "string" },
+      n: { type: "number", optional: true },
+      flag: { type: "boolean", optional: true },
     },
   });
-  api.registerTable("u", { columns: { name: Type.String() } });
+  api.registerTable("u", { columns: { name: { type: "string" } } });
   api.registerTable("g", {
-    columns: { title: Type.String() },
+    columns: { title: { type: "string" } },
     access: {
       async prepare(user, db) {
         if (!user) return UNRESTRICTED;
@@ -492,19 +486,19 @@ function matrixPlugin(api: VexPluginAPI) {
   });
   api.registerTable("grants", {
     columns: {
-      userId: Type.String({ index: true }),
-      itemId: Type.String({ index: true }),
+      userId: { type: "string", index: true },
+      itemId: { type: "string", index: true },
     },
   });
   api.registerQuery("q", {
-    args: { shape: Type.String(), ids: Type.Unknown() },
+    args: { shape: "string", ids: "json" },
     async handler(ctx, args) {
       runs.set(args.shape, (runs.get(args.shape) ?? 0) + 1);
       return SHAPES[args.shape](ctx, args.ids as Ids);
     },
   });
   api.registerMutation("w", {
-    args: { write: Type.String(), ids: Type.Unknown() },
+    args: { write: "string", ids: "json" },
     async handler(ctx, args) {
       await WRITES[args.write](ctx, args.ids as Ids);
     },

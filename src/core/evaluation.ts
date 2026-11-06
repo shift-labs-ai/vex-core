@@ -1,38 +1,42 @@
-import { HttpError, isHttpError } from "../http/error.js";
-import type { StorageReader } from "./storage.js";
+import type { PluginFunction } from "./api.js";
+import type { StorageAdapter } from "./storage.js";
 import type { QueryDependency } from "./trace-metadata.js";
-import type { ReactiveBudget, VexEnv, VexUser } from "./types.js";
+import type { PluginDef, ReactiveBudget, VexUser } from "./types.js";
 
 /**
- * Reads off the main thread.
+ * Subscription evaluation off the main thread.
  *
  * A pool of workers, each running a read-only engine over the same
- * database, built from the app's own plugins (each given by module,
- * `PluginModule`), its `env` and the storage's `reader()`, runs a
- * query and answers with its result, measured, and the tables and
- * dependencies the run recorded. The main thread keeps everything
- * else: which subscriptions a write affects, their runs' single
- * flight, delivery, writes, actions.
+ * database with the same plugins, runs a subscription's query and
+ * answers with its result, measured, and the tables and dependencies
+ * the run recorded. The main thread keeps everything else: which
+ * subscriptions a write affects, their runs' single flight, delivery.
  *
- * A run's answer crosses back as a copy, which costs the main thread;
- * a run cheaper than its copy is cheaper on the main thread. So the
- * pool takes a query's runs, subscriptions' and one-shot calls'
- * alike, once they cost more than `offloadAboveMs`, and hands them
- * back once they cost under half of it. A run is timed in a worker,
- * where it runs alone: a query's first run, and one in 32 of a query
- * kept on the main thread, go to a worker that is idle, to time it.
+ * The module `EvaluationOptions.module` names is imported by each
+ * worker; its default export builds what a worker's engine needs,
+ * from `EvaluationOptions.setup`:
+ *
+ *   export default ({ path }): EvaluationSetup => ({
+ *     plugins: [...],
+ *     storage: sqliteAdapter(path, { readonly: true }),
+ *   });
  */
 export interface EvaluationOptions {
-  /** How many workers read; none reads on the main thread. */
+  /** How many workers evaluate; none evaluates on the main thread. */
   workers: number;
-  /**
-   * The run time, in ms, past which a query's runs go to the pool
-   * (2 unless set); 0 sends every run.
-   */
-  offloadAboveMs?: number;
+  /** The module whose default export is an `EvaluationSetup` factory. */
+  module: string | URL;
+  /** What the factory is called with; it crosses to each worker. */
+  setup?: unknown;
 }
 
-/** A query run, as a worker runs it: a subscription's or a one-shot. */
+/** What a worker's engine is built from (`EvaluationOptions.module`). */
+export interface EvaluationSetup {
+  plugins: Array<PluginFunction<any> | PluginDef<any>>;
+  storage: StorageAdapter;
+}
+
+/** A subscription's query, as a worker runs it. */
 export interface EvaluationRequest {
   name: string;
   args: Record<string, any>;
@@ -43,89 +47,19 @@ export interface EvaluationRequest {
 export interface Evaluation {
   result: unknown;
   serialized: string | undefined;
-  /** Whether `result` is its own JSON reading, so readers may share it. */
-  exact: boolean;
-  /** The caller's fields the run read. */
-  callerReads: string[];
   hash: number;
   resultRows: number | undefined;
   resultBytes: number;
   tables: string[];
   dependencies: QueryDependency[];
-  /** How long the run took where it ran, in ms. */
-  durationMs: number;
 }
 
-/** What a worker's engine is built from: the main engine's own. */
+/** The engine's settings a worker's engine shares. */
 export interface EvaluationInit {
-  /** Each plugin's module, in the order the main engine registered. */
-  plugins: string[];
-  env: Readonly<VexEnv>;
-  reader: StorageReader;
+  module: string;
+  setup: unknown;
   handlerTimeoutMs: number;
   reactive: Required<ReactiveBudget>;
-}
-
-/**
- * An error as it crosses from a worker: its name and message, and an
- * HttpError's status, body and headers, so a refusal answers the
- * caller as it would from the main thread.
- */
-export interface CrossedError {
-  name: string;
-  message: string;
-  http?: {
-    status: number;
-    body: unknown;
-    headers: Record<string, string>;
-    expose: boolean;
-  };
-}
-
-/**
- * `error` as it crosses (`CrossedError`): plain data, which every
- * thread boundary copies. An HttpError's body crosses as HTTP sends
- * it, its JSON reading; one JSON cannot say crosses as its message.
- */
-export function crossing(error: unknown): CrossedError {
-  if (isHttpError(error)) {
-    return {
-      name: error.name,
-      message: error.message,
-      http: {
-        status: error.status,
-        body: sent(error.body, error.message),
-        headers: { ...error.headers },
-        expose: error.expose,
-      },
-    };
-  }
-  return error instanceof Error
-    ? { name: error.name, message: error.message }
-    : { name: "Error", message: String(error) };
-}
-
-/** `body` as an HTTP response says it. */
-function sent(body: unknown, message: string): unknown {
-  try {
-    const json = JSON.stringify(body);
-    return json === undefined ? undefined : JSON.parse(json);
-  } catch {
-    return { error: message };
-  }
-}
-
-/** The error `shape` describes, rebuilt on this side. */
-export function crossed(shape: CrossedError): Error {
-  const error = shape.http
-    ? new HttpError(shape.http.status, shape.message, {
-        body: shape.http.body,
-        headers: shape.http.headers,
-        expose: shape.http.expose,
-      })
-    : new Error(shape.message);
-  error.name = shape.name;
-  return error;
 }
 
 export type WorkerInbound =
@@ -134,9 +68,19 @@ export type WorkerInbound =
 
 export type WorkerOutbound =
   | { type: "ready" }
-  | { type: "failed"; error: CrossedError }
+  | { type: "failed"; error: string }
   | { type: "done"; id: number; evaluation: Evaluation }
-  | { type: "error"; id: number; error: CrossedError };
+  | { type: "error"; id: number; error: string };
+
+/** Whether `value` can cross to a worker as it is. */
+export function transferable(value: unknown): boolean {
+  try {
+    structuredClone(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** Whether this runtime can host evaluation workers. */
 export function workersAvailable(): boolean {
@@ -151,17 +95,16 @@ interface Pending {
 interface Member {
   worker: Worker;
   ready: Promise<void>;
-  /** Its engine is built: it takes a run at once. */
-  booted: boolean;
   /** The run it is on, by id; one at a time, its CPU being the point. */
   run: { id: number; pending: Pending } | null;
 }
 
 /**
  * The pool: its workers spawn as it is made, each building its engine
- * at once (`ready`). A request goes to an idle worker, or waits for
- * one; each worker runs one request at a time. A worker that dies
- * fails what it was running and is replaced on the next request.
+ * at once, so the first run waits for no boot. A request goes to an
+ * idle worker, or waits for one; each worker runs one request at a
+ * time. A worker that dies fails what it was running and is replaced
+ * on the next request.
  */
 export class EvaluationPool {
   private readonly members: Member[] = [];
@@ -171,8 +114,6 @@ export class EvaluationPool {
   }> = [];
   private nextId = 0;
   private closed = false;
-  /** Every first worker's engine built, or why one could not be. */
-  readonly ready: Promise<void>;
 
   constructor(
     private readonly script: URL,
@@ -180,15 +121,6 @@ export class EvaluationPool {
     private readonly init: EvaluationInit,
   ) {
     for (let i = 0; i < size; i++) this.members.push(this.spawn());
-    this.ready = Promise.all(this.members.map((m) => m.ready)).then(() => {});
-  }
-
-  /** Whether a worker would take a run now, with none waiting. */
-  idleNow(): boolean {
-    return (
-      this.queue.length === 0 &&
-      this.members.some((member) => member.booted && member.run === null)
-    );
   }
 
   run(request: EvaluationRequest): Promise<Evaluation> {
@@ -241,13 +173,8 @@ export class EvaluationPool {
     const member: Member = {
       worker,
       ready: new Promise<void>((resolve, reject) => {
-        booted = (outcome) => {
-          if (outcome) return reject(outcome);
-          member.booted = true;
-          resolve();
-        };
+        booted = (outcome) => (outcome ? reject(outcome) : resolve());
       }),
-      booted: false,
       run: null,
     };
     worker.addEventListener("message", (event: MessageEvent) => {
@@ -256,14 +183,14 @@ export class EvaluationPool {
         case "ready":
           return booted(null);
         case "failed":
-          return booted(crossed(message.error));
+          return booted(new Error(message.error));
         case "done":
         case "error": {
           const run = member.run;
           if (run?.id !== message.id) return;
           member.run = null;
           if (message.type === "done") run.pending.resolve(message.evaluation);
-          else run.pending.reject(crossed(message.error));
+          else run.pending.reject(new Error(message.error));
           return this.dispatch();
         }
       }

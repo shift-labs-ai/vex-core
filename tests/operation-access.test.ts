@@ -11,21 +11,20 @@ import { sqliteAdapter } from "../src/adapters/sqlite.js";
 import type { VexPluginAPI } from "../src/core/api.js";
 import { Vex } from "../src/core/engine.js";
 import type { MiddlewareInfo } from "../src/core/types.js";
-import { Type } from "../src/portable.js";
 
 /** An app's declaration: the permission an operation needs. */
 type Access = { permission: string } | "system";
 
 function notesPlugin(api: VexPluginAPI<Access>) {
   api.setName("notes");
-  api.registerTable("notes", { columns: { text: Type.String() } });
+  api.registerTable("notes", { columns: { text: { type: "string" } } });
   api.registerQuery("list", {
     args: {},
     access: { permission: "notes.read" },
     handler: (ctx) => ctx.db.table("notes").all(),
   });
   api.registerMutation("add", {
-    args: { text: Type.String() },
+    args: { text: "string" },
     access: { permission: "notes.write" },
     handler: (ctx, args) => ctx.db.table("notes").insert({ text: args.text }),
   });
