@@ -736,6 +736,9 @@ class BoundedMap<K, V> extends Map<K, V> {
  *
  * Writes inside a transaction wait in `pending` and join the changed
  * set at commit, so nothing reports a write that may yet roll back.
+ * Work waiting for those writes (`StorageAdapter.afterCommit`) waits
+ * beside them, is released by the same commit, and is dropped by the
+ * same rollback.
  */
 export class SqliteAdapterState {
   readonly schemas = new Map<string, TableSchema>();
@@ -744,6 +747,8 @@ export class SqliteAdapterState {
   // The open transaction's writes; one Map, reused.
   private readonly pendingTables = new Map<string, boolean>();
   private pending: Map<string, boolean> | null = null;
+  // What the open transaction's commit releases, in the order asked.
+  private readonly pendingReleases: Array<() => void> = [];
   // While a transaction is open, each schema it replaces, to put back on
   // rollback.
   private readonly schemaUndo: [string, TableSchema | undefined][] = [];
@@ -963,10 +968,22 @@ export class SqliteAdapterState {
   /** Starts the outermost transaction: its writes wait for commit. */
   begin(): void {
     this.pendingTables.clear();
+    this.pendingReleases.length = 0;
     this.pending = this.pendingTables;
   }
 
-  /** Commits the outermost transaction: its writes count as changed. */
+  /**
+   * Holds `release` for the open transaction's commit. The adapter
+   * calls it only while a transaction is open on the asking call.
+   */
+  deferRelease(release: () => void): void {
+    this.pendingReleases.push(release);
+  }
+
+  /**
+   * Commits the outermost transaction: its writes count as changed,
+   * and what waited for them is released, in order.
+   */
   commit(): void {
     this.pendingTables.forEach((attributed, table) => {
       this.changed.set(table, attributed && this.changed.get(table) !== false);
@@ -974,6 +991,8 @@ export class SqliteAdapterState {
     this.pendingTables.clear();
     this.pending = null;
     this.schemaUndo.length = 0;
+    const releases = this.pendingReleases.splice(0);
+    for (const release of releases) release();
   }
 
   /**
@@ -1004,16 +1023,20 @@ export class SqliteAdapterState {
   }
 
   /**
-   * Returns a function that restores the schemas and the pending writes
-   * as they are now: a rollback undoes the migrations and writes they
-   * describe. Taken before `begin()` (an outermost transaction) it ends
-   * the transaction; taken inside one (a savepoint), it rolls back to
+   * Returns a function that restores the schemas, the pending writes
+   * and the work waiting for them as they are now: a rollback undoes
+   * the migrations and writes they describe, and drops the work. Taken
+   * before `begin()` (an outermost transaction) it ends the
+   * transaction; taken inside one (a savepoint), it rolls back to
    * there.
    */
   snapshot(): () => void {
     const undo = this.schemaUndo.length;
     const pending = this.pending && new Map(this.pending);
+    // Taken before `begin()`, nothing waits; inside, what waited then.
+    const releases = pending ? this.pendingReleases.length : 0;
     return () => {
+      this.pendingReleases.length = releases;
       if (this.schemaUndo.length > undo) {
         while (this.schemaUndo.length > undo) {
           const [table, schema] = this.schemaUndo.pop()!;

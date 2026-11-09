@@ -43,6 +43,16 @@ export interface StorageAdapter {
   delete(table: string, id: string): Promise<boolean>;
   query(table: string): QueryBuilder;
   transaction<T>(fn: () => Promise<T> | T): Promise<T>;
+  /**
+   * Call `release` once the writes made so far on this call commit:
+   * when the outermost transaction open on this call commits, never
+   * when it, or the savepoint `release` was asked for in, rolls back;
+   * at once when no transaction is open here, its writes having
+   * committed already. `release` runs synchronously and must not
+   * throw. Without it, the engine releases work when the transaction
+   * it ran commits, and cannot see one opened inside another.
+   */
+  afterCommit?(release: () => void): void;
   rawQuery<T = Record<string, any>>(
     sql: string,
     ...params: any[]

@@ -701,6 +701,16 @@ export function sqliteAdapter(
       }
     },
 
+    // Open on this call only while its owner is: a call that merely
+    // inherits a settled owner's context, or none, writes in autocommit.
+    afterCommit(release: () => void): void {
+      if (transactionContext.getStore()?.active === true) {
+        state.deferRelease(release);
+      } else {
+        release();
+      }
+    },
+
     async rawQuery<T = Record<string, any>>(
       sql: string,
       ...params: any[]

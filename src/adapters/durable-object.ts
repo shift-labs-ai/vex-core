@@ -243,6 +243,15 @@ export function durableObjectAdapter(
       });
     },
 
+    // An open transaction holds the object's input gate (see the
+    // header): other requests wait for it, so one open is this call's.
+    // Its work is released where its changes are recorded, as the
+    // outermost closure returns, which is where the object commits it.
+    afterCommit(release: () => void): void {
+      if (transactionDepth > 0) state.deferRelease(release);
+      else release();
+    },
+
     async rawQuery<T = Record<string, any>>(
       query: string,
       ...params: any[]
