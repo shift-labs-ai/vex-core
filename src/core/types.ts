@@ -241,6 +241,20 @@ export interface MutationContext {
   };
   runtime: VexRuntime;
   user?: VexUser | null;
+  /**
+   * Run `work` once the writes made so far have committed, and never if
+   * they roll back: a notification, a signal to a runtime, a file
+   * removed, a cache forgotten. It runs on a later turn, in the order
+   * asked, outside the transaction and the caller's async context; what
+   * it throws or rejects is logged, never reaches the change, and never
+   * stops the work after it. In a job, whose writes commit one by one,
+   * it runs as soon as the turn allows. Asked once the change has
+   * ended (a handler still running past its timeout), it throws.
+   * Not durable: work asked for by a change whose process stops before
+   * it runs is lost; what must survive a restart is written as a row
+   * in the change itself.
+   */
+  afterCommit(work: () => unknown): void;
 }
 
 /**

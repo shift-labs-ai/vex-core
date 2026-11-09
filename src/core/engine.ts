@@ -5,6 +5,7 @@ import {
   publishedGovernedError,
   UNRESTRICTED,
 } from "./access.js";
+import { AfterCommitRunner, nextTurn } from "./after-commit.js";
 import type { PluginFunction } from "./api.js";
 import { resolvePlugin } from "./api.js";
 import {
@@ -362,12 +363,6 @@ interface PendingInvalidation {
   pass: Promise<void>;
 }
 
-/** Resolves once the current turn's microtasks have drained. */
-const nextTurn: () => Promise<void> =
-  typeof setImmediate === "function"
-    ? () => new Promise((resolve) => setImmediate(resolve))
-    : () => new Promise((resolve) => setTimeout(resolve, 0));
-
 interface JobRunResult {
   status: "ok" | "error";
   error: string | null;
@@ -402,6 +397,26 @@ export interface VexOptions<A = undefined> {
    * cross to one, evaluation stays on the main thread.
    */
   evaluation?: EvaluationOptions;
+  /**
+   * How long `close()` waits for work released by committed changes
+   * (`MutationContext.afterCommit`) to settle before it closes
+   * storage anyway. Default 10s.
+   */
+  afterCommitDrainMs?: number;
+}
+
+/**
+ * A change's hold on the work it asks to follow it: open while the
+ * change runs. `held` is the work the engine releases itself, when its
+ * transaction commits, for storage that cannot see commits (no
+ * `StorageAdapter.afterCommit`); null where the storage releases it, or
+ * where no transaction is open.
+ */
+interface ChangeScope {
+  open: boolean;
+  held: Array<() => unknown> | null;
+  name: string;
+  parent: ExecContext;
 }
 
 /**
@@ -452,6 +467,15 @@ export class Vex<A = unknown> {
     maxRows: 1000,
     maxBytes: 1024 * 1024,
   };
+  private afterCommitDrainMs = 10_000;
+  // Work that follows committed changes (`afterCommit`).
+  private afterCommitRunner = new AfterCommitRunner(
+    (error) => console.error("[vex] work after a commit failed:", error),
+    () =>
+      console.warn(
+        "[vex] work after a commit was dropped: the engine is closed",
+      ),
+  );
 
   private constructor(storage: StorageAdapter) {
     this.storage = storage;
@@ -512,6 +536,8 @@ export class Vex<A = unknown> {
     if (options.jobScheduler) vex.jobScheduler = options.jobScheduler;
     if (options.handlerTimeoutMs)
       vex.handlerTimeoutMs = options.handlerTimeoutMs;
+    if (options.afterCommitDrainMs !== undefined)
+      vex.afterCommitDrainMs = options.afterCommitDrainMs;
     if (options.reactive) {
       vex.reactiveDefaults = {
         maxRows: options.reactive.maxRows ?? vex.reactiveDefaults.maxRows,
@@ -802,8 +828,14 @@ export class Vex<A = unknown> {
           async (ectx, meta) => {
             meta.schedule = job.schedule;
             meta.attempt = attempt;
-            const ctx = this.buildMutationContext();
-            await job.handler(ctx);
+            // No transaction: each write commits as it is made.
+            const scope = this.openScope(cronName, ectx, false);
+            const ctx = this.buildMutationContext(scope);
+            try {
+              await job.handler(ctx);
+            } finally {
+              this.closeScope(scope, true);
+            }
             await this.invalidateAfter(ectx);
           },
         );
@@ -1231,13 +1263,92 @@ export class Vex<A = unknown> {
   }
 
   /**
+   * A change's scope. `transactional`: the engine runs the change in a
+   * transaction, whose commit releases its work; else its writes commit
+   * one by one, and its work is released as it is asked for.
+   */
+  private openScope(
+    name: string,
+    parent: ExecContext,
+    transactional: boolean,
+  ): ChangeScope {
+    return {
+      open: true,
+      held: transactional && !this.storage.afterCommit ? [] : null,
+      name,
+      parent,
+    };
+  }
+
+  /** `fn` in a transaction of its own, ending `scope` as it settles. */
+  private async inTransaction<T>(
+    scope: ChangeScope,
+    fn: () => Promise<T> | T,
+  ): Promise<T> {
+    let committed = false;
+    try {
+      const result = await this.storage.transaction(fn);
+      committed = true;
+      return result;
+    } finally {
+      this.closeScope(scope, committed);
+    }
+  }
+
+  /**
+   * The change has ended: nothing more may be asked of its scope, and,
+   * when it `committed`, the work the engine held for it is released.
+   */
+  private closeScope(scope: ChangeScope, committed: boolean): void {
+    scope.open = false;
+    const held = scope.held?.splice(0) ?? [];
+    if (!committed) return;
+    for (const job of held) this.afterCommitRunner.release(job);
+  }
+
+  /**
+   * `work`, traced as a child of the change that asked for it, released
+   * once that change's writes commit: by the storage, which sees every
+   * transaction open on the call, nested ones included; else by the
+   * engine, when the transaction it ran commits.
+   */
+  private afterCommit(scope: ChangeScope, work: () => unknown): void {
+    if (!scope.open) {
+      throw new Error(
+        `afterCommit was asked for after ${scope.name} ended; ask for it while the change runs`,
+      );
+    }
+    const job = () =>
+      this.trace("afterCommit", scope.name, scope.parent, () => work());
+    if (this.storage.afterCommit) {
+      this.storage.afterCommit(() => this.afterCommitRunner.release(job));
+    } else if (scope.held) {
+      scope.held.push(job);
+    } else {
+      this.afterCommitRunner.release(job);
+    }
+  }
+
+  /**
+   * Resolves once every piece of work released so far by a committed
+   * change (`MutationContext.afterCommit`), and all it released in
+   * turn, has run and settled: for tests, and for whatever must see
+   * the effects of a change's follow-up work.
+   */
+  afterCommitSettled(): Promise<void> {
+    return this.afterCommitRunner.settled();
+  }
+
+  /**
    * A mutation's context. With `writes`, each write the handler makes
    * is recorded there for invalidation to narrow on, with the values
    * its rows hold; the rows are read first, which is consistent only
    * inside the transaction the handler runs in, so a caller recording
-   * writes runs the handler in one.
+   * writes runs the handler in one. `scope` is the change the context
+   * belongs to: what it asks to follow it waits for that change.
    */
   private buildMutationContext(
+    scope: ChangeScope,
     user?: VexUser | null,
     writes?: WriteDependency[],
   ): MutationContext {
@@ -1390,6 +1501,7 @@ export class Vex<A = unknown> {
       },
       runtime: this.runtime(),
       user: user ?? undefined,
+      afterCommit: (work) => this.afterCommit(scope, work),
     };
   }
 
@@ -2021,8 +2133,9 @@ export class Vex<A = unknown> {
       const reg = this.mutations.get(name);
       if (!reg) throw new Error(`Mutation not found: ${name}`);
       const writes: WriteDependency[] = [];
-      const ctx = this.buildMutationContext(user, writes);
-      const result = await this.storage.transaction(() =>
+      const scope = this.openScope(name, ectx, true);
+      const ctx = this.buildMutationContext(scope, user, writes);
+      const result = await this.inTransaction(scope, () =>
         this.runMiddleware(
           ctx,
           { type: "mutation", name, args, access: reg.def.access },
@@ -2171,13 +2284,14 @@ export class Vex<A = unknown> {
           } as WebhookResponse;
         }
         const writes: WriteDependency[] = [];
-        const ctx = this.buildMutationContext(undefined, writes);
         const info: MiddlewareInfo<any> = {
           type: "webhook",
           name: `${match.plugin}.${match.name}`,
           args: req.body ?? {},
         };
-        const result = await this.storage.transaction(() =>
+        const scope = this.openScope(info.name, ectx, true);
+        const ctx = this.buildMutationContext(scope, undefined, writes);
+        const result = await this.inTransaction(scope, () =>
           this.runMiddleware(
             ctx,
             info,
@@ -2340,8 +2454,10 @@ export class Vex<A = unknown> {
   /**
    * Closes the engine. From the call on it refuses job changes, job runs
    * and subscriptions, and no timer starts a job. Job changes in flight
-   * finish without arming a timer, running jobs settle, and then storage
-   * closes. Calling it again returns the same promise.
+   * finish without arming a timer, running jobs settle, work committed
+   * changes asked for settles (for up to `afterCommitDrainMs`; work
+   * asked for after is dropped), and then storage closes. Calling it
+   * again returns the same promise.
    */
   close(): Promise<void> {
     if (!this.closing) {
@@ -2355,6 +2471,13 @@ export class Vex<A = unknown> {
   private async shutDown(): Promise<void> {
     await Promise.allSettled([...this.jobChanges.values()]);
     await Promise.allSettled([...this.runningJobs.values()]);
+    // What committed changes asked to follow them, while storage is
+    // still open for it; bounded, so a hung piece never holds close().
+    if (!(await this.afterCommitRunner.drain(this.afterCommitDrainMs))) {
+      console.warn(
+        `[vex] work after a commit still running ${this.afterCommitDrainMs}ms into close(); closing storage anyway`,
+      );
+    }
     this.subscriptions.clear();
     this.groups.clear();
     this.groupIndex.clear();
