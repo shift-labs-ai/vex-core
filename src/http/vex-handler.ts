@@ -1,6 +1,9 @@
 /**
  * vexHandler — the vex engine adapted as a Router.
  *
+ * It asks of the engine only its calls (`VexCalls`) and its webhooks,
+ * so an app may hand it something standing in front of the engine.
+ *
  * Exposes four routes relative to wherever it's mounted:
  *   POST /query      JSON body { name, args? } → { data } | { error }
  *   POST /mutate     JSON body { name, args? } → { data } | { error }
@@ -36,7 +39,7 @@
  */
 
 import type { Vex } from "../core/engine.js";
-import type { VexUser } from "../core/types.js";
+import type { VexCalls, VexUser } from "../core/types.js";
 import { type ReadLimits, readText } from "./body.js";
 import { errorMessage, isHttpError } from "./error.js";
 import { createRouter, type Router } from "./router.js";
@@ -65,7 +68,15 @@ export interface VexHandlerOptions {
 /** The default ceiling on a `/query`, `/mutate`, `/action` or webhook body. */
 export const DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
 
-export function vexHandler(vex: Vex, opts: VexHandlerOptions = {}): Router {
+/** What `vexHandler` asks of the engine: its one-shot calls and its
+ *  webhooks. */
+type Dispatched = Pick<VexCalls, "query" | "mutate" | "action"> &
+  Pick<Vex, "handleWebhook">;
+
+export function vexHandler(
+  vex: Dispatched,
+  opts: VexHandlerOptions = {},
+): Router {
   const getUser = opts.getUser ?? ((c: RequestCtx) => c.user ?? null);
   const rpcLimits: ReadLimits = {
     maxBytes: opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
@@ -140,7 +151,10 @@ function makeCallHandler(
   };
 }
 
-function makeWebhookHandler(vex: Vex, limits: ReadLimits): Handler {
+function makeWebhookHandler(
+  vex: Pick<Vex, "handleWebhook">,
+  limits: ReadLimits,
+): Handler {
   return async (ctx: RequestCtx): Promise<Response> => {
     // URLPattern's `*` capture for `/webhook/*` lands in params["0"].
     // The leading slash is not captured, so prepend one; an empty

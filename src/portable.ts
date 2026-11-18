@@ -75,6 +75,7 @@ export type {
   QueryDef,
   ReactiveBudget,
   TableSchema,
+  VexCalls,
   VexUser,
   WebhookDef,
   WebhookRequest,
