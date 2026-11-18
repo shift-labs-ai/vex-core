@@ -50,6 +50,7 @@ import type {
   QueryDef,
   ReactiveBudget,
   TableSchema,
+  VexCalls,
   VexRuntime,
   VexUser,
   WebhookRequest,
@@ -425,7 +426,7 @@ interface ChangeScope {
  * holder does not read, so it holds an engine of any declaration;
  * code that reads them names the type (`Vex<Access>`).
  */
-export class Vex<A = unknown> {
+export class Vex<A = unknown> implements VexCalls {
   private storage: StorageAdapter;
   // Erased as the registries are (RegisteredQuery).
   private plugins: PluginDef<any>[] = [];

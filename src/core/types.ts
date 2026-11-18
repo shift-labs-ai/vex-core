@@ -151,6 +151,38 @@ export interface CallContext {
   signal?: AbortSignal;
 }
 
+/**
+ * The engine's calls: all a transport asks of it (`vexHandler`,
+ * `vexWebSocket`). `Vex` answers them, and so can anything standing
+ * in front of one: where an app puts what must happen to a call
+ * arriving from outside and to none it makes itself, such as a name
+ * the call once had answered as the one it has now.
+ */
+export interface VexCalls {
+  query<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    callCtx?: ExecContext | CallContext,
+  ): Promise<T>;
+  mutate<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    callCtx?: ExecContext | CallContext,
+  ): Promise<T>;
+  action<T = any>(
+    name: string,
+    args?: Record<string, any>,
+    callCtx?: ExecContext | CallContext,
+  ): Promise<T>;
+  /** Resolves, after the first delivery, to what ends the subscription. */
+  subscribe(
+    name: string,
+    args: Record<string, any>,
+    callback: (data: any) => void,
+    callCtx?: CallContext,
+  ): Promise<() => void>;
+}
+
 export interface SubscriptionSummary {
   total: number;
   unique: number;

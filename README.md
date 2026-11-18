@@ -475,6 +475,26 @@ A query, mutation or action that throws an `HttpError` answers as it renders, it
 
 `VexClient` reconnects a lost socket by itself, with backoff, and replays its subscriptions, so a view does not see the loss. Any close but `client.close()` is a loss, a clean one from a restarting server or a proxy included. A one-shot waiting when the socket dies rejects with `connection lost`, and is never sent later. The app can see the connection: `client.connection()` is `idle`, `connecting`, `open` or `reconnecting` (with `since`, when the connection was lost, `attempt`, and `nextAttemptAt`, or null while a try is under way), `client.onConnectionChange(listener)` reports each change on a microtask, and `client.reconnectNow()` tries at once instead of waiting out the backoff. A server down from the start reads as `reconnecting` too.
 
+Both transports ask of the engine only its calls, the `VexCalls` interface (`query`, `mutate`, `action`, `subscribe`; `vexHandler` also `handleWebhook`), so either takes an object standing in front of the engine. That is where to put what must happen to a call arriving from outside and to none the app makes itself, such as answering a name a release renamed:
+
+```ts
+import type { VexCalls } from "vex-core";
+
+const now = (name: string) => (name === "notes.remove" ? "notes.delete" : name);
+const calls: VexCalls = {
+  query: (name, args, callCtx) => vex.query(now(name), args, callCtx),
+  mutate: (name, args, callCtx) => vex.mutate(now(name), args, callCtx),
+  action: (name, args, callCtx) => vex.action(now(name), args, callCtx),
+  subscribe: (name, args, callback, callCtx) =>
+    vex.subscribe(now(name), args, callback, callCtx),
+};
+
+vexHandler({ ...calls, handleWebhook: (req) => vex.handleWebhook(req) });
+vexWebSocket(calls);
+```
+
+A subscription's answers can be reshaped by wrapping `callback`; pass it through untouched where nothing changes.
+
 Request bodies are read under a byte ceiling: `vexHandler(vex, { maxBodyBytes, maxWebhookBodyBytes, bodyTimeoutMs })`. `maxBodyBytes` defaults to 8 MiB (`DEFAULT_MAX_BODY_BYTES`) and covers `/query`, `/mutate` and `/action`. Webhooks use the same ceiling unless `maxWebhookBodyBytes` gives them their own. A body past the ceiling gets a 413 before it is buffered, and no operation or webhook runs. With `bodyTimeoutMs` set, a body that stalls gets a 408. Mounted behind `bodyParser`, the dispatcher uses the body the parser already read.
 
 ### Request bodies under a byte ceiling

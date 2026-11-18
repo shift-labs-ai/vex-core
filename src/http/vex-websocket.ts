@@ -4,7 +4,9 @@
  * One WebSocket per client carries every reactive read and one-shot
  * calls. The engine's `vex.subscribe()` machinery does the actual work
  * — table-precise re-runs, hash-deduped pushes — and this module frames
- * it onto a wire protocol.
+ * it onto a wire protocol. It asks of the engine only its calls
+ * (`VexCalls`), so an app may hand it something standing in front of
+ * the engine.
  *
  * Why one connection
  *   - HTTP/1.1 caps origins at ~6 simultaneous connections, which made
@@ -77,8 +79,8 @@
  */
 
 import type { Server as BunServer, ServerWebSocket } from "bun";
-import { type Vex, withSerializedSubscriptionResult } from "../core/engine.js";
-import type { VexUser } from "../core/types.js";
+import { withSerializedSubscriptionResult } from "../core/engine.js";
+import type { VexCalls, VexUser } from "../core/types.js";
 import { errorMessage, isHttpError } from "./error.js";
 
 // Bun's `Server` is generic over the websocket payload shape; we
@@ -172,7 +174,7 @@ const AUTH_TIMEOUT_DEFAULT_MS = 10_000;
 const POLICY_VIOLATION_CLOSE_CODE = 1008;
 
 export function vexWebSocket(
-  vex: Vex,
+  vex: VexCalls,
   opts: VexWebSocketOptions = {},
 ): VexWebSocketHandlers {
   const getUser = opts.getUser ?? (() => null);
@@ -407,7 +409,7 @@ function parseFrame(value: unknown): ClientFrame | null {
 // ─── Dispatch ─────────────────────────────────────────────
 
 async function dispatch(
-  vex: Vex,
+  vex: VexCalls,
   ws: VexWebSocket,
   frame: ClientFrame,
 ): Promise<void> {
@@ -433,7 +435,7 @@ async function dispatch(
 }
 
 async function handleSubscribe(
-  vex: Vex,
+  vex: VexCalls,
   ws: VexWebSocket,
   frame: { id: string; name: string; args?: Record<string, unknown> },
 ): Promise<void> {
@@ -497,7 +499,7 @@ function handleUnsubscribe(ws: VexWebSocket, frame: { id: string }): void {
 
 /** A one-shot call, made as the connection's user; its answer or failure goes back by id. */
 async function handleCall(
-  vex: Vex,
+  vex: VexCalls,
   ws: VexWebSocket,
   frame: {
     type: "query" | "mutate" | "action";
