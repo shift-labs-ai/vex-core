@@ -493,7 +493,7 @@ vexHandler({ ...calls, handleWebhook: (req) => vex.handleWebhook(req) });
 vexWebSocket(calls);
 ```
 
-A subscription's answers can be reshaped by wrapping `callback`; pass it through untouched where nothing changes.
+A subscription's answers are reshaped by wrapping `callback`. Where nothing changes, hand it on as it is: the socket's own callback is sent each answer as the JSON the engine already made, and a wrapped one is serialized again.
 
 Request bodies are read under a byte ceiling: `vexHandler(vex, { maxBodyBytes, maxWebhookBodyBytes, bodyTimeoutMs })`. `maxBodyBytes` defaults to 8 MiB (`DEFAULT_MAX_BODY_BYTES`) and covers `/query`, `/mutate` and `/action`. Webhooks use the same ceiling unless `maxWebhookBodyBytes` gives them their own. A body past the ceiling gets a 413 before it is buffered, and no operation or webhook runs. With `bodyTimeoutMs` set, a body that stalls gets a 408. Mounted behind `bodyParser`, the dispatcher uses the body the parser already read.
 

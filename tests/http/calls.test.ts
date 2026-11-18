@@ -1,8 +1,8 @@
 /**
  * The transports ask of the engine only its calls (`VexCalls`), so
  * they serve what stands in front of one as they serve the engine:
- * here, something that answers a name the engine no longer has as the
- * one it has now, in the shape the old name gave.
+ * here, something that answers a name the engine does not have as one
+ * it has, in a shape of that name's own.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -17,7 +17,7 @@ let server: Server;
 /** Each call as the engine was asked it. */
 const asked: string[] = [];
 
-/** `items.all` is `items.list` now, and answered `{ items }`. */
+/** `items.all` is answered as `items.list`, shaped `{ items }`. */
 const now = (name: string) => (name === "items.all" ? "items.list" : name);
 const shaped = (name: string, rows: unknown) =>
   name === "items.all" ? { items: rows } : rows;
@@ -58,6 +58,7 @@ beforeAll(async () => {
     asked.push(`${info.type} ${info.name}`);
     return next();
   });
+  await vex.mutate("items.create", { name: "ant" });
 
   const inFront: VexCalls = {
     query: async (name, args, callCtx) =>
@@ -143,7 +144,6 @@ async function connect() {
 
 describe("what stands in front of the engine", () => {
   test("the dispatcher answers a call through it, and the engine is asked the call it has", async () => {
-    await post("/mutate", { name: "items.create", args: { name: "ant" } });
     asked.length = 0;
     expect(await post("/query", { name: "items.all" })).toEqual({
       status: 200,
